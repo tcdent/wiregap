@@ -85,9 +85,7 @@
     unsound; the proxy drives a minimal, datasheet-built driver over a kernel-bypassed link, and
     its constructs are verifiable by enumeration — total functions over finite domains.
 
-17. **The proxy relays only inert shapes.** It admits upstream only inert, client-side tool
-    definitions; a capability-bearing tool selected inside a request body is reconstructed away.
-    Any growth in what the proxy interprets is a deliberate expansion of the trusted base.
+17. **The proxy enforces that emitted requests adhere to the rules set for the route.**
 
 ## The untrusted zone — the box
 
