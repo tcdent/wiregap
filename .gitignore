@@ -1,0 +1,5 @@
+# Re-fetchable third-party reference material — every repo/commit/datasheet URL
+# is pinned in reference/SOURCES.md, so the clones and PDFs are reproducible and
+# do not belong in version control.
+reference/*
+!reference/SOURCES.md
