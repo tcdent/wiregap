@@ -14,6 +14,7 @@ use crate::list_entry::ListEntries;
 use crate::net::NetAddress;
 use crate::reject::Reject;
 use crate::terminal::display::{CreatePty, Display};
+use crate::terminal::input::{Focus, Mouse, Paste, Resize, Viewport};
 use crate::terminal::pane_state::PaneState;
 use crate::verb;
 use crate::wire::Wire;
@@ -35,6 +36,11 @@ pub enum Message {
     List(List),
     ListEntries(ListEntries),
     RequestFile(RequestFile),
+    Resize(Resize),
+    Viewport(Viewport),
+    Mouse(Mouse),
+    Paste(Paste),
+    Focus(Focus),
 }
 
 impl Message {
@@ -54,6 +60,11 @@ impl Message {
             Message::List(_) => List::VERB,
             Message::ListEntries(_) => ListEntries::VERB,
             Message::RequestFile(_) => RequestFile::VERB,
+            Message::Resize(_) => Resize::VERB,
+            Message::Viewport(_) => Viewport::VERB,
+            Message::Mouse(_) => Mouse::VERB,
+            Message::Paste(_) => Paste::VERB,
+            Message::Focus(_) => Focus::VERB,
         }
     }
 }
@@ -84,6 +95,13 @@ pub fn decode_message(frame: &[u8]) -> Result<Message, Reject> {
         // an `UnterminatedRecord` from here is the observable proof of the route-through.
         verb::LIST_ENTRY => ListEntries::decode(body).map(Message::ListEntries),
         verb::REQUEST_FILE => RequestFile::decode(body).map(Message::RequestFile),
+        verb::RESIZE => Resize::decode(body).map(Message::Resize),
+        verb::VIEWPORT => Viewport::decode(body).map(Message::Viewport),
+        // 0x15 routes through `Mouse::decode` — the observable mouse `TrailingBytes` from here proves
+        // the route-through.
+        verb::MOUSE => Mouse::decode(body).map(Message::Mouse),
+        verb::PASTE => Paste::decode(body).map(Message::Paste),
+        verb::FOCUS => Focus::decode(body).map(Message::Focus),
         _ => Err(Reject::UnsupportedVerb { verb: id }),
     }
 }
@@ -107,6 +125,11 @@ pub fn encode_message(message: &Message) -> Vec<u8> {
         Message::List(m) => m.encode(&mut out),
         Message::ListEntries(m) => m.encode(&mut out),
         Message::RequestFile(m) => m.encode(&mut out),
+        Message::Resize(m) => m.encode(&mut out),
+        Message::Viewport(m) => m.encode(&mut out),
+        Message::Mouse(m) => m.encode(&mut out),
+        Message::Paste(m) => m.encode(&mut out),
+        Message::Focus(m) => m.encode(&mut out),
     }
     out
 }

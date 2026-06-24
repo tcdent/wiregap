@@ -317,7 +317,7 @@ fn implemented_set_matches_dispatch() {
     // G0 coherence: the source `IMPLEMENTED` constant must equal the set of verbs with a real decode
     // arm. An implemented verb with an empty body decodes to Ok or a *structural* reject (it has an
     // arm); every other catalog verb decodes to UnsupportedVerb (it is a stub).
-    assert_eq!(verb::IMPLEMENTED.len(), 12);
+    assert_eq!(verb::IMPLEMENTED.len(), 17);
     assert!(verb::IMPLEMENTED.iter().all(|s| verb::CATALOG.contains(s)));
     for &v in &verb::CATALOG {
         let result = decode_message(&v.to_le_bytes());

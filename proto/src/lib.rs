@@ -49,5 +49,9 @@ pub use terminal::cell::{
 };
 pub use terminal::dimensions::Dimensions;
 pub use terminal::display::{CreatePty, Display};
+pub use terminal::input::{
+    Button, Focus, Modifiers, Mouse, MouseKind, Paste, ReservedButton, ReservedMouseKind, Resize,
+    Viewport,
+};
 pub use terminal::pane_state::PaneState;
 pub use wire::Wire;

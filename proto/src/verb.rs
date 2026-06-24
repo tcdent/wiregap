@@ -25,12 +25,12 @@ pub const OPEN_SESSION: u32 = 0x00; // open-session         head→box          
 // ---- 0x1_  terminal -----------------------------------------------------------------------
 pub const CREATE_PTY: u32 = 0x10; //   create-pty           head→box            impl (dimensions)
 pub const DISPLAY: u32 = 0x11; //      display              box→head            impl (cell stream)
-pub const KEY: u32 = 0x12; //          key                  head→box            defer (BLOCKED: keysym table)
-pub const RESIZE: u32 = 0x13; //       resize               head→box            defer
-pub const VIEWPORT: u32 = 0x14; //     viewport             head→box            defer
-pub const MOUSE: u32 = 0x15; //        mouse                head→box            defer
-pub const PASTE: u32 = 0x16; //        paste                head→box            defer
-pub const FOCUS: u32 = 0x17; //        focus                head→box            defer
+pub const KEY: u32 = 0x12; //          key                  head→box            stub (BLOCKED: keysym table)
+pub const RESIZE: u32 = 0x13; //       resize               head→box            impl (Dimensions reuse)
+pub const VIEWPORT: u32 = 0x14; //     viewport             head→box            impl (u32 fixed)
+pub const MOUSE: u32 = 0x15; //        mouse                head→box            impl (12B + carriers)
+pub const PASTE: u32 = 0x16; //        paste                head→box            impl (verbatim tail)
+pub const FOCUS: u32 = 0x17; //        focus                head→box            impl (raw u8)
 pub const PANE_STATE: u32 = 0x18; //   pane-state           box→head            impl (fixed-record)
 
 // ---- 0x2_  file ---------------------------------------------------------------------------
@@ -80,6 +80,38 @@ pub const ERR_MALFORMED: u32 = 6; //   malformed
 pub const MAX_ERROR_CODE: u32 = ERR_MALFORMED;
 
 // ===========================================================================================
+// MOUSE / INPUT FIELD CODES — the `mouse` (0x15) field values (model.md §8 Input events).
+//   The carriers in `terminal/input` reference these (no magic literals — single source).
+// ===========================================================================================
+
+// `Button` (u8) — model §8 **ratified**; `> MAX_BUTTON` carried raw (`Button::Other`).
+pub const BUTTON_NONE: u8 = 0;
+pub const BUTTON_LEFT: u8 = 1;
+pub const BUTTON_MIDDLE: u8 = 2;
+pub const BUTTON_RIGHT: u8 = 3;
+pub const BUTTON_BACK: u8 = 4;
+pub const BUTTON_FORWARD: u8 = 5;
+/// The highest defined button; `> MAX_BUTTON` is reserved and carried raw.
+pub const MAX_BUTTON: u8 = BUTTON_FORWARD;
+
+// `MouseKind` (u8) — **PROVISIONAL** (model §8 names Down/Up/Move/Scroll but does not number them;
+// pinned here like the cell op-set, pending operator ratification). `> MAX_MOUSE_KIND` carried raw.
+pub const MOUSE_KIND_DOWN: u8 = 0;
+pub const MOUSE_KIND_UP: u8 = 1;
+pub const MOUSE_KIND_MOVE: u8 = 2;
+pub const MOUSE_KIND_SCROLL: u8 = 3;
+/// The highest defined mouse kind (provisional); `>` it is reserved and carried raw.
+pub const MAX_MOUSE_KIND: u8 = MOUSE_KIND_SCROLL;
+
+// `Modifiers` (u16 bitfield) — model §8 **ratified** bit positions; bits 6–15 reserved (dropped).
+pub const MOD_SHIFT_BIT: u32 = 0;
+pub const MOD_CONTROL_BIT: u32 = 1;
+pub const MOD_ALT_BIT: u32 = 2;
+pub const MOD_SUPER_BIT: u32 = 3;
+pub const MOD_CAPS_LOCK_BIT: u32 = 4;
+pub const MOD_FN_BIT: u32 = 5;
+
+// ===========================================================================================
 // DERIVED ANCHORS — keep in sync with the lists above (asserted by tests).
 // ===========================================================================================
 
@@ -115,10 +147,10 @@ pub const CATALOG: [u32; 22] = [
 /// `IMPLEMENTED` verb dispatches to a real decoder; every catalog verb outside it is a stub
 /// (`UnsupportedVerb`). `seed_set_matches_dispatch` ties this to the actual dispatch arms.
 ///
-/// 001 seeded 5 (`pane-state`, `file-chunk`, `file-read`, `net-address`, `file-error`); 002 (display)
-/// adds `create-pty` (0x10) and `display` (0x11); 003 (file) adds `file-write` (0x20), `file-data`
-/// (0x23), `list` (0x24), `list-entry` (0x25), `request-file` (0x26).
-pub const IMPLEMENTED: [u32; 12] = [
+/// 001 seeded 5; 002 (display) adds `create-pty`/`display`; 003 (file) adds `file-write`/`file-data`/
+/// `list`/`list-entry`/`request-file`; 004 (input) adds `resize` (0x13), `viewport` (0x14), `mouse`
+/// (0x15), `paste` (0x16), `focus` (0x17). `key` (0x12) stays a stub (keysym table unpinned).
+pub const IMPLEMENTED: [u32; 17] = [
     PANE_STATE,
     FILE_CHUNK,
     FILE_READ,
@@ -131,4 +163,9 @@ pub const IMPLEMENTED: [u32; 12] = [
     LIST,
     LIST_ENTRY,
     REQUEST_FILE,
+    RESIZE,
+    VIEWPORT,
+    MOUSE,
+    PASTE,
+    FOCUS,
 ];

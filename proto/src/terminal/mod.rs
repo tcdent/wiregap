@@ -5,4 +5,5 @@
 pub mod cell;
 pub mod dimensions;
 pub mod display;
+pub mod input;
 pub mod pane_state;

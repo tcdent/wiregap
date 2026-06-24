@@ -8,9 +8,10 @@
 //! case, not a bidirectional vector). Verb ids are provisional until §8 ratification.
 
 use proto::{
-    Cell, CreatePty, Dimensions, Display, ErrorBody, ErrorCode, FileChunk, FileData, FileError,
-    FileRead, FileType, FileWrite, List, Message, NetAddress, PaneState, Reject, RequestFile, Rgb,
-    RowCol, Scalar, Scheme, Width, decode_message, encode_message, scan_safe, scan_unsafe, verb,
+    Button, Cell, CreatePty, Dimensions, Display, ErrorBody, ErrorCode, FileChunk, FileData,
+    FileError, FileRead, FileType, FileWrite, Focus, List, Message, Modifiers, MouseKind,
+    NetAddress, PaneState, Paste, Reject, RequestFile, Resize, Rgb, RowCol, Scalar, Scheme, Viewport,
+    Width, decode_message, encode_message, scan_safe, scan_unsafe, verb,
 };
 
 /// fixed-record primitive — `pane-state` (verb 0x18).
@@ -333,10 +334,123 @@ fn vector_request_file() {
 /// G0 / G3 coverage (re-tightened, sprint close): the vectors name **every implemented verb exactly**,
 /// anchored bidirectionally to the source `IMPLEMENTED` constant (12) — fails if any implemented verb
 /// lacks a vector, or a vector names an unimplemented verb.
+/// signed POD + carry-raw + reserved-drop — `mouse` (verb 0x15), the headline. Decode-anchored where
+/// the reserved-bit drop applies: the **input** golden carries reserved mods (`0xFFFF`); decode drops
+/// them; encode produces the **canonical** golden (`0x003F`). Both byte-arrays are hand-authored, so
+/// the bidirectional check is non-circular. Carries a **negative delta** (the i16 sign-bit guard).
+#[test]
+fn vector_mouse_negative_delta_other_and_reserved_mods() {
+    #[rustfmt::skip]
+    let input: &[u8] = &[
+        0x15, 0x00, 0x00, 0x00, // verb 0x15 (mouse)
+        0xC8,                   // button = 200 (Other, > MAX_BUTTON)
+        0x63,                   // kind   = 99  (Other, > MAX_MOUSE_KIND)
+        0xFF, 0xFF,             // mods   = 0xFFFF (all bits incl. reserved 6-15)
+        0x0A, 0x00,             // row    = 10
+        0x14, 0x00,             // col    = 20
+        0xFF, 0xFF,             // dx     = -1     (i16 LE)
+        0x00, 0x80,             // dy     = i16::MIN
+    ];
+    #[rustfmt::skip]
+    let canonical: &[u8] = &[
+        0x15, 0x00, 0x00, 0x00,
+        0xC8, 0x63,
+        0x3F, 0x00,             // mods canonical = 0x003F (reserved bits dropped)
+        0x0A, 0x00, 0x14, 0x00,
+        0xFF, 0xFF, 0x00, 0x80,
+    ];
+    let m = decode_message(input).unwrap();
+    match &m {
+        Message::Mouse(mo) => {
+            assert!(matches!(mo.button, Button::Other(b) if b.get() == 200));
+            assert!(matches!(mo.kind, MouseKind::Other(k) if k.get() == 99));
+            assert_eq!(
+                mo.mods,
+                Modifiers { shift: true, control: true, alt: true, super_: true, caps_lock: true, fn_: true }
+            );
+            assert_eq!(mo.dx, -1);
+            assert_eq!(mo.dy, i16::MIN);
+        }
+        _ => panic!("expected Mouse"),
+    }
+    // encode drops the reserved mod bits -> the canonical golden; the canonical decodes to the same.
+    assert_eq!(encode_message(&m), canonical);
+    assert_eq!(decode_message(canonical).unwrap(), m);
+}
+
+/// verbatim tail (non-UTF-8) — `paste` (verb 0x16). Locks `Vec<u8>` (a `String` would reject this).
+#[test]
+fn vector_paste_non_utf8() {
+    #[rustfmt::skip]
+    let golden: &[u8] = &[
+        0x16, 0x00, 0x00, 0x00, // verb 0x16 (paste)
+        0xFF, 0x00, 0x68, 0x69, // [0xFF, NUL, 'h', 'i'] — non-UTF-8 clipboard bytes
+    ];
+    let expected = Message::Paste(Paste(vec![0xFF, 0x00, 0x68, 0x69]));
+    assert_eq!(decode_message(golden).unwrap(), expected);
+    assert_eq!(encode_message(&expected), golden);
+}
+
+/// Dimensions reuse — `resize` (verb 0x13). Layout `[verb u32][rows u16][cols u16]`.
+#[test]
+fn vector_resize() {
+    #[rustfmt::skip]
+    let golden: &[u8] = &[
+        0x13, 0x00, 0x00, 0x00, // verb 0x13 (resize)
+        0x18, 0x00,             // rows = 24
+        0x50, 0x00,             // cols = 80
+    ];
+    let expected = Message::Resize(Resize(Dimensions { rows: 24, cols: 80 }));
+    assert_eq!(decode_message(golden).unwrap(), expected);
+    assert_eq!(encode_message(&expected), golden);
+}
+
+/// fixed u32 — `viewport` (verb 0x14). Layout `[verb u32][offset u32]`.
+#[test]
+fn vector_viewport() {
+    #[rustfmt::skip]
+    let golden: &[u8] = &[
+        0x14, 0x00, 0x00, 0x00, // verb 0x14 (viewport)
+        0x64, 0x00, 0x00, 0x00, // offset = 100
+    ];
+    let expected = Message::Viewport(Viewport { offset: 100 });
+    assert_eq!(decode_message(golden).unwrap(), expected);
+    assert_eq!(encode_message(&expected), golden);
+}
+
+/// raw u8 — `focus` (verb 0x17). Layout `[verb u32][gained u8]`.
+#[test]
+fn vector_focus() {
+    #[rustfmt::skip]
+    let golden: &[u8] = &[
+        0x17, 0x00, 0x00, 0x00, // verb 0x17 (focus)
+        0x01,                   // gained = 1
+    ];
+    let expected = Message::Focus(Focus { gained: 1 });
+    assert_eq!(decode_message(golden).unwrap(), expected);
+    assert_eq!(encode_message(&expected), golden);
+}
+
+/// input reject vectors: a mouse short-body, a viewport trailing-bytes, a focus short-body.
+#[test]
+fn vector_input_rejects() {
+    // mouse 11B (< 12)
+    let mut m = verb::MOUSE.to_le_bytes().to_vec();
+    m.extend_from_slice(&[0u8; 11]);
+    assert_eq!(decode_message(&m), Err(Reject::ShortBody { needed: 12, got: 11 }));
+    // viewport 5B (> 4)
+    let mut v = verb::VIEWPORT.to_le_bytes().to_vec();
+    v.extend_from_slice(&[0u8; 5]);
+    assert_eq!(decode_message(&v), Err(Reject::TrailingBytes { extra: 1 }));
+    // focus 0B (< 1)
+    let f = verb::FOCUS.to_le_bytes().to_vec();
+    assert_eq!(decode_message(&f), Err(Reject::ShortBody { needed: 1, got: 0 }));
+}
+
+/// G0 / G3 coverage (re-tightened, sprint close): every implemented verb has a vector, both ways,
+/// anchored to `IMPLEMENTED(17)` — fails if any of the 17 lacks a vector.
 #[test]
 fn vectors_cover_every_implemented_verb() {
-    // every implemented verb has at least one conformance vector above (0x25 has three: a valid
-    // listing + the two reject vectors).
     let covered = [
         verb::PANE_STATE,
         verb::FILE_CHUNK,
@@ -350,6 +464,11 @@ fn vectors_cover_every_implemented_verb() {
         verb::LIST,
         verb::LIST_ENTRY,
         verb::REQUEST_FILE,
+        verb::RESIZE,
+        verb::VIEWPORT,
+        verb::MOUSE,
+        verb::PASTE,
+        verb::FOCUS,
     ];
     assert_eq!(covered.len(), verb::IMPLEMENTED.len());
     for v in verb::IMPLEMENTED {
