@@ -121,9 +121,12 @@ bounds-checked decoder, never a serialization library and **never a box-supplied
 - **a verbatim blob** — the rest of the frame, taken as bytes and never parsed (file content, the net
   payload, keystrokes).
 - **a segment stack** — a **scan** that *verifies*, never transforms: every byte is checked against
-  the segment's alphabet or the message is rejected; a `0x1F` byte (excluded from the alphabet, so it
-  cannot occur in content) ends a segment; the frame ends the stack (a file destination, the net
-  address).
+  the segment's alphabet or the message is rejected. A `0x1F` byte (excluded from the alphabet, so it
+  cannot occur in content) **separates** adjacent segments; the **frame ends the last segment**. `0x1F`
+  is a **separator, not a terminator** — there is no trailing delimiter, and a leading, trailing, or
+  doubled `0x1F` yields an empty segment, which is **rejected** (both alphabets require a non-empty
+  segment regardless). So each stack has exactly one encoding and round-trip is canonical. (A file
+  destination, the net address.)
 
 Two variable parts in one body is illegal — that is two messages. A boundary comes from the verb, a
 fixed width, the `0x1F` scan, or the hardware frame — **never from a count the box authored.**
@@ -226,7 +229,7 @@ id growth, zero for now). Ids are grouped by service in blocks of 16, with room 
 Blocks: `0x0_` control, `0x1_` terminal, `0x2_` file, `0x3_` net. Unused ids in each block and all of
 `0x40`–`0xFF` are reserved.
 
-> *Rationale.* 21 verbs of 256, four service blocks of 16 — generous headroom in every block, and the
+> *Rationale.* 22 verbs of 256, four service blocks of 16 — generous headroom in every block, and the
 > low-byte id leaves the upper three bytes for flags without disturbing 4-byte alignment.
 
 ### Input events

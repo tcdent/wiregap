@@ -1,0 +1,13 @@
+[package]
+name = "proto"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Zero non-dev dependencies (Decided Fork #5 / G6.b): the library links only `core` + `alloc`.
+[dependencies]
+
+# Test-only. `trybuild` drives the G4 compile-fail (negative) case; it is never linked into the
+# library surface.
+[dev-dependencies]
+trybuild = "1"

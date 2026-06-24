@@ -1,0 +1,4 @@
+target
+artifacts
+coverage
+# NOTE: `corpus/` is intentionally tracked — G2 requires the coverage-guided corpus committed.

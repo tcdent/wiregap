@@ -1,0 +1,27 @@
+[package]
+name = "proto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.proto]
+path = ".."
+
+# G2 requires these on for the fuzz build: integer overflow and debug assertions trap rather than
+# wrap/skip. cargo-fuzz builds the release profile.
+[profile.release]
+debug-assertions = true
+overflow-checks = true
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false

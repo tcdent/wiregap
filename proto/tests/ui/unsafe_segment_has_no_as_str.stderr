@@ -1,0 +1,5 @@
+error[E0599]: no method named `as_str` found for struct `UnsafeSegment` in the current scope
+ --> tests/ui/unsafe_segment_has_no_as_str.rs:9:45
+  |
+9 |     let _loggable = real_name.segments()[0].as_str();
+  |                                             ^^^^^^ method not found in `UnsafeSegment`
