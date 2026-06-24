@@ -79,8 +79,8 @@ pub use terminal::dimensions::Dimensions;
 pub use terminal::display::{CreatePty, Display};
 #[cfg(feature = "terminal")]
 pub use terminal::input::{
-    Button, Focus, Modifiers, Mouse, MouseKind, Paste, ReservedButton, ReservedMouseKind, Resize,
-    Viewport,
+    Button, Focus, Key, KeyKind, Modifiers, Mouse, MouseKind, Paste, ReservedButton, ReservedKeyKind,
+    ReservedMouseKind, Resize, Viewport,
 };
 #[cfg(feature = "terminal")]
 pub use terminal::pane_state::PaneState;

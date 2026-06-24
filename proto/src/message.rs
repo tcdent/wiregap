@@ -44,7 +44,7 @@ use crate::net::{NetAddress, NetError, NetPayload, NetResponse};
 #[cfg(feature = "terminal")]
 use crate::terminal::display::{CreatePty, Display};
 #[cfg(feature = "terminal")]
-use crate::terminal::input::{Focus, Mouse, Paste, Resize, Viewport};
+use crate::terminal::input::{Focus, Key, Mouse, Paste, Resize, Viewport};
 #[cfg(feature = "terminal")]
 use crate::terminal::pane_state::PaneState;
 
@@ -56,6 +56,8 @@ pub enum Message {
     #[cfg(feature = "control")]
     OpenSession(OpenSession),
     // terminal (0x1_)
+    #[cfg(feature = "terminal")]
+    Key(Key),
     #[cfg(feature = "terminal")]
     PaneState(PaneState),
     #[cfg(feature = "terminal")]
@@ -107,6 +109,8 @@ impl Message {
         match self {
             #[cfg(feature = "control")]
             Message::OpenSession(_) => OpenSession::VERB,
+            #[cfg(feature = "terminal")]
+            Message::Key(_) => Key::VERB,
             #[cfg(feature = "terminal")]
             Message::PaneState(_) => PaneState::VERB,
             #[cfg(feature = "terminal")]
@@ -182,6 +186,8 @@ pub fn decode_message(frame: &[u8]) -> Result<Message, Reject> {
         #[cfg(feature = "control")]
         verb::OPEN_SESSION => OpenSession::decode(body).map(Message::OpenSession),
         #[cfg(feature = "terminal")]
+        verb::KEY => Key::decode(body).map(Message::Key),
+        #[cfg(feature = "terminal")]
         verb::PANE_STATE => PaneState::decode(body).map(Message::PaneState),
         #[cfg(feature = "terminal")]
         verb::CREATE_PTY => CreatePty::decode(body).map(Message::CreatePty),
@@ -244,6 +250,8 @@ pub fn encode_message(message: &Message) -> Vec<u8> {
     match message {
         #[cfg(feature = "control")]
         Message::OpenSession(m) => m.encode(&mut out),
+        #[cfg(feature = "terminal")]
+        Message::Key(m) => m.encode(&mut out),
         #[cfg(feature = "terminal")]
         Message::PaneState(m) => m.encode(&mut out),
         #[cfg(feature = "terminal")]

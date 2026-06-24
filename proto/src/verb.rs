@@ -25,7 +25,7 @@ pub const OPEN_SESSION: u32 = 0x00; // open-session         head→box          
 // ---- 0x1_  terminal -----------------------------------------------------------------------
 pub const CREATE_PTY: u32 = 0x10; //   create-pty           head→box            impl (dimensions)
 pub const DISPLAY: u32 = 0x11; //      display              box→head            impl (cell stream)
-pub const KEY: u32 = 0x12; //          key                  head→box            stub (BLOCKED: keysym table)
+pub const KEY: u32 = 0x12; //          key                  head→box            impl (KeySym raw u32 + text tail)
 pub const RESIZE: u32 = 0x13; //       resize               head→box            impl (Dimensions reuse)
 pub const VIEWPORT: u32 = 0x14; //     viewport             head→box            impl (u32 fixed)
 pub const MOUSE: u32 = 0x15; //        mouse                head→box            impl (12B + carriers)
@@ -111,6 +111,14 @@ pub const MOD_SUPER_BIT: u32 = 3;
 pub const MOD_CAPS_LOCK_BIT: u32 = 4;
 pub const MOD_FN_BIT: u32 = 5;
 
+// `KeyKind` (u8) — **PROVISIONAL** (model §8 names Press/Repeat/Release but does not number them;
+// pinned here like the cell op-set / MouseKind, pending operator ratification). `> MAX_KEY_KIND` raw.
+pub const KEY_KIND_PRESS: u8 = 0;
+pub const KEY_KIND_REPEAT: u8 = 1;
+pub const KEY_KIND_RELEASE: u8 = 2;
+/// The highest defined key kind (provisional); `>` it is reserved and carried raw.
+pub const MAX_KEY_KIND: u8 = KEY_KIND_RELEASE;
+
 // ===========================================================================================
 // L1 ENVELOPE LAYOUT — the frame header the box encodes + the proxy decodes (model.md §1/§2).
 //   `[session_id u32 LE][flags u32 LE][L2 [verb u32][body]]` — 8 bytes, L2 stays 4-byte aligned.
@@ -172,9 +180,9 @@ pub const CATALOG: [u32; 22] = [
 ///
 /// 001 seeded 5; 002 (display) adds `create-pty`/`display`; 003 (file) adds `file-write`/`file-data`/
 /// `list`/`list-entry`/`request-file`; 004 (input) adds `resize`/`viewport`/`mouse`/`paste`/`focus`;
-/// 005 (net) adds `net-response`/`net-error`/`net-payload`; 006 (control) adds `open-session` (0x00).
-/// `key` (0x12) stays a stub (keysym table unpinned). (006 6B turns this into a `&[u32]` with `#[cfg]`
-/// on its elements so a gated build holds only its slice; 6A keeps the fixed array.)
+/// 005 (net) adds `net-response`/`net-error`/`net-payload`; 006 (control) adds `open-session` (0x00);
+/// 007 (input) adds `key` (0x12) — the final verb, the crate now complete (22/22). (006 6B made this a
+/// `&[u32]` with `#[cfg]` on its elements so a gated build holds only its slice.)
 /// 006 6B: a `&[u32]` (not a fixed array) so each element can be `#[cfg]`'d to its service — a gated
 /// build holds only its slice's implemented set (all-features = 21; core-only = `&[]`). `CATALOG`
 /// stays the full fixed `[u32; 22]` (the id space is universal). This is declaration-level metadata
@@ -182,6 +190,8 @@ pub const CATALOG: [u32; 22] = [
 pub const IMPLEMENTED: &[u32] = &[
     #[cfg(feature = "control")]
     OPEN_SESSION,
+    #[cfg(feature = "terminal")]
+    KEY,
     #[cfg(feature = "terminal")]
     PANE_STATE,
     #[cfg(feature = "terminal")]

@@ -159,9 +159,11 @@ the operator; the rest are the team's to choose and are flagged here so they are
   grammars, or keep per-verb layouts that merely coincide (§4).
 - **Feature-gating granularity** — per-service cargo features, per-direction, or all-in.
 - **`no_std`** — is any consumer constrained enough to need it, or is `std` universal?
-- **Named-key integer table** — the `> 0x10FFFF` functional keysym values are deliberately *not* yet
-  pinned (full draft first, per the design conversation); the crate cannot finalize the input codec
-  until that table is assigned.
+- **Functional keysym values are not a crate concern.** The crate carries `keysym` as an opaque
+  `u32` — it validates structure, not values (§2) — so the input codec is **structural and unblocked**;
+  it never needed the values. The meaning of `> 0x10FFFF` values is a **head↔box agreement**: both
+  adopt an existing standard (X11 keysyms or HID) so they do not drift. Not a protocol artifact, not an
+  operator sign-off.
 
 ---
 

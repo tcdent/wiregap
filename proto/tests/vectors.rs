@@ -9,8 +9,9 @@
 
 use proto::{
     Button, Cell, CreatePty, Dimensions, Display, ErrorBody, ErrorCode, FileChunk, FileData,
-    FileError, FileRead, FileType, FileWrite, Focus, List, Message, Modifiers, MouseKind,
-    NetAddress, NetError, NetPayload, NetResponse, OpenSession, PaneState, Paste, Reject, Reassembler,
+    FileError, FileRead, FileType, FileWrite, Focus, Key, KeyKind, List, Message, Modifiers,
+    MouseKind, NetAddress, NetError, NetPayload, NetResponse, OpenSession, PaneState, Paste, Reject,
+    Reassembler,
     ReassemblyState, RequestFile, Resize, Rgb, RowCol, Scalar, Scheme, Viewport, Width, decode_frame,
     decode_message, encode_frame, encode_message, scan_safe, scan_unsafe, verb,
 };
@@ -600,12 +601,80 @@ fn vector_open_session() {
     );
 }
 
-/// G0 / G3 coverage (re-tightened): every implemented verb has a vector, both ways, anchored to
-/// `IMPLEMENTED(21)` — fails if any of the 21 lacks a vector.
+/// control empty-body — `open-session` placeholder kept above; the **`key`** vectors (0x12, the final
+/// verb) follow, then the coverage gate.
+///
+/// raw-u32 keysym + reuse + carry-raw + verbatim — `key` (verb 0x12). The canonical bidirectional
+/// vector: keysym above the `0x10FFFF` threshold (a named key), `kind` Press, defined mods, rsv 0,
+/// text "A".
+#[test]
+fn vector_key() {
+    #[rustfmt::skip]
+    let golden: &[u8] = &[
+        0x12, 0x00, 0x00, 0x00, // verb 0x12 (key)
+        0x00, 0x00, 0x11, 0x00, // KeySym 0x110000 (a named functional key, > 0x10FFFF)
+        0x01, 0x00,             // mods = Shift
+        0x00,                   // kind = Press
+        0x00,                   // reserved
+        0x41,                   // text "A"
+    ];
+    let expected = Message::Key(Key {
+        keysym: 0x0011_0000,
+        mods: Modifiers { shift: true, ..Modifiers::default() },
+        kind: KeyKind::Press,
+        text: b"A".to_vec(),
+    });
+    assert_eq!(decode_message(golden).unwrap(), expected);
+    assert_eq!(encode_message(&expected), golden);
+}
+
+/// Decode-anchored — the Modifiers-reuse canonicalization AND the reserved-byte drop in one non-circular
+/// vector: the **input** golden carries `mods=0xFFFF` + `rsv=0xFF`; decode drops both; encode produces
+/// the hand-authored **canonical** golden (`mods=0x003F`, `rsv=0x00`). Both byte-arrays hand-authored.
+#[test]
+fn vector_key_reserved_canonical() {
+    #[rustfmt::skip]
+    let input: &[u8] = &[
+        0x12, 0x00, 0x00, 0x00, // verb 0x12 (key)
+        0x69, 0x00, 0x00, 0x00, // KeySym 0x69 ('i')
+        0xFF, 0xFF,             // mods 0xFFFF (all bits incl. reserved 6-15)
+        0x02,                   // kind = Release
+        0xFF,                   // reserved byte = 0xFF (dropped)
+        0x68, 0x69,             // text "hi"
+    ];
+    #[rustfmt::skip]
+    let canonical: &[u8] = &[
+        0x12, 0x00, 0x00, 0x00,
+        0x69, 0x00, 0x00, 0x00,
+        0x3F, 0x00,             // mods canonical 0x003F
+        0x02,
+        0x00,                   // reserved canonical 0
+        0x68, 0x69,
+    ];
+    let m = decode_message(input).unwrap();
+    match &m {
+        Message::Key(k) => {
+            assert_eq!(k.keysym, 0x69);
+            assert_eq!(
+                k.mods,
+                Modifiers { shift: true, control: true, alt: true, super_: true, caps_lock: true, fn_: true }
+            );
+            assert_eq!(k.kind, KeyKind::Release);
+            assert_eq!(k.text, b"hi");
+        }
+        _ => panic!("expected Key"),
+    }
+    assert_eq!(encode_message(&m), canonical);
+    assert_eq!(decode_message(canonical).unwrap(), m);
+}
+
+/// G0 / G3 coverage (re-tightened, the crate COMPLETE): every implemented verb has a vector, both ways,
+/// anchored to `IMPLEMENTED(22)` — fails if any of the 22 lacks a vector.
 #[test]
 fn vectors_cover_every_implemented_verb() {
     let covered = [
         verb::OPEN_SESSION,
+        verb::KEY,
         verb::PANE_STATE,
         verb::FILE_CHUNK,
         verb::NET_ADDRESS,

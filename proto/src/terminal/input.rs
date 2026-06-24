@@ -126,6 +126,54 @@ impl MouseKind {
     }
 }
 
+// ---- KeyKind (carry-raw enum) ------------------------------------------------------------------
+
+/// A reserved key event kind (a value `> MAX_KEY_KIND`), carried verbatim. Inner private, in-crate
+/// only (value `≥ 3`), so [`KeyKind::Other`] can never hold a defined kind.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ReservedKeyKind(u8);
+
+impl ReservedKeyKind {
+    /// The raw reserved kind value (always `> MAX_KEY_KIND`).
+    #[must_use]
+    pub fn get(self) -> u8 {
+        self.0
+    }
+}
+
+/// The key event kind ([`model.md`] §8). `0..=2` defined (**provisional** numbering — model §8 names
+/// but does not number these); an unrecognized value is carried raw.
+///
+/// [`model.md`]: ../../docs/proto/model.md
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KeyKind {
+    Press,
+    Repeat,
+    Release,
+    /// A value `> MAX_KEY_KIND` — see [`ReservedKeyKind`].
+    Other(ReservedKeyKind),
+}
+
+impl KeyKind {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            verb::KEY_KIND_PRESS => KeyKind::Press,
+            verb::KEY_KIND_REPEAT => KeyKind::Repeat,
+            verb::KEY_KIND_RELEASE => KeyKind::Release,
+            other => KeyKind::Other(ReservedKeyKind(other)),
+        }
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            KeyKind::Press => verb::KEY_KIND_PRESS,
+            KeyKind::Repeat => verb::KEY_KIND_REPEAT,
+            KeyKind::Release => verb::KEY_KIND_RELEASE,
+            KeyKind::Other(reserved) => reserved.get(),
+        }
+    }
+}
+
 // ---- Modifiers (reserved-bit-drop bitfield) ----------------------------------------------------
 
 /// Keyboard modifiers held during the event ([`model.md`] §8): the 6 defined bits as named bools.
@@ -317,11 +365,63 @@ impl Wire for Focus {
     }
 }
 
+// ---- key (0x12) — the final verb -----------------------------------------------------------------
+
+/// `key` (0x12, head→box): a structured key event ([`model.md`] §8). Body = a fixed 8-byte prefix
+/// `[KeySym u32][mods u16][kind u8][reserved u8]` + a verbatim UTF-8 `text` tail (the produced string,
+/// empty = none) — the [`crate::ErrorBody`]/`file-chunk` shape (fixed prefix + verbatim tail).
+///
+/// `keysym` is a **plain raw `u32`** — the crate carries *any* value and applies **no value logic**:
+/// the `0` / `1..=0x10FFFF` / `> 0x10FFFF` threshold and the named-key vocabulary are the consumer's
+/// (the structural-only ruling). `mods` reuses [`Modifiers`]; `kind` is the carry-raw [`KeyKind`]; the
+/// reserved byte is dropped.
+///
+/// [`model.md`]: ../../docs/proto/model.md
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Key {
+    pub keysym: u32,
+    pub mods: Modifiers,
+    pub kind: KeyKind,
+    pub text: Vec<u8>,
+}
+
+impl Wire for Key {
+    const VERB: u32 = verb::KEY;
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.keysym.to_le_bytes());
+        out.extend_from_slice(&self.mods.to_u16().to_le_bytes());
+        out.push(self.kind.to_u8());
+        out.push(0); // reserved byte — canonical zero
+        out.extend_from_slice(&self.text);
+    }
+
+    fn decode(body: &[u8]) -> Result<Self, Reject> {
+        let (prefix, text) = body.split_first_chunk::<8>().ok_or(Reject::ShortBody {
+            needed: 8,
+            got: body.len(),
+        })?;
+        // Destructure the fixed 8-byte prefix (no indexing on input). Byte 7 is reserved → dropped.
+        let [k0, k1, k2, k3, m0, m1, kind, _reserved] = *prefix;
+        Ok(Key {
+            // keysym: every u32 is carried verbatim — NO value logic (no table, no threshold check).
+            keysym: u32::from_le_bytes([k0, k1, k2, k3]),
+            mods: Modifiers::from_u16(u16::from_le_bytes([m0, m1])),
+            kind: KeyKind::from_u8(kind),
+            text: text.to_vec(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Button, Modifiers, Mouse, MouseKind, ReservedButton, ReservedMouseKind};
+    use super::{
+        Button, Key, KeyKind, Modifiers, Mouse, MouseKind, ReservedButton, ReservedKeyKind,
+        ReservedMouseKind,
+    };
     use crate::reject::Reject;
     use crate::wire::Wire;
+    use alloc::vec;
     use alloc::vec::Vec;
 
     fn encode(m: &Mouse) -> Vec<u8> {
@@ -437,5 +537,87 @@ mod tests {
             Mouse::decode(&[0u8; 13]),
             Err(Reject::TrailingBytes { extra: 1 })
         );
+    }
+
+    // ---- key (0x12) ----
+
+    #[test]
+    fn key_kind_bijective_over_full_u8() {
+        for b in 0u8..=255 {
+            assert_eq!(KeyKind::from_u8(b).to_u8(), b, "key kind {b} must round-trip");
+        }
+        assert_eq!(KeyKind::from_u8(2), KeyKind::Release);
+        assert_eq!(KeyKind::from_u8(3), KeyKind::Other(ReservedKeyKind(3)));
+    }
+
+    fn key_rt(k: Key) {
+        let mut wire = Vec::new();
+        k.encode(&mut wire);
+        let back = Key::decode(&wire).expect("key decodes");
+        assert_eq!(back, k);
+        let mut re = Vec::new();
+        back.encode(&mut re);
+        assert_eq!(re, wire);
+    }
+
+    #[test]
+    fn key_roundtrips_over_keysym_value_span() {
+        // the raw-u32 keysym: 0 / 1 / a codepoint / just above the 0x10FFFF threshold / a named key /
+        // the max — every value carried, NO value logic.
+        for keysym in [0u32, 0x1, 0x61, 0x110000, 0x1000010, 0xFFFF_FFFF] {
+            key_rt(Key {
+                keysym,
+                mods: Modifiers {
+                    shift: true,
+                    ..Modifiers::default()
+                },
+                kind: KeyKind::Press,
+                text: b"A".to_vec(),
+            });
+        }
+        // KeyKind Other + empty text + non-UTF-8 text
+        key_rt(Key {
+            keysym: 0x1B,
+            mods: Modifiers::default(),
+            kind: KeyKind::Other(ReservedKeyKind(200)),
+            text: Vec::new(),
+        });
+        key_rt(Key {
+            keysym: 0,
+            mods: Modifiers::default(),
+            kind: KeyKind::Release,
+            text: vec![0xFF, 0x00, 0xFE],
+        });
+    }
+
+    #[test]
+    fn key_decode_drops_reserved_mods_and_byte() {
+        // mods = 0xFFFF and reserved byte = 0xFF on the wire → canonical re-encode (mods 0x003F, rsv 0).
+        #[rustfmt::skip]
+        let wire: &[u8] = &[
+            0x61, 0x00, 0x00, 0x00, // keysym 0x61
+            0xFF, 0xFF,             // mods all bits (incl reserved 6-15)
+            0x01,                   // kind = Repeat
+            0xFF,                   // reserved byte (dropped)
+            0x68, 0x69,             // text "hi"
+        ];
+        let k = Key::decode(wire).unwrap();
+        assert_eq!(k.mods.to_u16(), 0x003F);
+        assert_eq!(k.kind, KeyKind::Repeat);
+        assert_eq!(k.text, b"hi");
+        let mut re = Vec::new();
+        k.encode(&mut re);
+        assert_eq!(&re[4..6], &0x003Fu16.to_le_bytes()); // mods canonical
+        assert_eq!(re[7], 0); // reserved byte canonical
+    }
+
+    #[test]
+    fn key_short_body() {
+        assert_eq!(
+            Key::decode(&[0u8; 7]),
+            Err(Reject::ShortBody { needed: 8, got: 7 })
+        );
+        // exactly 8 bytes → empty text, valid
+        assert!(Key::decode(&[0u8; 8]).is_ok());
     }
 }
