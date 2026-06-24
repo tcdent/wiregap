@@ -10,7 +10,7 @@
 use proto::{
     Button, Cell, CreatePty, Dimensions, Display, ErrorBody, ErrorCode, FileChunk, FileData,
     FileError, FileRead, FileType, FileWrite, Focus, List, Message, Modifiers, MouseKind,
-    NetAddress, NetError, NetPayload, NetResponse, PaneState, Paste, Reject, Reassembler,
+    NetAddress, NetError, NetPayload, NetResponse, OpenSession, PaneState, Paste, Reject, Reassembler,
     ReassemblyState, RequestFile, Resize, Rgb, RowCol, Scalar, Scheme, Viewport, Width, decode_frame,
     decode_message, encode_frame, encode_message, scan_safe, scan_unsafe, verb,
 };
@@ -582,11 +582,30 @@ fn vector_reassembly_never_ending_rejects() {
     }
 }
 
-/// G0 / G3 coverage (re-tightened, sprint close): every implemented verb has a vector, both ways,
-/// anchored to `IMPLEMENTED(20)` — fails if any of the 20 lacks a vector.
+/// control empty-body — `open-session` (verb 0x00). The frame is just `[verb 0x00]` (no body).
+#[test]
+fn vector_open_session() {
+    #[rustfmt::skip]
+    let golden: &[u8] = &[
+        0x00, 0x00, 0x00, 0x00, // verb 0x00 (open-session) — empty body
+    ];
+    let expected = Message::OpenSession(OpenSession);
+    assert_eq!(decode_message(golden).unwrap(), expected);
+    assert_eq!(encode_message(&expected), golden);
+    // live-path route-through: a non-empty 0x00 body → TrailingBytes from decode_message — surfaces
+    // only because 0x00 dispatches to OpenSession::decode.
+    assert_eq!(
+        decode_message(&[0x00, 0x00, 0x00, 0x00, 0xFF]),
+        Err(Reject::TrailingBytes { extra: 1 })
+    );
+}
+
+/// G0 / G3 coverage (re-tightened): every implemented verb has a vector, both ways, anchored to
+/// `IMPLEMENTED(21)` — fails if any of the 21 lacks a vector.
 #[test]
 fn vectors_cover_every_implemented_verb() {
     let covered = [
+        verb::OPEN_SESSION,
         verb::PANE_STATE,
         verb::FILE_CHUNK,
         verb::NET_ADDRESS,
@@ -609,7 +628,8 @@ fn vectors_cover_every_implemented_verb() {
         verb::NET_PAYLOAD,
     ];
     assert_eq!(covered.len(), verb::IMPLEMENTED.len());
-    for v in verb::IMPLEMENTED {
+    // `IMPLEMENTED` is now `&[u32]` (006 6B) — iterate by ref so the element stays `u32`.
+    for &v in verb::IMPLEMENTED {
         assert!(covered.contains(&v), "implemented verb {v:#x} has no conformance vector");
     }
     for v in covered {

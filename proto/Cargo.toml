@@ -7,6 +7,18 @@ publish = false
 # Zero non-dev dependencies (Decided Fork #5 / G6.b): the library links only `core` + `alloc`.
 [dependencies]
 
+# Per-service feature-gating (006 6B / library §7–§8): each consumer compiles only its slice; the
+# validation loop (default = all) exercises the whole. Surface minimization (G6) — e.g. the proxy
+# (`file`,`net`) never compiles the terminal grammar. The features map to the verb blocks
+# (0x0_/0x1_/0x2_/0x3_) and the per-service modules; CORE (verb/reject/wire/envelope/message/segment/
+# errors) is always on. No inter-feature deps — each service uses only CORE.
+[features]
+default = ["control", "terminal", "file", "net"]
+control = []
+terminal = []
+file = []
+net = []
+
 # Test-only. `trybuild` drives the G4 compile-fail (negative) case; it is never linked into the
 # library surface.
 [dev-dependencies]

@@ -24,38 +24,63 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+// CORE modules (always compiled — universal routing + the shared foundational grammars).
 mod envelope;
 mod errors;
-mod file;
-mod list_entry;
 mod message;
-mod net;
-mod reassembler;
 mod reject;
 mod segment;
-mod terminal;
 pub mod verb;
 mod wire;
 
+// Per-service modules (006 6B) — gated at the DECLARATION line; the module files are byte-identical
+// (the cfg never goes inside them). A consumer compiles only the services it links (library §7).
+#[cfg(feature = "control")]
+mod control;
+#[cfg(feature = "terminal")]
+mod terminal;
+#[cfg(feature = "file")]
+mod file;
+#[cfg(feature = "file")]
+mod list_entry;
+#[cfg(feature = "net")]
+mod net;
+#[cfg(feature = "net")]
+mod reassembler;
+
+// CORE re-exports (always available).
 pub use envelope::{Frame, decode_frame, encode_frame};
 pub use errors::{ErrorBody, ErrorCode, ReservedCode};
-pub use file::{FileChunk, FileData, FileError, FileRead, FileWrite, List, RequestFile};
-pub use reassembler::{Reassembler, ReassemblyState};
-pub use list_entry::{FileType, ListEntries, ListEntry, ReservedFileType};
 pub use message::{Message, decode_message, encode_message};
-pub use net::{NetAddress, NetError, NetPayload, NetResponse, ReservedScheme, Scheme};
 pub use reject::Reject;
 pub use segment::{
     SafeSegment, SafeSegmentStack, UnsafeSegment, UnsafeSegmentStack, scan_safe, scan_unsafe,
 };
+pub use wire::Wire;
+
+// Per-service re-exports (gated to match their module).
+#[cfg(feature = "control")]
+pub use control::OpenSession;
+#[cfg(feature = "file")]
+pub use file::{FileChunk, FileData, FileError, FileRead, FileWrite, List, RequestFile};
+#[cfg(feature = "file")]
+pub use list_entry::{FileType, ListEntries, ListEntry, ReservedFileType};
+#[cfg(feature = "net")]
+pub use net::{NetAddress, NetError, NetPayload, NetResponse, ReservedScheme, Scheme};
+#[cfg(feature = "net")]
+pub use reassembler::{Reassembler, ReassemblyState};
+#[cfg(feature = "terminal")]
 pub use terminal::cell::{
     AttrBits, Cell, CursorStyleBits, ReservedCell, Rgb, RowCol, Scalar, Width,
 };
+#[cfg(feature = "terminal")]
 pub use terminal::dimensions::Dimensions;
+#[cfg(feature = "terminal")]
 pub use terminal::display::{CreatePty, Display};
+#[cfg(feature = "terminal")]
 pub use terminal::input::{
     Button, Focus, Modifiers, Mouse, MouseKind, Paste, ReservedButton, ReservedMouseKind, Resize,
     Viewport,
 };
+#[cfg(feature = "terminal")]
 pub use terminal::pane_state::PaneState;
-pub use wire::Wire;

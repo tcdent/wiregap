@@ -40,7 +40,10 @@ pub trait Wire: Sized {
 /// `parse` is fallible (`-> Result<T, Reject>`) so a future record kind can reject a malformed field;
 /// for an infallible record (e.g. a display cell carried raw) it simply returns `Ok`.
 //
-// Live consumer: `display` (0x11) `Display::decode` routes through this decoder (seam 2B).
+// Live consumer: `display` (0x11) `Display::decode` routes through this decoder (seam 2B). Its only
+// consumer is the terminal service, so it is `cfg(terminal)` in place — moving it would edit
+// `display.rs` (a protected anchor) which imports it (006 6B).
+#[cfg(feature = "terminal")]
 pub(crate) fn decode_record_tail<const N: usize, T, F>(
     tail: &[u8],
     mut parse: F,
@@ -64,7 +67,8 @@ where
     Ok(out)
 }
 
-#[cfg(test)]
+// The unit tests exercise `decode_record_tail` only, so they share its `terminal` gate.
+#[cfg(all(test, feature = "terminal"))]
 mod tests {
     use super::decode_record_tail;
     use crate::reject::Reject;

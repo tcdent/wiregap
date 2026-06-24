@@ -20,7 +20,7 @@
 // ===========================================================================================
 
 // ---- 0x0_  control ------------------------------------------------------------------------
-pub const OPEN_SESSION: u32 = 0x00; // open-session         head→box            defer
+pub const OPEN_SESSION: u32 = 0x00; // open-session         head→box            impl (empty body)
 
 // ---- 0x1_  terminal -----------------------------------------------------------------------
 pub const CREATE_PTY: u32 = 0x10; //   create-pty           head→box            impl (dimensions)
@@ -172,27 +172,54 @@ pub const CATALOG: [u32; 22] = [
 ///
 /// 001 seeded 5; 002 (display) adds `create-pty`/`display`; 003 (file) adds `file-write`/`file-data`/
 /// `list`/`list-entry`/`request-file`; 004 (input) adds `resize`/`viewport`/`mouse`/`paste`/`focus`;
-/// 005 (net) adds `net-response` (0x31), `net-error` (0x32), `net-payload` (0x33). `key` (0x12) stays a
-/// stub (keysym table unpinned).
-pub const IMPLEMENTED: [u32; 20] = [
+/// 005 (net) adds `net-response`/`net-error`/`net-payload`; 006 (control) adds `open-session` (0x00).
+/// `key` (0x12) stays a stub (keysym table unpinned). (006 6B turns this into a `&[u32]` with `#[cfg]`
+/// on its elements so a gated build holds only its slice; 6A keeps the fixed array.)
+/// 006 6B: a `&[u32]` (not a fixed array) so each element can be `#[cfg]`'d to its service — a gated
+/// build holds only its slice's implemented set (all-features = 21; core-only = `&[]`). `CATALOG`
+/// stays the full fixed `[u32; 22]` (the id space is universal). This is declaration-level metadata
+/// (the implemented-set per slice), not decode behavior.
+pub const IMPLEMENTED: &[u32] = &[
+    #[cfg(feature = "control")]
+    OPEN_SESSION,
+    #[cfg(feature = "terminal")]
     PANE_STATE,
-    FILE_CHUNK,
-    FILE_READ,
-    NET_ADDRESS,
-    FILE_ERROR,
+    #[cfg(feature = "terminal")]
     CREATE_PTY,
+    #[cfg(feature = "terminal")]
     DISPLAY,
-    FILE_WRITE,
-    FILE_DATA,
-    LIST,
-    LIST_ENTRY,
-    REQUEST_FILE,
+    #[cfg(feature = "terminal")]
     RESIZE,
+    #[cfg(feature = "terminal")]
     VIEWPORT,
+    #[cfg(feature = "terminal")]
     MOUSE,
+    #[cfg(feature = "terminal")]
     PASTE,
+    #[cfg(feature = "terminal")]
     FOCUS,
+    #[cfg(feature = "file")]
+    FILE_WRITE,
+    #[cfg(feature = "file")]
+    FILE_CHUNK,
+    #[cfg(feature = "file")]
+    FILE_READ,
+    #[cfg(feature = "file")]
+    FILE_DATA,
+    #[cfg(feature = "file")]
+    LIST,
+    #[cfg(feature = "file")]
+    LIST_ENTRY,
+    #[cfg(feature = "file")]
+    REQUEST_FILE,
+    #[cfg(feature = "file")]
+    FILE_ERROR,
+    #[cfg(feature = "net")]
+    NET_ADDRESS,
+    #[cfg(feature = "net")]
     NET_RESPONSE,
+    #[cfg(feature = "net")]
     NET_ERROR,
+    #[cfg(feature = "net")]
     NET_PAYLOAD,
 ];
