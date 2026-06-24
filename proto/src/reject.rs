@@ -14,7 +14,9 @@ use core::fmt;
 /// are carried raw (not rejected) — Decided Fork #8. That absence is the coherence tell that the
 /// library never rejects on a *value* the consumer owns.
 ///
-/// Seam 1A defined the segment-scan rejections; seam 1B adds the message-geometry rejections.
+/// Seam 1A defined the segment-scan rejections; seam 1B adds the message-geometry rejections; seam
+/// 2A adds the record-tail geometry reject. New variants are **appended last** so existing
+/// discriminants are preserved (the scan-surface codegen that constructs them stays byte-identical).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Reject {
     /// The verb's low byte is not a supported id. Keys on `verb & 0xFF` only — the reserved upper
@@ -40,6 +42,10 @@ pub enum Reject {
         offset: usize,
         byte: u8,
     },
+    /// A record-tail body had `remainder` bytes past the last whole `record_len`-byte record — a
+    /// partial trailing record (`frame_len % record_len != 0`). Structural geometry reject, distinct
+    /// from `TrailingBytes` (which is bytes past a *fixed single* body). Appended last (seam 2A).
+    PartialRecord { record_len: usize, remainder: usize },
 }
 
 impl fmt::Display for Reject {
@@ -67,6 +73,13 @@ impl fmt::Display for Reject {
             } => write!(
                 f,
                 "byte 0x{byte:02x} not allowed in segment {index} at offset {offset}"
+            ),
+            Reject::PartialRecord {
+                record_len,
+                remainder,
+            } => write!(
+                f,
+                "partial trailing record: {remainder} bytes past the last {record_len}-byte record"
             ),
         }
     }

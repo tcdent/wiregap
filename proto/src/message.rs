@@ -12,12 +12,14 @@ use alloc::vec::Vec;
 use crate::file::{FileChunk, FileError, FileRead};
 use crate::net::NetAddress;
 use crate::reject::Reject;
+use crate::terminal::display::{CreatePty, Display};
 use crate::terminal::pane_state::PaneState;
 use crate::verb;
 use crate::wire::Wire;
 
-/// A decoded message: one variant per **seed** verb. The other 17 verbs are declared in [`verb`] but
-/// have no variant or decode arm in sprint 001 — they resolve to [`Reject::UnsupportedVerb`].
+/// A decoded message: one variant per **implemented** verb (see [`verb::IMPLEMENTED`]). The remaining
+/// catalog verbs are declared in [`verb`] but have no decode arm yet — they resolve to
+/// [`Reject::UnsupportedVerb`].
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Message {
     PaneState(PaneState),
@@ -25,6 +27,8 @@ pub enum Message {
     FileRead(FileRead),
     NetAddress(NetAddress),
     FileError(FileError),
+    CreatePty(CreatePty),
+    Display(Display),
 }
 
 impl Message {
@@ -37,6 +41,8 @@ impl Message {
             Message::FileRead(_) => FileRead::VERB,
             Message::NetAddress(_) => NetAddress::VERB,
             Message::FileError(_) => FileError::VERB,
+            Message::CreatePty(_) => CreatePty::VERB,
+            Message::Display(_) => Display::VERB,
         }
     }
 }
@@ -56,6 +62,10 @@ pub fn decode_message(frame: &[u8]) -> Result<Message, Reject> {
         verb::FILE_READ => FileRead::decode(body).map(Message::FileRead),
         verb::NET_ADDRESS => NetAddress::decode(body).map(Message::NetAddress),
         verb::FILE_ERROR => FileError::decode(body).map(Message::FileError),
+        verb::CREATE_PTY => CreatePty::decode(body).map(Message::CreatePty),
+        // The production head path: 0x11 routes straight through `Display::decode` (which rides the
+        // 2A `decode_record_tail`) — no inline cell loop here.
+        verb::DISPLAY => Display::decode(body).map(Message::Display),
         _ => Err(Reject::UnsupportedVerb { verb: id }),
     }
 }
@@ -72,6 +82,8 @@ pub fn encode_message(message: &Message) -> Vec<u8> {
         Message::FileRead(m) => m.encode(&mut out),
         Message::NetAddress(m) => m.encode(&mut out),
         Message::FileError(m) => m.encode(&mut out),
+        Message::CreatePty(m) => m.encode(&mut out),
+        Message::Display(m) => m.encode(&mut out),
     }
     out
 }

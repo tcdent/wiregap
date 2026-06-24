@@ -19,6 +19,11 @@
 
 extern crate alloc;
 
+// Test-only: the unit-test harness needs `std`. Gated to `cfg(test)`, so the audited (non-test) lib
+// build stays `no_std` — `cargo build -p proto` and the bare-metal target never see this.
+#[cfg(test)]
+extern crate std;
+
 mod errors;
 mod file;
 mod message;
@@ -37,5 +42,10 @@ pub use reject::Reject;
 pub use segment::{
     SafeSegment, SafeSegmentStack, UnsafeSegment, UnsafeSegmentStack, scan_safe, scan_unsafe,
 };
+pub use terminal::cell::{
+    AttrBits, Cell, CursorStyleBits, ReservedCell, Rgb, RowCol, Scalar, Width,
+};
+pub use terminal::dimensions::Dimensions;
+pub use terminal::display::{CreatePty, Display};
 pub use terminal::pane_state::PaneState;
 pub use wire::Wire;

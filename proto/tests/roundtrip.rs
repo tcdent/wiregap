@@ -308,19 +308,19 @@ fn error_codes_are_contiguous_zero_to_max() {
 }
 
 #[test]
-fn seed_set_matches_dispatch() {
-    // G0 coherence: the source `SEED` constant must equal the set of verbs with a real decode arm.
-    // A seed verb with an empty body decodes to Ok or a *structural* reject (it has an arm); every
-    // non-seed catalog verb decodes to UnsupportedVerb (it is a stub).
-    assert_eq!(verb::SEED.len(), 5);
-    assert!(verb::SEED.iter().all(|s| verb::CATALOG.contains(s)));
+fn implemented_set_matches_dispatch() {
+    // G0 coherence: the source `IMPLEMENTED` constant must equal the set of verbs with a real decode
+    // arm. An implemented verb with an empty body decodes to Ok or a *structural* reject (it has an
+    // arm); every other catalog verb decodes to UnsupportedVerb (it is a stub).
+    assert_eq!(verb::IMPLEMENTED.len(), 7);
+    assert!(verb::IMPLEMENTED.iter().all(|s| verb::CATALOG.contains(s)));
     for &v in &verb::CATALOG {
         let result = decode_message(&v.to_le_bytes());
         let is_unsupported = matches!(result, Err(Reject::UnsupportedVerb { .. }));
         assert_eq!(
-            verb::SEED.contains(&v),
+            verb::IMPLEMENTED.contains(&v),
             !is_unsupported,
-            "verb {v:#x}: SEED membership must match having a decode arm"
+            "verb {v:#x}: IMPLEMENTED membership must match having a decode arm"
         );
     }
 }
