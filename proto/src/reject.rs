@@ -46,6 +46,10 @@ pub enum Reject {
     /// partial trailing record (`frame_len % record_len != 0`). Structural geometry reject, distinct
     /// from `TrailingBytes` (which is bytes past a *fixed single* body). Appended last (seam 2A).
     PartialRecord { record_len: usize, remainder: usize },
+    /// A combined-record (`list-entry`) name had no `0x1F` terminator before the frame end — the
+    /// record-internal `0x1F` is a **terminator** (the frame does not end an unterminated name), unlike
+    /// the segment stack's separator. `offset` is the name's start in the body. Appended last (seam 3A).
+    UnterminatedRecord { offset: usize },
 }
 
 impl fmt::Display for Reject {
@@ -81,6 +85,9 @@ impl fmt::Display for Reject {
                 f,
                 "partial trailing record: {remainder} bytes past the last {record_len}-byte record"
             ),
+            Reject::UnterminatedRecord { offset } => {
+                write!(f, "unterminated record name at offset {offset} (no 0x1F)")
+            }
         }
     }
 }

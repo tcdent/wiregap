@@ -9,7 +9,8 @@
 
 use alloc::vec::Vec;
 
-use crate::file::{FileChunk, FileError, FileRead};
+use crate::file::{FileChunk, FileData, FileError, FileRead, FileWrite, List, RequestFile};
+use crate::list_entry::ListEntries;
 use crate::net::NetAddress;
 use crate::reject::Reject;
 use crate::terminal::display::{CreatePty, Display};
@@ -29,6 +30,11 @@ pub enum Message {
     FileError(FileError),
     CreatePty(CreatePty),
     Display(Display),
+    FileWrite(FileWrite),
+    FileData(FileData),
+    List(List),
+    ListEntries(ListEntries),
+    RequestFile(RequestFile),
 }
 
 impl Message {
@@ -43,6 +49,11 @@ impl Message {
             Message::FileError(_) => FileError::VERB,
             Message::CreatePty(_) => CreatePty::VERB,
             Message::Display(_) => Display::VERB,
+            Message::FileWrite(_) => FileWrite::VERB,
+            Message::FileData(_) => FileData::VERB,
+            Message::List(_) => List::VERB,
+            Message::ListEntries(_) => ListEntries::VERB,
+            Message::RequestFile(_) => RequestFile::VERB,
         }
     }
 }
@@ -66,6 +77,13 @@ pub fn decode_message(frame: &[u8]) -> Result<Message, Reject> {
         // The production head path: 0x11 routes straight through `Display::decode` (which rides the
         // 2A `decode_record_tail`) — no inline cell loop here.
         verb::DISPLAY => Display::decode(body).map(Message::Display),
+        verb::FILE_WRITE => FileWrite::decode(body).map(Message::FileWrite),
+        verb::FILE_DATA => FileData::decode(body).map(Message::FileData),
+        verb::LIST => List::decode(body).map(Message::List),
+        // 0x25 routes through `ListEntries::decode` → the 3A `decode_list_entries` (terminator-bounded);
+        // an `UnterminatedRecord` from here is the observable proof of the route-through.
+        verb::LIST_ENTRY => ListEntries::decode(body).map(Message::ListEntries),
+        verb::REQUEST_FILE => RequestFile::decode(body).map(Message::RequestFile),
         _ => Err(Reject::UnsupportedVerb { verb: id }),
     }
 }
@@ -84,6 +102,11 @@ pub fn encode_message(message: &Message) -> Vec<u8> {
         Message::FileError(m) => m.encode(&mut out),
         Message::CreatePty(m) => m.encode(&mut out),
         Message::Display(m) => m.encode(&mut out),
+        Message::FileWrite(m) => m.encode(&mut out),
+        Message::FileData(m) => m.encode(&mut out),
+        Message::List(m) => m.encode(&mut out),
+        Message::ListEntries(m) => m.encode(&mut out),
+        Message::RequestFile(m) => m.encode(&mut out),
     }
     out
 }

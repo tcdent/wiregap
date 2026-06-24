@@ -236,11 +236,16 @@ fn error_code_known_values_are_canonical_not_unknown() {
 
 #[test]
 fn unknown_low_byte_is_unsupported_verb() {
-    // a declared-but-unseeded stub verb (file-write 0x20)
-    let frame = verb::FILE_WRITE.to_le_bytes().to_vec();
+    // any declared-but-unimplemented catalog verb is a stub → UnsupportedVerb. Derived from the
+    // catalog so it never churns as service sprints implement specific ids.
+    let stub = verb::CATALOG
+        .iter()
+        .copied()
+        .find(|v| !verb::IMPLEMENTED.contains(v))
+        .expect("an unimplemented stub verb exists");
     assert_eq!(
-        decode_message(&frame),
-        Err(Reject::UnsupportedVerb { verb: 0x20 })
+        decode_message(&stub.to_le_bytes()),
+        Err(Reject::UnsupportedVerb { verb: stub })
     );
     // a fully unused id
     let frame = 0x99u32.to_le_bytes().to_vec();
@@ -312,7 +317,7 @@ fn implemented_set_matches_dispatch() {
     // G0 coherence: the source `IMPLEMENTED` constant must equal the set of verbs with a real decode
     // arm. An implemented verb with an empty body decodes to Ok or a *structural* reject (it has an
     // arm); every other catalog verb decodes to UnsupportedVerb (it is a stub).
-    assert_eq!(verb::IMPLEMENTED.len(), 7);
+    assert_eq!(verb::IMPLEMENTED.len(), 12);
     assert!(verb::IMPLEMENTED.iter().all(|s| verb::CATALOG.contains(s)));
     for &v in &verb::CATALOG {
         let result = decode_message(&v.to_le_bytes());

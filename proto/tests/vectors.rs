@@ -8,9 +8,9 @@
 //! case, not a bidirectional vector). Verb ids are provisional until §8 ratification.
 
 use proto::{
-    Cell, CreatePty, Dimensions, Display, ErrorBody, ErrorCode, FileChunk, FileError, FileRead,
-    Message, NetAddress, PaneState, Reject, Rgb, RowCol, Scalar, Scheme, Width, decode_message,
-    encode_message, scan_safe, scan_unsafe, verb,
+    Cell, CreatePty, Dimensions, Display, ErrorBody, ErrorCode, FileChunk, FileData, FileError,
+    FileRead, FileType, FileWrite, List, Message, NetAddress, PaneState, Reject, RequestFile, Rgb,
+    RowCol, Scalar, Scheme, Width, decode_message, encode_message, scan_safe, scan_unsafe, verb,
 };
 
 /// fixed-record primitive — `pane-state` (verb 0x18).
@@ -203,10 +203,140 @@ fn vector_create_pty() {
     assert_eq!(encode_message(&expected), golden);
 }
 
-/// G0 / G1 coverage: the vectors above name every **implemented** verb exactly, anchored to the source
-/// `IMPLEMENTED` constant (not a hand-typed count).
+/// repeated combined-record — `list-entry` (verb 0x25): a valid 2-record listing.
+/// Record layout `[size u64][mtime_secs u64][mtime_nanos u32][type_flags u32][name][0x1F]` (all LE).
+#[test]
+fn vector_list_entry_listing() {
+    #[rustfmt::skip]
+    let golden: &[u8] = &[
+        0x25, 0x00, 0x00, 0x00, // verb 0x25 (list-entry)
+        // record 0 — size 100, mtime 0, type_flags 1 (Dir), name "docs"
+        0x64, 0, 0, 0, 0, 0, 0, 0, // size = 100
+        0, 0, 0, 0, 0, 0, 0, 0,    // mtime_secs = 0
+        0, 0, 0, 0,                // mtime_nanos = 0
+        0x01, 0, 0, 0,             // type_flags = 1 (Dir)
+        0x64, 0x6F, 0x63, 0x73,    // "docs"
+        0x1F,                      // terminator
+        // record 1 — size 42, type_flags 0 (File), name "a.txt"
+        0x2A, 0, 0, 0, 0, 0, 0, 0, // size = 42
+        0, 0, 0, 0, 0, 0, 0, 0,    // mtime_secs = 0
+        0, 0, 0, 0,                // mtime_nanos = 0
+        0x00, 0, 0, 0,             // type_flags = 0 (File)
+        0x61, 0x2E, 0x74, 0x78, 0x74, // "a.txt"
+        0x1F,                      // terminator
+    ];
+    let decoded = decode_message(golden).unwrap();
+    match &decoded {
+        Message::ListEntries(le) => {
+            assert_eq!(le.0.len(), 2);
+            assert_eq!(le.0[0].size, 100);
+            assert_eq!(le.0[0].file_type, FileType::Dir);
+            assert_eq!(le.0[0].name.as_bytes(), b"docs");
+            assert_eq!(le.0[1].size, 42);
+            assert_eq!(le.0[1].file_type, FileType::File);
+            assert_eq!(le.0[1].name.as_bytes(), b"a.txt");
+        }
+        _ => panic!("expected ListEntries"),
+    }
+    // encode direction: re-encode of the decoded message reproduces the hand-authored golden.
+    assert_eq!(encode_message(&decoded), golden);
+}
+
+/// terminator-semantics regression guard — `list-entry` (0x25) with a name lacking its `0x1F`.
+#[test]
+fn vector_list_entry_unterminated_reject() {
+    #[rustfmt::skip]
+    let golden: &[u8] = &[
+        0x25, 0x00, 0x00, 0x00, // verb 0x25
+        0, 0, 0, 0, 0, 0, 0, 0,  // size
+        0, 0, 0, 0, 0, 0, 0, 0,  // mtime_secs
+        0, 0, 0, 0,              // mtime_nanos
+        0, 0, 0, 0,              // type_flags
+        0x6E, 0x61, 0x6D, 0x65,  // "name" — NO trailing 0x1F before frame end
+    ];
+    assert_eq!(
+        decode_message(golden),
+        Err(Reject::UnterminatedRecord { offset: 24 })
+    );
+}
+
+/// truncated-metadata reject — `list-entry` (0x25), a started record with < 24 metadata bytes.
+#[test]
+fn vector_list_entry_truncated_metadata_reject() {
+    #[rustfmt::skip]
+    let golden: &[u8] = &[
+        0x25, 0x00, 0x00, 0x00, // verb 0x25
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 20 bytes (< 24)
+    ];
+    assert_eq!(
+        decode_message(golden),
+        Err(Reject::ShortBody { needed: 24, got: 20 })
+    );
+}
+
+/// segment stack (safe) — `file-write` (verb 0x20). Layout `[verb u32][safe stack]`.
+#[test]
+fn vector_file_write() {
+    #[rustfmt::skip]
+    let golden: &[u8] = &[
+        0x20, 0x00, 0x00, 0x00, // verb 0x20 (file-write)
+        0x71, 0x75, 0x61, 0x72, 0x61, 0x6E, 0x74, 0x69, 0x6E, 0x65, // "quarantine"
+        0x1F,                   // separator
+        0x6F, 0x75, 0x74, 0x2E, 0x62, 0x69, 0x6E, // "out.bin"
+    ];
+    let expected = Message::FileWrite(FileWrite(scan_safe(b"quarantine\x1Fout.bin").unwrap()));
+    assert_eq!(decode_message(golden).unwrap(), expected);
+    assert_eq!(encode_message(&expected), golden);
+}
+
+/// segment stack (unsafe) — `list` (verb 0x24). Layout `[verb u32][unsafe stack]`.
+#[test]
+fn vector_list() {
+    #[rustfmt::skip]
+    let golden: &[u8] = &[
+        0x24, 0x00, 0x00, 0x00, // verb 0x24 (list)
+        0x6D, 0x79, 0x20, 0x64, 0x6F, 0x63, 0x73, // "my docs"
+        0x1F,                   // separator
+        0x72, 0x65, 0x70, 0x6F, 0x72, 0x74, 0x73, // "reports"
+    ];
+    let expected = Message::List(List(scan_unsafe(b"my docs\x1Freports").unwrap()));
+    assert_eq!(decode_message(golden).unwrap(), expected);
+    assert_eq!(encode_message(&expected), golden);
+}
+
+/// verbatim tail — `file-data` (verb 0x23). Layout `[verb u32][verbatim bytes]`.
+#[test]
+fn vector_file_data() {
+    #[rustfmt::skip]
+    let golden: &[u8] = &[
+        0x23, 0x00, 0x00, 0x00, // verb 0x23 (file-data)
+        0xDE, 0xAD, 0xBE, 0xEF, // verbatim read bytes (non-UTF-8)
+    ];
+    let expected = Message::FileData(FileData(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+    assert_eq!(decode_message(golden).unwrap(), expected);
+    assert_eq!(encode_message(&expected), golden);
+}
+
+/// segment stack (unsafe) — `request-file` (verb 0x26). Layout `[verb u32][unsafe stack]`.
+#[test]
+fn vector_request_file() {
+    #[rustfmt::skip]
+    let golden: &[u8] = &[
+        0x26, 0x00, 0x00, 0x00, // verb 0x26 (request-file)
+        0x72, 0x65, 0x70, 0x6F, 0x72, 0x74, 0x20, 0x66, 0x69, 0x6E, 0x61, 0x6C, 0x2E, 0x70, 0x64, 0x66, // "report final.pdf"
+    ];
+    let expected = Message::RequestFile(RequestFile(scan_unsafe(b"report final.pdf").unwrap()));
+    assert_eq!(decode_message(golden).unwrap(), expected);
+    assert_eq!(encode_message(&expected), golden);
+}
+
+/// G0 / G3 coverage (re-tightened, sprint close): the vectors name **every implemented verb exactly**,
+/// anchored bidirectionally to the source `IMPLEMENTED` constant (12) — fails if any implemented verb
+/// lacks a vector, or a vector names an unimplemented verb.
 #[test]
 fn vectors_cover_every_implemented_verb() {
+    // every implemented verb has at least one conformance vector above (0x25 has three: a valid
+    // listing + the two reject vectors).
     let covered = [
         verb::PANE_STATE,
         verb::FILE_CHUNK,
@@ -215,9 +345,17 @@ fn vectors_cover_every_implemented_verb() {
         verb::FILE_ERROR,
         verb::DISPLAY,
         verb::CREATE_PTY,
+        verb::FILE_WRITE,
+        verb::FILE_DATA,
+        verb::LIST,
+        verb::LIST_ENTRY,
+        verb::REQUEST_FILE,
     ];
     assert_eq!(covered.len(), verb::IMPLEMENTED.len());
     for v in verb::IMPLEMENTED {
         assert!(covered.contains(&v), "implemented verb {v:#x} has no conformance vector");
+    }
+    for v in covered {
+        assert!(verb::IMPLEMENTED.contains(&v), "vector names unimplemented verb {v:#x}");
     }
 }

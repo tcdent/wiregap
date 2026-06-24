@@ -26,6 +26,7 @@ extern crate std;
 
 mod errors;
 mod file;
+mod list_entry;
 mod message;
 mod net;
 mod reject;
@@ -35,7 +36,8 @@ pub mod verb;
 mod wire;
 
 pub use errors::{ErrorBody, ErrorCode, ReservedCode};
-pub use file::{FileChunk, FileError, FileRead};
+pub use file::{FileChunk, FileData, FileError, FileRead, FileWrite, List, RequestFile};
+pub use list_entry::{FileType, ListEntries, ListEntry, ReservedFileType};
 pub use message::{Message, decode_message, encode_message};
 pub use net::{NetAddress, ReservedScheme, Scheme};
 pub use reject::Reject;

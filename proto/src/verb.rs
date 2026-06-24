@@ -34,13 +34,13 @@ pub const FOCUS: u32 = 0x17; //        focus                head→box          
 pub const PANE_STATE: u32 = 0x18; //   pane-state           box→head            impl (fixed-record)
 
 // ---- 0x2_  file ---------------------------------------------------------------------------
-pub const FILE_WRITE: u32 = 0x20; //   file-write           box→proxy           stub
+pub const FILE_WRITE: u32 = 0x20; //   file-write           box→proxy           impl (safe stack)
 pub const FILE_CHUNK: u32 = 0x21; //   file-chunk           box→proxy           impl (verbatim tail)
 pub const FILE_READ: u32 = 0x22; //    file-read            box→proxy           impl (unsafe stack)
-pub const FILE_DATA: u32 = 0x23; //    file-data            proxy→box           stub
-pub const LIST: u32 = 0x24; //         list                 box→proxy/head→box  stub
-pub const LIST_ENTRY: u32 = 0x25; //   list-entry           response            stub
-pub const REQUEST_FILE: u32 = 0x26; // request-file         head→box            stub
+pub const FILE_DATA: u32 = 0x23; //    file-data            proxy→box           impl (verbatim tail)
+pub const LIST: u32 = 0x24; //         list                 box→proxy/head→box  impl (unsafe stack)
+pub const LIST_ENTRY: u32 = 0x25; //   list-entry           response            impl (combined-record)
+pub const REQUEST_FILE: u32 = 0x26; // request-file         head→box            impl (unsafe stack)
 pub const FILE_ERROR: u32 = 0x27; //   file-error           either              impl (error body)
 
 // ---- 0x3_  net ----------------------------------------------------------------------------
@@ -116,8 +116,9 @@ pub const CATALOG: [u32; 22] = [
 /// (`UnsupportedVerb`). `seed_set_matches_dispatch` ties this to the actual dispatch arms.
 ///
 /// 001 seeded 5 (`pane-state`, `file-chunk`, `file-read`, `net-address`, `file-error`); 002 (display)
-/// adds `create-pty` (0x10) and `display` (0x11).
-pub const IMPLEMENTED: [u32; 7] = [
+/// adds `create-pty` (0x10) and `display` (0x11); 003 (file) adds `file-write` (0x20), `file-data`
+/// (0x23), `list` (0x24), `list-entry` (0x25), `request-file` (0x26).
+pub const IMPLEMENTED: [u32; 12] = [
     PANE_STATE,
     FILE_CHUNK,
     FILE_READ,
@@ -125,4 +126,9 @@ pub const IMPLEMENTED: [u32; 7] = [
     FILE_ERROR,
     CREATE_PTY,
     DISPLAY,
+    FILE_WRITE,
+    FILE_DATA,
+    LIST,
+    LIST_ENTRY,
+    REQUEST_FILE,
 ];
