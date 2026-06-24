@@ -10,8 +10,9 @@
 use proto::{
     Button, Cell, CreatePty, Dimensions, Display, ErrorBody, ErrorCode, FileChunk, FileData,
     FileError, FileRead, FileType, FileWrite, Focus, List, Message, Modifiers, MouseKind,
-    NetAddress, PaneState, Paste, Reject, RequestFile, Resize, Rgb, RowCol, Scalar, Scheme, Viewport,
-    Width, decode_message, encode_message, scan_safe, scan_unsafe, verb,
+    NetAddress, NetError, NetPayload, NetResponse, PaneState, Paste, Reject, Reassembler,
+    ReassemblyState, RequestFile, Resize, Rgb, RowCol, Scalar, Scheme, Viewport, Width, decode_frame,
+    decode_message, encode_frame, encode_message, scan_safe, scan_unsafe, verb,
 };
 
 /// fixed-record primitive — `pane-state` (verb 0x18).
@@ -447,8 +448,142 @@ fn vector_input_rejects() {
     assert_eq!(decode_message(&f), Err(Reject::ShortBody { needed: 1, got: 0 }));
 }
 
+/// verbatim tail — `net-response` (verb 0x31). Layout `[verb u32][response bytes]`. NOT reassembled.
+#[test]
+fn vector_net_response() {
+    #[rustfmt::skip]
+    let golden: &[u8] = &[
+        0x31, 0x00, 0x00, 0x00, // verb 0x31 (net-response)
+        0x7B, 0x22, 0x6F, 0x6B, 0x22, 0x7D, // {"ok"}
+    ];
+    let expected = Message::NetResponse(NetResponse(vec![0x7B, 0x22, 0x6F, 0x6B, 0x22, 0x7D]));
+    assert_eq!(decode_message(golden).unwrap(), expected);
+    assert_eq!(encode_message(&expected), golden);
+}
+
+/// ErrorBody reuse — `net-error` (verb 0x32). Layout `[verb u32][code u32][detail tail]`.
+#[test]
+fn vector_net_error() {
+    #[rustfmt::skip]
+    let golden: &[u8] = &[
+        0x32, 0x00, 0x00, 0x00, // verb 0x32 (net-error)
+        0x05, 0x00, 0x00, 0x00, // code 5 = unreachable
+        0x6E, 0x6F, 0x20, 0x72, 0x6F, 0x75, 0x74, 0x65, // "no route"
+    ];
+    let expected = Message::NetError(NetError(ErrorBody {
+        code: ErrorCode::Unreachable,
+        detail: b"no route".to_vec(),
+    }));
+    assert_eq!(decode_message(golden).unwrap(), expected);
+    assert_eq!(encode_message(&expected), golden);
+}
+
+/// verbatim tail (the COMPLETE reassembled buffer) — `net-payload` (verb 0x33). Single-frame here;
+/// `[verb u32][full payload]`. (The multi-frame join is `vector_net_payload_reassembles_n_frames`.)
+#[test]
+fn vector_net_payload() {
+    #[rustfmt::skip]
+    let golden: &[u8] = &[
+        0x33, 0x00, 0x00, 0x00, // verb 0x33 (net-payload)
+        0x50, 0x4F, 0x53, 0x54, // "POST"
+    ];
+    let expected = Message::NetPayload(NetPayload(vec![0x50, 0x4F, 0x53, 0x54]));
+    assert_eq!(decode_message(golden).unwrap(), expected);
+    assert_eq!(encode_message(&expected), golden);
+}
+
+/// The first **frame-sequence** golden — a payload spanning N frames reassembles to the joined bytes,
+/// which decode ONCE to `NetPayload(full)`. Authored byte-by-byte: the L1 envelope `[session u32]
+/// [flags u32: bit0]` per frame + the opaque join (`0x33` rides frame 1 only; continuations are raw).
+#[test]
+fn vector_net_payload_reassembles_n_frames() {
+    // session 9; frame 1 continuation=1, frame 2 continuation=1, frame 3 continuation=0.
+    #[rustfmt::skip]
+    let frame1: &[u8] = &[
+        0x09, 0x00, 0x00, 0x00, // session_id 9
+        0x01, 0x00, 0x00, 0x00, // flags: bit0 = continuation
+        0x33, 0x00, 0x00, 0x00, // L2 verb 0x33 (net-payload) — frame 1 only
+        0x50, 0x4F,             // "PO"
+    ];
+    #[rustfmt::skip]
+    let frame2: &[u8] = &[
+        0x09, 0x00, 0x00, 0x00, // session_id 9
+        0x01, 0x00, 0x00, 0x00, // flags: continuation
+        0x53, 0x54,             // "ST" — RAW payload (no verb)
+    ];
+    #[rustfmt::skip]
+    let frame3: &[u8] = &[
+        0x09, 0x00, 0x00, 0x00, // session_id 9
+        0x00, 0x00, 0x00, 0x00, // flags: clear (last frame)
+        0x21,                   // "!" — RAW payload
+    ];
+    let mut r = Reassembler::new(64);
+    assert_eq!(r.push(decode_frame(frame1).unwrap().l2, true).unwrap(), ReassemblyState::Accumulating);
+    assert_eq!(r.push(decode_frame(frame2).unwrap().l2, true).unwrap(), ReassemblyState::Accumulating);
+    let complete = match r.push(decode_frame(frame3).unwrap().l2, false).unwrap() {
+        ReassemblyState::Complete(b) => b,
+        other => panic!("{other:?}"),
+    };
+    // joined = [0x33][POST!] -> decode_message ONCE -> NetPayload("POST!")
+    assert_eq!(complete, vec![0x33, 0x00, 0x00, 0x00, 0x50, 0x4F, 0x53, 0x54, 0x21]);
+    assert_eq!(
+        decode_message(&complete).unwrap(),
+        Message::NetPayload(NetPayload(b"POST!".to_vec()))
+    );
+}
+
+/// Fail-closed regression guard — a CAP-EXCEED reject (small test-cap). Two frames sum past the cap →
+/// `ReassemblyOverflow` (the permanent guard; the boundary is value-independent of the production cap).
+#[test]
+fn vector_reassembly_cap_exceed_rejects() {
+    const CAP: usize = 8;
+    let f1 = {
+        let mut o = Vec::new();
+        encode_frame(1, true, &[0u8; 6], &mut o);
+        o
+    };
+    let f2 = {
+        let mut o = Vec::new();
+        encode_frame(1, true, &[0u8; 6], &mut o); // 6 + 6 = 12 > 8
+        o
+    };
+    let mut r = Reassembler::new(CAP);
+    assert_eq!(r.push(decode_frame(&f1).unwrap().l2, true).unwrap(), ReassemblyState::Accumulating);
+    assert_eq!(
+        r.push(decode_frame(&f2).unwrap().l2, true),
+        Err(Reject::ReassemblyOverflow { cap: CAP })
+    );
+}
+
+/// Fail-closed regression guard — a NEVER-ENDING sequence (continuation always set) trips the cap and
+/// is denied; it does not hang awaiting a clear bit.
+#[test]
+fn vector_reassembly_never_ending_rejects() {
+    const CAP: usize = 8;
+    let f = {
+        let mut o = Vec::new();
+        encode_frame(1, true, &[0u8; 4], &mut o); // continuation always set
+        o
+    };
+    let mut r = Reassembler::new(CAP);
+    let mut count = 0;
+    loop {
+        match r.push(decode_frame(&f).unwrap().l2, true) {
+            Ok(ReassemblyState::Accumulating) => {
+                count += 1;
+                assert!(count < 100, "must trip the cap, not loop forever");
+            }
+            Err(Reject::ReassemblyOverflow { cap }) => {
+                assert_eq!(cap, CAP);
+                break;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
 /// G0 / G3 coverage (re-tightened, sprint close): every implemented verb has a vector, both ways,
-/// anchored to `IMPLEMENTED(17)` — fails if any of the 17 lacks a vector.
+/// anchored to `IMPLEMENTED(20)` — fails if any of the 20 lacks a vector.
 #[test]
 fn vectors_cover_every_implemented_verb() {
     let covered = [
@@ -469,6 +604,9 @@ fn vectors_cover_every_implemented_verb() {
         verb::MOUSE,
         verb::PASTE,
         verb::FOCUS,
+        verb::NET_RESPONSE,
+        verb::NET_ERROR,
+        verb::NET_PAYLOAD,
     ];
     assert_eq!(covered.len(), verb::IMPLEMENTED.len());
     for v in verb::IMPLEMENTED {

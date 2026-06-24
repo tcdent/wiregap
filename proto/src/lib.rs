@@ -24,22 +24,26 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod envelope;
 mod errors;
 mod file;
 mod list_entry;
 mod message;
 mod net;
+mod reassembler;
 mod reject;
 mod segment;
 mod terminal;
 pub mod verb;
 mod wire;
 
+pub use envelope::{Frame, decode_frame, encode_frame};
 pub use errors::{ErrorBody, ErrorCode, ReservedCode};
 pub use file::{FileChunk, FileData, FileError, FileRead, FileWrite, List, RequestFile};
+pub use reassembler::{Reassembler, ReassemblyState};
 pub use list_entry::{FileType, ListEntries, ListEntry, ReservedFileType};
 pub use message::{Message, decode_message, encode_message};
-pub use net::{NetAddress, ReservedScheme, Scheme};
+pub use net::{NetAddress, NetError, NetPayload, NetResponse, ReservedScheme, Scheme};
 pub use reject::Reject;
 pub use segment::{
     SafeSegment, SafeSegmentStack, UnsafeSegment, UnsafeSegmentStack, scan_safe, scan_unsafe,

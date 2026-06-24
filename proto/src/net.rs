@@ -6,6 +6,7 @@
 
 use alloc::vec::Vec;
 
+use crate::errors::ErrorBody;
 use crate::reject::Reject;
 use crate::segment::{SafeSegmentStack, scan_safe};
 use crate::verb;
@@ -81,5 +82,61 @@ impl Wire for NetAddress {
             scheme: Scheme::from_u32(u32::from_le_bytes(*scheme)),
             address,
         })
+    }
+}
+
+// ---- the net verbs (005, seam 5B) --------------------------------------------------------------
+
+/// `net-response` (`proxy → box`): the upstream response, a **verbatim** tail. The box reassembles
+/// the response itself (the asymmetry: ingress lands on untrusted ground, relayed per-frame —
+/// approach.md §5); the proxy does **not** reassemble it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct NetResponse(pub Vec<u8>);
+
+impl Wire for NetResponse {
+    const VERB: u32 = verb::NET_RESPONSE;
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.0);
+    }
+
+    fn decode(body: &[u8]) -> Result<Self, Reject> {
+        Ok(NetResponse(body.to_vec()))
+    }
+}
+
+/// `net-error` (`proxy → box`): an upstream/route error — the shared [`ErrorBody`] grammar (one body,
+/// many verbs; reuse, not re-implementation).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct NetError(pub ErrorBody);
+
+impl Wire for NetError {
+    const VERB: u32 = verb::NET_ERROR;
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.0.encode_body(out);
+    }
+
+    fn decode(body: &[u8]) -> Result<Self, Reject> {
+        ErrorBody::decode_body(body).map(NetError)
+    }
+}
+
+/// `net-payload` (`box → proxy`): the verbatim request body, **reassembled** across frames by the
+/// proxy ([`crate::Reassembler`]) before this decodes. Verb `0x33` rides in frame 1 only; continuation
+/// frames are raw payload concatenated opaquely, so the **complete** buffer (`[0x33][full payload]`)
+/// decodes through `decode_message` **once** here — a single verbatim tail over the full payload.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct NetPayload(pub Vec<u8>);
+
+impl Wire for NetPayload {
+    const VERB: u32 = verb::NET_PAYLOAD;
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.0);
+    }
+
+    fn decode(body: &[u8]) -> Result<Self, Reject> {
+        Ok(NetPayload(body.to_vec()))
     }
 }

@@ -50,6 +50,11 @@ pub enum Reject {
     /// record-internal `0x1F` is a **terminator** (the frame does not end an unterminated name), unlike
     /// the segment stack's separator. `offset` is the name's start in the body. Appended last (seam 3A).
     UnterminatedRecord { offset: usize },
+    /// A multi-frame reassembly would exceed the capacity `cap` (the fail-closed total-request bound).
+    /// **Structural / resource** — it rejects on the accumulated byte-count alone, never on any value
+    /// the consumer owns, so the no-value-policy coherence tell holds. This is the proxy's TCB defense:
+    /// a payload that exceeds the cap, or never ends (the cap trips), fails closed. Appended last (5A).
+    ReassemblyOverflow { cap: usize },
 }
 
 impl fmt::Display for Reject {
@@ -87,6 +92,9 @@ impl fmt::Display for Reject {
             ),
             Reject::UnterminatedRecord { offset } => {
                 write!(f, "unterminated record name at offset {offset} (no 0x1F)")
+            }
+            Reject::ReassemblyOverflow { cap } => {
+                write!(f, "reassembly exceeds the {cap}-byte capacity bound")
             }
         }
     }

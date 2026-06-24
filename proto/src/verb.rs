@@ -45,9 +45,9 @@ pub const FILE_ERROR: u32 = 0x27; //   file-error           either              
 
 // ---- 0x3_  net ----------------------------------------------------------------------------
 pub const NET_ADDRESS: u32 = 0x30; //  net-address          box→proxy           impl (safe stack)
-pub const NET_RESPONSE: u32 = 0x31; // net-response          proxy→box           stub
-pub const NET_ERROR: u32 = 0x32; //    net-error            proxy→box           stub
-pub const NET_PAYLOAD: u32 = 0x33; //  net-payload          box→proxy           stub
+pub const NET_RESPONSE: u32 = 0x31; // net-response          proxy→box           impl (verbatim; NOT reassembled)
+pub const NET_ERROR: u32 = 0x32; //    net-error            proxy→box           impl (ErrorBody reuse)
+pub const NET_PAYLOAD: u32 = 0x33; //  net-payload          box→proxy           impl (verbatim; reassembled upstream)
 
 // ===========================================================================================
 // DISPLAY CELL OP-SET — the top byte of a `display` (0x11) cell `u32` (display.md §1–2, §6 decided).
@@ -112,6 +112,29 @@ pub const MOD_CAPS_LOCK_BIT: u32 = 4;
 pub const MOD_FN_BIT: u32 = 5;
 
 // ===========================================================================================
+// L1 ENVELOPE LAYOUT — the frame header the box encodes + the proxy decodes (model.md §1/§2).
+//   `[session_id u32 LE][flags u32 LE][L2 [verb u32][body]]` — 8 bytes, L2 stays 4-byte aligned.
+//   PROVISIONAL (session-id width, the continuation-bit position) — pending operator ratification.
+// ===========================================================================================
+/// The fixed L1 envelope size in bytes; the L2 message begins at this offset (4-byte aligned).
+pub const ENVELOPE_LEN: usize = 8;
+/// The continuation flag's bit position in the envelope `flags` u32 (bit 0). Bits 1–31 are reserved
+/// and **dropped** on decode (the 002/004 reserved-bit-drop) — never read, re-encoded zero.
+pub const FLAG_CONTINUATION_BIT: u32 = 0;
+
+// ===========================================================================================
+// REASSEMBLY CAPACITY BOUND — the fail-closed total reassembled-request cap (5A).
+//   This is a CAPACITY / SECURITY tuning (memory buffered on the trusted proxy vs the largest
+//   legitimate request), DISTINCT IN KIND from the protocol numbers above (verb-ids / op-set /
+//   error-codes / mouse field codes / envelope-layout) — review it with the capacity/security lens.
+//   PROVISIONAL = 32 MiB: the Anthropic Messages API's own ~32 MB request limit, so the proxy fails
+//   closed exactly where the upstream would and admits image-bearing POSTs. DISTINCT from the
+//   per-frame/per-alloc bound (`MAX_FRAME * ALLOC_K` in the fuzz target) — this bounds the TOTAL
+//   reassembled request across frames.
+// ===========================================================================================
+pub const REASSEMBLY_CAP: usize = 32 * 1024 * 1024;
+
+// ===========================================================================================
 // DERIVED ANCHORS — keep in sync with the lists above (asserted by tests).
 // ===========================================================================================
 
@@ -148,9 +171,10 @@ pub const CATALOG: [u32; 22] = [
 /// (`UnsupportedVerb`). `seed_set_matches_dispatch` ties this to the actual dispatch arms.
 ///
 /// 001 seeded 5; 002 (display) adds `create-pty`/`display`; 003 (file) adds `file-write`/`file-data`/
-/// `list`/`list-entry`/`request-file`; 004 (input) adds `resize` (0x13), `viewport` (0x14), `mouse`
-/// (0x15), `paste` (0x16), `focus` (0x17). `key` (0x12) stays a stub (keysym table unpinned).
-pub const IMPLEMENTED: [u32; 17] = [
+/// `list`/`list-entry`/`request-file`; 004 (input) adds `resize`/`viewport`/`mouse`/`paste`/`focus`;
+/// 005 (net) adds `net-response` (0x31), `net-error` (0x32), `net-payload` (0x33). `key` (0x12) stays a
+/// stub (keysym table unpinned).
+pub const IMPLEMENTED: [u32; 20] = [
     PANE_STATE,
     FILE_CHUNK,
     FILE_READ,
@@ -168,4 +192,7 @@ pub const IMPLEMENTED: [u32; 17] = [
     MOUSE,
     PASTE,
     FOCUS,
+    NET_RESPONSE,
+    NET_ERROR,
+    NET_PAYLOAD,
 ];

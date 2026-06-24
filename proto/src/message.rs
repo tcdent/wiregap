@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 
 use crate::file::{FileChunk, FileData, FileError, FileRead, FileWrite, List, RequestFile};
 use crate::list_entry::ListEntries;
-use crate::net::NetAddress;
+use crate::net::{NetAddress, NetError, NetPayload, NetResponse};
 use crate::reject::Reject;
 use crate::terminal::display::{CreatePty, Display};
 use crate::terminal::input::{Focus, Mouse, Paste, Resize, Viewport};
@@ -41,6 +41,9 @@ pub enum Message {
     Mouse(Mouse),
     Paste(Paste),
     Focus(Focus),
+    NetResponse(NetResponse),
+    NetError(NetError),
+    NetPayload(NetPayload),
 }
 
 impl Message {
@@ -65,6 +68,9 @@ impl Message {
             Message::Mouse(_) => Mouse::VERB,
             Message::Paste(_) => Paste::VERB,
             Message::Focus(_) => Focus::VERB,
+            Message::NetResponse(_) => NetResponse::VERB,
+            Message::NetError(_) => NetError::VERB,
+            Message::NetPayload(_) => NetPayload::VERB,
         }
     }
 }
@@ -102,6 +108,13 @@ pub fn decode_message(frame: &[u8]) -> Result<Message, Reject> {
         verb::MOUSE => Mouse::decode(body).map(Message::Mouse),
         verb::PASTE => Paste::decode(body).map(Message::Paste),
         verb::FOCUS => Focus::decode(body).map(Message::Focus),
+        verb::NET_RESPONSE => NetResponse::decode(body).map(Message::NetResponse),
+        // 0x32 routes through `ErrorBody::decode_body` (reuse, not re-impl) — an `ErrorBody` reject
+        // surfacing here proves the route-through.
+        verb::NET_ERROR => NetError::decode(body).map(Message::NetError),
+        // 0x33 decodes the COMPLETE reassembled buffer once (verb 0x33 in frame 1; the reassembler
+        // joined the raw continuation payloads opaquely upstream) — a verbatim tail over the payload.
+        verb::NET_PAYLOAD => NetPayload::decode(body).map(Message::NetPayload),
         _ => Err(Reject::UnsupportedVerb { verb: id }),
     }
 }
@@ -130,6 +143,9 @@ pub fn encode_message(message: &Message) -> Vec<u8> {
         Message::Mouse(m) => m.encode(&mut out),
         Message::Paste(m) => m.encode(&mut out),
         Message::Focus(m) => m.encode(&mut out),
+        Message::NetResponse(m) => m.encode(&mut out),
+        Message::NetError(m) => m.encode(&mut out),
+        Message::NetPayload(m) => m.encode(&mut out),
     }
     out
 }
