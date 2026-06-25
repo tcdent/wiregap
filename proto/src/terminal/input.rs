@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use crate::reject::Reject;
 use crate::terminal::dimensions::Dimensions;
 use crate::verb;
-use crate::wire::Wire;
+use crate::wire::{Wire, take_prefix, verbatim_verb};
 
 // ---- Button (carry-raw enum) -------------------------------------------------------------------
 
@@ -246,28 +246,21 @@ impl Wire for Mouse {
     }
 
     fn decode(body: &[u8]) -> Result<Self, Reject> {
-        let short = Reject::ShortBody {
-            needed: 12,
-            got: body.len(),
-        };
-        let (button, r) = body.split_first_chunk::<1>().ok_or(short)?;
-        let (kind, r) = r.split_first_chunk::<1>().ok_or(short)?;
-        let (mods, r) = r.split_first_chunk::<2>().ok_or(short)?;
-        let (row, r) = r.split_first_chunk::<2>().ok_or(short)?;
-        let (col, r) = r.split_first_chunk::<2>().ok_or(short)?;
-        let (dx, r) = r.split_first_chunk::<2>().ok_or(short)?;
-        let (dy, rest) = r.split_first_chunk::<2>().ok_or(short)?;
+        // 12B fixed-only body — take the prefix (`< 12` → ShortBody{12, body.len()}), then read each
+        // field from the destructured prefix (no index on input); no tail → any extra is TrailingBytes.
+        let (prefix, rest) = take_prefix::<12>(body)?;
         if !rest.is_empty() {
             return Err(Reject::TrailingBytes { extra: rest.len() });
         }
+        let [button, kind, m0, m1, r0, r1, c0, c1, dx0, dx1, dy0, dy1] = *prefix;
         Ok(Mouse {
-            button: Button::from_u8(u8::from_le_bytes(*button)),
-            kind: MouseKind::from_u8(u8::from_le_bytes(*kind)),
-            mods: Modifiers::from_u16(u16::from_le_bytes(*mods)),
-            row: u16::from_le_bytes(*row),
-            col: u16::from_le_bytes(*col),
-            dx: i16::from_le_bytes(*dx),
-            dy: i16::from_le_bytes(*dy),
+            button: Button::from_u8(button),
+            kind: MouseKind::from_u8(kind),
+            mods: Modifiers::from_u16(u16::from_le_bytes([m0, m1])),
+            row: u16::from_le_bytes([r0, r1]),
+            col: u16::from_le_bytes([c0, c1]),
+            dx: i16::from_le_bytes([dx0, dx1]),
+            dy: i16::from_le_bytes([dy0, dy1]),
         })
     }
 }
@@ -307,10 +300,7 @@ impl Wire for Viewport {
     }
 
     fn decode(body: &[u8]) -> Result<Self, Reject> {
-        let (offset, rest) = body.split_first_chunk::<4>().ok_or(Reject::ShortBody {
-            needed: 4,
-            got: body.len(),
-        })?;
+        let (offset, rest) = take_prefix::<4>(body)?;
         if !rest.is_empty() {
             return Err(Reject::TrailingBytes { extra: rest.len() });
         }
@@ -320,21 +310,10 @@ impl Wire for Viewport {
     }
 }
 
-/// `paste` (0x16, head→box): clipboard text, a **verbatim** UTF-8 tail (distinct from a text-only
-/// key). Carried as `Vec<u8>` — UTF-8 validation is the consumer's (law 11), like `ErrorBody.detail`.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Paste(pub Vec<u8>);
-
-impl Wire for Paste {
-    const VERB: u32 = verb::PASTE;
-
-    fn encode(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.0);
-    }
-
-    fn decode(body: &[u8]) -> Result<Self, Reject> {
-        Ok(Paste(body.to_vec()))
-    }
+verbatim_verb! {
+    /// `paste` (0x16, head→box): clipboard text, a **verbatim** UTF-8 tail (distinct from a text-only
+    /// key). Carried as `Vec<u8>` — UTF-8 validation is the consumer's (law 11), like `ErrorBody.detail`.
+    Paste, verb::PASTE
 }
 
 /// `focus` (0x17, head→box): a focus change. `gained` is a raw `u8` (`0`/`1` defined, `2+` reserved)
@@ -352,10 +331,7 @@ impl Wire for Focus {
     }
 
     fn decode(body: &[u8]) -> Result<Self, Reject> {
-        let (gained, rest) = body.split_first_chunk::<1>().ok_or(Reject::ShortBody {
-            needed: 1,
-            got: body.len(),
-        })?;
+        let (gained, rest) = take_prefix::<1>(body)?;
         if !rest.is_empty() {
             return Err(Reject::TrailingBytes { extra: rest.len() });
         }
@@ -397,10 +373,7 @@ impl Wire for Key {
     }
 
     fn decode(body: &[u8]) -> Result<Self, Reject> {
-        let (prefix, text) = body.split_first_chunk::<8>().ok_or(Reject::ShortBody {
-            needed: 8,
-            got: body.len(),
-        })?;
+        let (prefix, text) = take_prefix::<8>(body)?;
         // Destructure the fixed 8-byte prefix (no indexing on input). Byte 7 is reserved → dropped.
         let [k0, k1, k2, k3, m0, m1, kind, _reserved] = *prefix;
         Ok(Key {

@@ -15,6 +15,7 @@ use alloc::vec::Vec;
 
 use crate::reject::Reject;
 use crate::verb;
+use crate::wire::take_prefix;
 
 /// A decoded L1 frame: the session id, the continuation flag, and the **borrowed** L2 bytes (located
 /// in the caller's owned frame copy — never the NIC ring). The consumer routes by `session_id`; the
@@ -29,15 +30,13 @@ pub struct Frame<'a> {
 
 /// Decode an L1 frame. Total: `< ENVELOPE_LEN` bytes → `ShortBody`; reserved flag bits 1–31 dropped.
 pub fn decode_frame(frame: &[u8]) -> Result<Frame<'_>, Reject> {
-    let short = Reject::ShortBody {
-        needed: verb::ENVELOPE_LEN,
-        got: frame.len(),
-    };
-    let (session_id, rest) = frame.split_first_chunk::<4>().ok_or(short)?;
-    let (flags, l2) = rest.split_first_chunk::<4>().ok_or(short)?;
-    let flags = u32::from_le_bytes(*flags);
+    // Take the fixed `ENVELOPE_LEN` header (`< ENVELOPE_LEN` → ShortBody{ENVELOPE_LEN, frame.len()});
+    // the remainder is the borrowed L2 tail. Read session_id + flags from the destructured header.
+    let (header, l2) = take_prefix::<{ verb::ENVELOPE_LEN }>(frame)?;
+    let [s0, s1, s2, s3, f0, f1, f2, f3] = *header;
+    let flags = u32::from_le_bytes([f0, f1, f2, f3]);
     Ok(Frame {
-        session_id: u32::from_le_bytes(*session_id),
+        session_id: u32::from_le_bytes([s0, s1, s2, s3]),
         // continuation from the fixed bit only; bits 1–31 dropped (never read).
         continuation: flags & (1u32 << verb::FLAG_CONTINUATION_BIT) != 0,
         l2,

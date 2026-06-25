@@ -155,8 +155,20 @@ the operator; the rest are the team's to choose and are flagged here so they are
   and to what value? (`net.md` §2 mandates *bounded*; the number is unset.)
 - **Message representation** — one crate-wide verb enum, per-service enums, or a trait per message;
   in-place field overlay vs owned structs at the decode edge.
-- **Grammar reuse** — express shared bodies (actuation header, dimensions, error) as named reusable
-  grammars, or keep per-verb layouts that merely coincide (§4).
+- **Shared implementation, distinct types (resolved — 008).** Where verbs coincide in body *shape* —
+  the verbatim-tail bodies (`net-response`/`net-payload`/`file-data`/`paste`, opaque `Vec<u8>`) and the
+  fixed-prefix geometry — the crate factors the **implementation** (the `verbatim_verb!` macro, the
+  `take_prefix::<N>` geometry helper) while keeping the **types distinct**. A coincidence of shape is not
+  a shared grammar (§4): conflating `NetResponse` with `Paste`, or `key` with `ErrorBody` (which share a
+  fixed-prefix-plus-tail *shape*, not a *grammar*), would erase a real semantic boundary — never factor a
+  coincidental layout. A **named reusable grammar** is reserved for genuine reuse, where one body *is* the
+  same across verbs: `Modifiers` (mouse + key), `Dimensions` (create-pty + resize), `ErrorBody`
+  (file-error + net-error), the `scan_safe`/`scan_unsafe` address stacks, `decode_record_tail` (display's
+  cell stream), and `decode_list_entries` (the list-entry record). Two surfaces stay **explicit, never
+  macro-collapsed**, because they are the reviewable TCB: the **dispatch table** (verb → decoder) and the
+  **carry-raw routing** (`from_*`/`to_*` — the enforce-by-construction check that `Other` cannot hold a
+  defined value), along with the verb/field-code **consts**. The dedup is in the codegen; the security
+  logic and the routing table are read directly.
 - **Feature-gating granularity** — per-service cargo features, per-direction, or all-in.
 - **`no_std`** — is any consumer constrained enough to need it, or is `std` universal?
 - **Functional keysym values are not a crate concern.** The crate carries `keysym` as an opaque

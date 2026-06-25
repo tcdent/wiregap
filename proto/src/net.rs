@@ -10,7 +10,7 @@ use crate::errors::ErrorBody;
 use crate::reject::Reject;
 use crate::segment::{SafeSegmentStack, scan_safe};
 use crate::verb;
-use crate::wire::Wire;
+use crate::wire::{Wire, take_prefix, verbatim_verb};
 
 /// A reserved scheme value (`≥ 1`), carried verbatim.
 ///
@@ -71,10 +71,7 @@ impl Wire for NetAddress {
     }
 
     fn decode(body: &[u8]) -> Result<Self, Reject> {
-        let (scheme, rest) = body.split_first_chunk::<4>().ok_or(Reject::ShortBody {
-            needed: 4,
-            got: body.len(),
-        })?;
+        let (scheme, rest) = take_prefix::<4>(body)?;
         // The safe scan consumes the entire remainder (the stack runs to the frame end), so there is
         // no trailing-bytes case here — the scan either accepts all of `rest` or rejects.
         let address = scan_safe(rest)?;
@@ -87,22 +84,11 @@ impl Wire for NetAddress {
 
 // ---- the net verbs (005, seam 5B) --------------------------------------------------------------
 
-/// `net-response` (`proxy → box`): the upstream response, a **verbatim** tail. The box reassembles
-/// the response itself (the asymmetry: ingress lands on untrusted ground, relayed per-frame —
-/// approach.md §5); the proxy does **not** reassemble it.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct NetResponse(pub Vec<u8>);
-
-impl Wire for NetResponse {
-    const VERB: u32 = verb::NET_RESPONSE;
-
-    fn encode(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.0);
-    }
-
-    fn decode(body: &[u8]) -> Result<Self, Reject> {
-        Ok(NetResponse(body.to_vec()))
-    }
+verbatim_verb! {
+    /// `net-response` (`proxy → box`): the upstream response, a **verbatim** tail. The box reassembles
+    /// the response itself (the asymmetry: ingress lands on untrusted ground, relayed per-frame —
+    /// approach.md §5); the proxy does **not** reassemble it.
+    NetResponse, verb::NET_RESPONSE
 }
 
 /// `net-error` (`proxy → box`): an upstream/route error — the shared [`ErrorBody`] grammar (one body,
@@ -122,21 +108,10 @@ impl Wire for NetError {
     }
 }
 
-/// `net-payload` (`box → proxy`): the verbatim request body, **reassembled** across frames by the
-/// proxy ([`crate::Reassembler`]) before this decodes. Verb `0x33` rides in frame 1 only; continuation
-/// frames are raw payload concatenated opaquely, so the **complete** buffer (`[0x33][full payload]`)
-/// decodes through `decode_message` **once** here — a single verbatim tail over the full payload.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct NetPayload(pub Vec<u8>);
-
-impl Wire for NetPayload {
-    const VERB: u32 = verb::NET_PAYLOAD;
-
-    fn encode(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.0);
-    }
-
-    fn decode(body: &[u8]) -> Result<Self, Reject> {
-        Ok(NetPayload(body.to_vec()))
-    }
+verbatim_verb! {
+    /// `net-payload` (`box → proxy`): the verbatim request body, **reassembled** across frames by the
+    /// proxy ([`crate::Reassembler`]) before this decodes. Verb `0x33` rides in frame 1 only; continuation
+    /// frames are raw payload concatenated opaquely, so the **complete** buffer (`[0x33][full payload]`)
+    /// decodes through `decode_message` **once** here — a single verbatim tail over the full payload.
+    NetPayload, verb::NET_PAYLOAD
 }

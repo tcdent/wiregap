@@ -27,6 +27,49 @@ pub trait Wire: Sized {
     fn decode(body: &[u8]) -> Result<Self, Reject>;
 }
 
+/// Split a fixed `N`-byte prefix off `body`, or [`Reject::ShortBody`] if `body` is shorter. The
+/// reject reports `needed: N` and `got: body.len()` — the geometry-check shape every fixed-prefix
+/// decoder shares. Callers then read fields from the prefix (explicit `from_le_bytes`) and handle any
+/// verbatim tail. (008 8A — a behavior-preserving dedup of the `split_first_chunk` + `ShortBody`
+/// pattern; the per-field reads stay explicit.) Core: `envelope` (every slice) consumes it.
+pub(crate) fn take_prefix<const N: usize>(body: &[u8]) -> Result<(&[u8; N], &[u8]), Reject> {
+    body.split_first_chunk::<N>().ok_or(Reject::ShortBody {
+        needed: N,
+        got: body.len(),
+    })
+}
+
+/// Generate a **verbatim-tail** verb: `pub struct $name(pub Vec<u8>)` + its [`Wire`] impl (the body is
+/// the raw bytes, no structure). Dedups the identical `to_vec`/`extend_from_slice` impl across the
+/// opaque-passthrough verbs (`net-response`/`net-payload`/`file-data`/`paste`) while keeping the
+/// **types distinct** (a `NetResponse` is not a `Paste` — model §4 / library §8). (008 8A.)
+///
+/// The macro is `cfg`'d to the services that invoke it — in a build with none of them, it is never
+/// invoked, and an unused `macro_rules!` would fail the `-D warnings` core-only matrix build.
+#[cfg(any(feature = "net", feature = "file", feature = "terminal"))]
+macro_rules! verbatim_verb {
+    ($(#[$doc:meta])* $name:ident, $verb:path) => {
+        $(#[$doc])*
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        pub struct $name(pub alloc::vec::Vec<u8>);
+
+        impl $crate::wire::Wire for $name {
+            const VERB: u32 = $verb;
+
+            fn encode(&self, out: &mut alloc::vec::Vec<u8>) {
+                out.extend_from_slice(&self.0);
+            }
+
+            fn decode(body: &[u8]) -> Result<Self, $crate::reject::Reject> {
+                Ok($name(body.to_vec()))
+            }
+        }
+    };
+}
+
+#[cfg(any(feature = "net", feature = "file", feature = "terminal"))]
+pub(crate) use verbatim_verb;
+
 /// Decode a **repeated-fixed-record tail**: a run of exact `N`-byte records to the frame end, each
 /// passed to `parse`. The boundary is the slice end — never a box-authored count (law 11).
 ///

@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 
 use crate::reject::Reject;
 use crate::verb;
-use crate::wire::Wire;
+use crate::wire::{Wire, take_prefix};
 
 /// `input_flags` bit 0 — the only defined bit (DECSET 1003 hover interest).
 const WANTS_FREE_MOTION: u32 = 1;
@@ -43,20 +43,17 @@ impl Wire for PaneState {
     }
 
     fn decode(body: &[u8]) -> Result<Self, Reject> {
-        let short = || Reject::ShortBody {
-            needed: BODY_LEN,
-            got: body.len(),
-        };
-        let (scrollback_total, rest) = body.split_first_chunk::<4>().ok_or_else(short)?;
-        let (viewport_offset, rest) = rest.split_first_chunk::<4>().ok_or_else(short)?;
-        let (input_flags, rest) = rest.split_first_chunk::<4>().ok_or_else(short)?;
+        // Fixed `BODY_LEN` body — take the prefix (`< BODY_LEN` → ShortBody{BODY_LEN, body.len()}),
+        // then read the three u32s from the destructured prefix (no index on input).
+        let (prefix, rest) = take_prefix::<{ BODY_LEN }>(body)?;
         if !rest.is_empty() {
             return Err(Reject::TrailingBytes { extra: rest.len() });
         }
-        let input_flags = u32::from_le_bytes(*input_flags);
+        let [s0, s1, s2, s3, v0, v1, v2, v3, f0, f1, f2, f3] = *prefix;
+        let input_flags = u32::from_le_bytes([f0, f1, f2, f3]);
         Ok(PaneState {
-            scrollback_total: u32::from_le_bytes(*scrollback_total),
-            viewport_offset: u32::from_le_bytes(*viewport_offset),
+            scrollback_total: u32::from_le_bytes([s0, s1, s2, s3]),
+            viewport_offset: u32::from_le_bytes([v0, v1, v2, v3]),
             // Read the defined bit; drop reserved bits 1–31 (any value decodes Ok).
             wants_free_motion: (input_flags & WANTS_FREE_MOTION) != 0,
         })

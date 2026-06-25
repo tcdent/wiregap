@@ -11,7 +11,7 @@ use crate::errors::ErrorBody;
 use crate::reject::Reject;
 use crate::segment::{SafeSegmentStack, UnsafeSegmentStack, scan_safe, scan_unsafe};
 use crate::verb;
-use crate::wire::Wire;
+use crate::wire::{Wire, verbatim_verb};
 
 /// `file-chunk` (`box → proxy`): verbatim bytes, appended in order to the quarantine file. Pure
 /// verbatim tail — the whole body is the content, no fixed prefix, no boundary to police (a chunk
@@ -89,20 +89,9 @@ impl Wire for FileWrite {
     }
 }
 
-/// `file-data` (0x23, proxy→box): verbatim read bytes (the 001 verbatim tail, like `file-chunk`).
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct FileData(pub Vec<u8>);
-
-impl Wire for FileData {
-    const VERB: u32 = verb::FILE_DATA;
-
-    fn encode(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.0);
-    }
-
-    fn decode(body: &[u8]) -> Result<Self, Reject> {
-        Ok(FileData(body.to_vec()))
-    }
+verbatim_verb! {
+    /// `file-data` (0x23, proxy→box): verbatim read bytes (the 001 verbatim tail, like `file-chunk`).
+    FileData, verb::FILE_DATA
 }
 
 /// `list` (0x24, box→proxy / head→box): names a directory as an **unsafe** segment stack. Routes
