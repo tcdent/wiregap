@@ -1,0 +1,13 @@
+[package]
+name = "transport"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Zero non-dev dependencies (matches the `proto` sibling): the library links only `core` + `alloc`,
+# so architecture.md's "no syscalls in the crate's logic" is a *link-time* property — `std::{net,fs,
+# process,thread,time}` cannot be reached. The three E3/E4 seams (transmit sink, clock, inbound entry)
+# are traits, so the only I/O is whatever the reactor supplies behind them.
+[dependencies]
+
+[dev-dependencies]
