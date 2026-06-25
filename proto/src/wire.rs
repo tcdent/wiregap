@@ -31,7 +31,9 @@ pub trait Wire: Sized {
 /// reject reports `needed: N` and `got: body.len()` — the geometry-check shape every fixed-prefix
 /// decoder shares. Callers then read fields from the prefix (explicit `from_le_bytes`) and handle any
 /// verbatim tail. (008 8A — a behavior-preserving dedup of the `split_first_chunk` + `ShortBody`
-/// pattern; the per-field reads stay explicit.) Core: `envelope` (every slice) consumes it.
+/// pattern; the per-field reads stay explicit.) Consumed by the net + terminal decoders (`cfg`'d to
+/// them, so a build without either does not carry an unused helper).
+#[cfg(any(feature = "net", feature = "terminal"))]
 pub(crate) fn take_prefix<const N: usize>(body: &[u8]) -> Result<(&[u8; N], &[u8]), Reject> {
     body.split_first_chunk::<N>().ok_or(Reject::ShortBody {
         needed: N,

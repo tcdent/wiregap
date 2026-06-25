@@ -12,8 +12,8 @@ use proto::{
     FileError, FileRead, FileType, FileWrite, Focus, Key, KeyKind, List, Message, Modifiers,
     MouseKind, NetAddress, NetError, NetPayload, NetResponse, OpenSession, PaneState, Paste, Reject,
     Reassembler,
-    ReassemblyState, RequestFile, Resize, Rgb, RowCol, Scalar, Scheme, Viewport, Width, decode_frame,
-    decode_message, encode_frame, encode_message, scan_safe, scan_unsafe, verb,
+    ReassemblyState, RequestFile, Resize, Rgb, RowCol, Scalar, Scheme, Viewport, Width,
+    decode_message, encode_message, scan_safe, scan_unsafe, verb,
 };
 
 /// fixed-record primitive — `pane-state` (verb 0x18).
@@ -493,35 +493,20 @@ fn vector_net_payload() {
     assert_eq!(encode_message(&expected), golden);
 }
 
-/// The first **frame-sequence** golden — a payload spanning N frames reassembles to the joined bytes,
-/// which decode ONCE to `NetPayload(full)`. Authored byte-by-byte: the L1 envelope `[session u32]
-/// [flags u32: bit0]` per frame + the opaque join (`0x33` rides frame 1 only; continuations are raw).
+/// The first **push-sequence** golden — a payload spanning N transport chunks reassembles to the joined
+/// bytes, which decode ONCE to `NetPayload(full)`. Authored byte-by-byte: the transport delivers each
+/// `(chunk, continuation)` (the L1 framing is below the copy boundary); the first chunk carries `0x33`,
+/// the continued chunks are raw payload concatenated opaquely.
 #[test]
-fn vector_net_payload_reassembles_n_frames() {
-    // session 9; frame 1 continuation=1, frame 2 continuation=1, frame 3 continuation=0.
-    #[rustfmt::skip]
-    let frame1: &[u8] = &[
-        0x09, 0x00, 0x00, 0x00, // session_id 9
-        0x01, 0x00, 0x00, 0x00, // flags: bit0 = continuation
-        0x33, 0x00, 0x00, 0x00, // L2 verb 0x33 (net-payload) — frame 1 only
-        0x50, 0x4F,             // "PO"
-    ];
-    #[rustfmt::skip]
-    let frame2: &[u8] = &[
-        0x09, 0x00, 0x00, 0x00, // session_id 9
-        0x01, 0x00, 0x00, 0x00, // flags: continuation
-        0x53, 0x54,             // "ST" — RAW payload (no verb)
-    ];
-    #[rustfmt::skip]
-    let frame3: &[u8] = &[
-        0x09, 0x00, 0x00, 0x00, // session_id 9
-        0x00, 0x00, 0x00, 0x00, // flags: clear (last frame)
-        0x21,                   // "!" — RAW payload
-    ];
+fn vector_net_payload_reassembles_n_chunks() {
+    // chunk 1 (continuation=1) carries the verb; chunks 2/3 are raw; chunk 3 (continuation=0) ends.
+    let chunk1: &[u8] = &[0x33, 0x00, 0x00, 0x00, 0x50, 0x4F]; // [0x33]"PO"
+    let chunk2: &[u8] = &[0x53, 0x54]; // "ST" — raw
+    let chunk3: &[u8] = &[0x21]; // "!" — raw
     let mut r = Reassembler::new(64);
-    assert_eq!(r.push(decode_frame(frame1).unwrap().l2, true).unwrap(), ReassemblyState::Accumulating);
-    assert_eq!(r.push(decode_frame(frame2).unwrap().l2, true).unwrap(), ReassemblyState::Accumulating);
-    let complete = match r.push(decode_frame(frame3).unwrap().l2, false).unwrap() {
+    assert_eq!(r.push(chunk1, true).unwrap(), ReassemblyState::Accumulating);
+    assert_eq!(r.push(chunk2, true).unwrap(), ReassemblyState::Accumulating);
+    let complete = match r.push(chunk3, false).unwrap() {
         ReassemblyState::Complete(b) => b,
         other => panic!("{other:?}"),
     };
@@ -533,43 +518,28 @@ fn vector_net_payload_reassembles_n_frames() {
     );
 }
 
-/// Fail-closed regression guard — a CAP-EXCEED reject (small test-cap). Two frames sum past the cap →
+/// Fail-closed regression guard — a CAP-EXCEED reject (small test-cap). Two chunks sum past the cap →
 /// `ReassemblyOverflow` (the permanent guard; the boundary is value-independent of the production cap).
 #[test]
 fn vector_reassembly_cap_exceed_rejects() {
     const CAP: usize = 8;
-    let f1 = {
-        let mut o = Vec::new();
-        encode_frame(1, true, &[0u8; 6], &mut o);
-        o
-    };
-    let f2 = {
-        let mut o = Vec::new();
-        encode_frame(1, true, &[0u8; 6], &mut o); // 6 + 6 = 12 > 8
-        o
-    };
     let mut r = Reassembler::new(CAP);
-    assert_eq!(r.push(decode_frame(&f1).unwrap().l2, true).unwrap(), ReassemblyState::Accumulating);
+    assert_eq!(r.push(&[0u8; 6], true).unwrap(), ReassemblyState::Accumulating);
     assert_eq!(
-        r.push(decode_frame(&f2).unwrap().l2, true),
+        r.push(&[0u8; 6], true), // 6 + 6 = 12 > 8
         Err(Reject::ReassemblyOverflow { cap: CAP })
     );
 }
 
 /// Fail-closed regression guard — a NEVER-ENDING sequence (continuation always set) trips the cap and
-/// is denied; it does not hang awaiting a clear bit.
+/// is denied; it does not hang awaiting a clear signal.
 #[test]
 fn vector_reassembly_never_ending_rejects() {
     const CAP: usize = 8;
-    let f = {
-        let mut o = Vec::new();
-        encode_frame(1, true, &[0u8; 4], &mut o); // continuation always set
-        o
-    };
     let mut r = Reassembler::new(CAP);
     let mut count = 0;
     loop {
-        match r.push(decode_frame(&f).unwrap().l2, true) {
+        match r.push(&[0u8; 4], true) {
             Ok(ReassemblyState::Accumulating) => {
                 count += 1;
                 assert!(count < 100, "must trip the cap, not loop forever");

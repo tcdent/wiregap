@@ -120,21 +120,10 @@ pub const KEY_KIND_RELEASE: u8 = 2;
 pub const MAX_KEY_KIND: u8 = KEY_KIND_RELEASE;
 
 // ===========================================================================================
-// L1 ENVELOPE LAYOUT — the frame header the box encodes + the proxy decodes (model.md §1/§2).
-//   `[session_id u32 LE][flags u32 LE][L2 [verb u32][body]]` — 8 bytes, L2 stays 4-byte aligned.
-//   PROVISIONAL (session-id width, the continuation-bit position) — pending operator ratification.
-// ===========================================================================================
-/// The fixed L1 envelope size in bytes; the L2 message begins at this offset (4-byte aligned).
-pub const ENVELOPE_LEN: usize = 8;
-/// The continuation flag's bit position in the envelope `flags` u32 (bit 0). Bits 1–31 are reserved
-/// and **dropped** on decode (the 002/004 reserved-bit-drop) — never read, re-encoded zero.
-pub const FLAG_CONTINUATION_BIT: u32 = 0;
-
-// ===========================================================================================
 // REASSEMBLY CAPACITY BOUND — the fail-closed total reassembled-request cap (5A).
 //   This is a CAPACITY / SECURITY tuning (memory buffered on the trusted proxy vs the largest
 //   legitimate request), DISTINCT IN KIND from the protocol numbers above (verb-ids / op-set /
-//   error-codes / mouse field codes / envelope-layout) — review it with the capacity/security lens.
+//   error-codes / mouse field codes) — review it with the capacity/security lens.
 //   PROVISIONAL = 32 MiB: the Anthropic Messages API's own ~32 MB request limit, so the proxy fails
 //   closed exactly where the upstream would and admits image-bearing POSTs. DISTINCT from the
 //   per-frame/per-alloc bound (`MAX_FRAME * ALLOC_K` in the fuzz target) — this bounds the TOTAL

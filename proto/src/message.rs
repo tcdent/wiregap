@@ -233,8 +233,8 @@ pub fn decode_message(frame: &[u8]) -> Result<Message, Reject> {
         // surfacing here proves the route-through.
         #[cfg(feature = "net")]
         verb::NET_ERROR => NetError::decode(body).map(Message::NetError),
-        // 0x33 decodes the COMPLETE reassembled buffer once (verb 0x33 in frame 1; the reassembler
-        // joined the raw continuation payloads opaquely upstream) — a verbatim tail over the payload.
+        // 0x33 decodes the COMPLETE reassembled buffer once (the reassembler joined the transport's
+        // continued payload chunks opaquely upstream) — a verbatim tail over the payload.
         #[cfg(feature = "net")]
         verb::NET_PAYLOAD => NetPayload::decode(body).map(Message::NetPayload),
         _ => Err(Reject::UnsupportedVerb { verb: id }),

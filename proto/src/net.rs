@@ -109,9 +109,10 @@ impl Wire for NetError {
 }
 
 verbatim_verb! {
-    /// `net-payload` (`box → proxy`): the verbatim request body, **reassembled** across frames by the
-    /// proxy ([`crate::Reassembler`]) before this decodes. Verb `0x33` rides in frame 1 only; continuation
-    /// frames are raw payload concatenated opaquely, so the **complete** buffer (`[0x33][full payload]`)
-    /// decodes through `decode_message` **once** here — a single verbatim tail over the full payload.
+    /// `net-payload` (`box → proxy`): the verbatim request body, **reassembled** across transport
+    /// frames by the proxy ([`crate::Reassembler`]) before this decodes. The first chunk carries verb
+    /// `0x33`; the transport's continued chunks are raw payload concatenated opaquely, so the
+    /// **complete** buffer (`[0x33][full payload]`) decodes through `decode_message` **once** here — a
+    /// single verbatim tail over the full payload.
     NetPayload, verb::NET_PAYLOAD
 }

@@ -1,20 +1,23 @@
 //! The bounded, fail-closed reassembler — the protocol's **one** trusted-side reassembly (net.md §2).
-//! The **proxy** accumulates a `net-payload` request that spans frames (via the L1 continuation bit)
-//! into a complete buffer before the off-wire recognizer rules on it. Because the proxy holds the
-//! buffer, totality here is **TCB defense**: no frame sequence the box authors may crash, over-read,
-//! **unbounded-allocate**, or **hang** it.
+//! The **proxy** accumulates a `net-payload` request whose payload spans transport frames into a
+//! complete buffer before the off-wire recognizer rules on it. The transport delivers each frame's L2
+//! payload and a `continuation` signal (the L1 framing lives below the crate's copy boundary, model.md
+//! §1/§3); the crate parses no frame header. Because the proxy holds the buffer, totality here is **TCB
+//! defense**: no payload sequence the box authors may crash, over-read, **unbounded-allocate**, or
+//! **hang** it.
 //!
 //! The defense is one bound — the **capacity cap** ([`crate::verb::REASSEMBLY_CAP`]):
 //! - **reject-before-grow:** the cap is checked *before* the append, so the buffer **never allocates
 //!   past the cap** — the alloc bound holds at the check (`acc.len() + chunk.len() > cap` → reject),
 //!   not after.
-//! - **never-ending == cap-exceed:** an endless continuation-set stream trips the cap and is denied;
-//!   the reassembler never awaits a clear bit it may never receive (no timeout needed at this layer).
-//! - **opaque (law 11):** it concatenates the L2 bytes without parsing them; the boundary is the
-//!   frame + the continuation bit only, never a length read from content.
+//! - **never-ending == cap-exceed:** an endless `continuation`-set stream trips the cap and is denied;
+//!   the reassembler never awaits a clear signal it may never receive (no timeout needed at this layer).
+//! - **opaque (law 11):** it concatenates the payload bytes without parsing them; the boundary is the
+//!   `continuation` signal only, never a length read from content.
 //!
 //! Single-session: one `Reassembler` is one session's accumulation. The crate holds **no map** — the
-//! proxy keys `session_id → Reassembler` (no_std-friendly). Sprint 005, seam 5A.
+//! transport routes each session's payload bytes to a `Reassembler` (no_std-friendly). Sprint 005,
+//! seam 5A; the L1 framing excised in 010 (boundary correction).
 
 use alloc::vec::Vec;
 use core::mem::take;
@@ -22,12 +25,12 @@ use core::mem::take;
 use crate::reject::Reject;
 use crate::verb;
 
-/// The outcome of feeding one frame's payload to the reassembler.
+/// The outcome of feeding one payload chunk to the reassembler.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ReassemblyState {
-    /// The continuation bit was set — more frames follow; keep feeding the same `Reassembler`.
+    /// `continuation` was set — more payload follows; keep feeding the same `Reassembler`.
     Accumulating,
-    /// The continuation bit was clear — the complete reassembled payload (the reassembler is reset).
+    /// `continuation` was clear — the complete reassembled payload (the reassembler is reset).
     Complete(Vec<u8>),
 }
 
@@ -61,8 +64,9 @@ impl Reassembler {
         self.cap
     }
 
-    /// Feed one frame's payload. `continuation` is the L1 frame's continuation bit. The payload is
-    /// appended **opaquely** (never parsed); `Complete` carries the joined bytes (and resets `self`).
+    /// Feed one payload chunk. `continuation` is the transport's continuation signal (set = more
+    /// follows). The chunk is appended **opaquely** (never parsed); `Complete` carries the joined bytes
+    /// (and resets `self`).
     ///
     /// Fail-closed: if the accumulated total would exceed the cap (**inclusive**: `≤ cap` is allowed,
     /// `> cap` rejects), returns `Err(ReassemblyOverflow)` **before** any over-cap allocation. The

@@ -4,17 +4,17 @@
 //!
 //! Two modes, by the corpus directory name:
 //! - `fuzz/corpus/decode` (default) — `decode_message` (→ on Ok, encode + re-decode), the L2 path.
-//! - `fuzz/corpus/reassemble` — `frame → decode_frame → Reassembler::push`, the L1/reassembly path
-//!   (mirrors `fuzz_targets/reassemble.rs`).
+//! - `fuzz/corpus/reassemble` — `Reassembler::push` over `(chunk, continuation)` sequences, the
+//!   reassembly path (mirrors `fuzz_targets/reassemble.rs`).
 
 use std::fs;
 
-use proto::{Reassembler, ReassemblyState, decode_frame, decode_message, encode_message};
+use proto::{Reassembler, ReassemblyState, decode_message, encode_message};
 
 const MAX_FRAME: usize = 4096;
 const MAX_INPUT: usize = 1 << 16;
 const SMALL_CAP: usize = 4096;
-const MAX_FRAMES: u32 = 4096;
+const MAX_CHUNKS: u32 = 4096;
 
 fn replay_decode(data: &[u8]) {
     if data.len() > MAX_FRAME {
@@ -28,34 +28,36 @@ fn replay_decode(data: &[u8]) {
     }
 }
 
-/// Mirror `fuzz_targets/reassemble.rs`: parse `[u16 len][frame]…` and drive the live L1 path.
+/// Mirror `fuzz_targets/reassemble.rs`: parse `[u8 cont][u16 len][len bytes]…` and drive `push` direct.
 fn replay_reassemble(data: &[u8]) {
     if data.len() > MAX_INPUT {
         return;
     }
     let mut r = Reassembler::new(SMALL_CAP);
     let mut rest = data;
-    let mut frames = 0u32;
-    while let Some((lenb, after)) = rest.split_first_chunk::<2>() {
+    let mut chunks = 0u32;
+    while let Some((cont_byte, after)) = rest.split_first() {
+        let Some((lenb, after)) = after.split_first_chunk::<2>() else {
+            break;
+        };
         let len = u16::from_le_bytes(*lenb) as usize;
-        let Some((frame, tail)) = after.split_at_checked(len) else {
+        let Some((chunk, tail)) = after.split_at_checked(len) else {
             break;
         };
         rest = tail;
-        frames += 1;
-        if frames > MAX_FRAMES {
+        chunks += 1;
+        if chunks > MAX_CHUNKS {
             break;
         }
-        if let Ok(f) = decode_frame(frame) {
-            match r.push(f.l2, f.continuation) {
-                Ok(ReassemblyState::Accumulating) => {}
-                Ok(ReassemblyState::Complete(buf)) => {
-                    let _ = decode_message(&buf);
-                    r = Reassembler::new(SMALL_CAP);
-                }
-                Err(_) => {
-                    r = Reassembler::new(SMALL_CAP);
-                }
+        let continuation = cont_byte & 1 != 0;
+        match r.push(chunk, continuation) {
+            Ok(ReassemblyState::Accumulating) => {}
+            Ok(ReassemblyState::Complete(buf)) => {
+                let _ = decode_message(&buf);
+                r = Reassembler::new(SMALL_CAP);
+            }
+            Err(_) => {
+                r = Reassembler::new(SMALL_CAP);
             }
         }
     }
@@ -81,7 +83,7 @@ fn main() {
         replayed += 1;
     }
     let which = if reassemble {
-        "frame->decode_frame->reassembler.push"
+        "reassembler.push (chunk, continuation)"
     } else {
         "decode_message"
     };

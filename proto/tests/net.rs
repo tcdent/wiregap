@@ -1,12 +1,12 @@
 //! Seam 5B gates: round-trip over the 3 net verbs through `decode_message`/`encode_message`, the
 //! **opaque-concat + decode-once** wiring of net-payload through the reassembler, the net-response
 //! **asymmetry** (never reassembled), and the binding observables — a `ReassemblyOverflow` surfacing
-//! from the proxy's live L1 path (`frame → decode_frame → reassembler.push`), and an `ErrorBody`
-//! reject surfacing from `net-error` (the reuse-through proof).
+//! from `Reassembler::push` (fed the transport's payload chunks + continuation, the L1 framing being
+//! below the crate's copy boundary), and an `ErrorBody` reject surfacing from `net-error`.
 
 use proto::{
     ErrorBody, ErrorCode, Message, NetError, NetPayload, NetResponse, Reassembler, ReassemblyState,
-    Reject, decode_frame, decode_message, encode_frame, encode_message, verb,
+    Reject, decode_message, encode_message, verb,
 };
 
 fn assert_roundtrip(m: &Message) {
@@ -14,13 +14,6 @@ fn assert_roundtrip(m: &Message) {
     let decoded = decode_message(&wire).expect("must decode");
     assert_eq!(&decoded, m, "decode(encode(m)) == m");
     assert_eq!(encode_message(&decoded), wire, "canonical re-encode byte-identical");
-}
-
-/// Build one L1 frame (the box-side `encode_frame` writes into an `out` buffer).
-fn frame(session_id: u32, continuation: bool, l2: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    encode_frame(session_id, continuation, l2, &mut out);
-    out
 }
 
 #[test]
@@ -45,35 +38,31 @@ fn net_payload_roundtrips_verbatim() {
     }
 }
 
-// ----- net-payload: the live L1 path (opaque concat + decode ONCE) -------------------------------
+// ----- net-payload: reassembly (opaque concat + decode ONCE), fed push-direct --------------------
 
-/// The proxy's live path: a payload spanning 3 frames (verb 0x33 in frame 1 only; continuations raw)
-/// is reassembled opaquely, then `decode_message` runs ONCE on the complete buffer → NetPayload(FULL).
+/// The reassembly path: a payload spanning 3 transport chunks (the first carries verb 0x33; the
+/// transport's continued chunks are raw) is concatenated opaquely, then `decode_message` runs ONCE on
+/// the complete buffer → NetPayload(FULL). The transport delivers `(chunk, continuation)` per chunk.
 #[test]
-fn net_payload_reassembles_across_frames_then_decodes_once() {
+fn net_payload_reassembles_across_chunks_then_decodes_once() {
     // The full L2 message that *would* be sent if it fit one frame: [0x33][full payload].
     let full_payload = b"POST /v1/messages {\"model\":\"claude\"} <...big body...>".to_vec();
     let mut whole_l2 = verb::NET_PAYLOAD.to_le_bytes().to_vec();
     whole_l2.extend_from_slice(&full_payload);
 
-    // Split the WHOLE L2 (verb + payload) into 3 raw frame chunks — frame 1 carries the verb, the
-    // continuations are raw bytes. The reassembler concatenates them opaquely.
+    // The transport hands the crate each chunk + its continuation bool — push them directly.
     let cut1 = 10;
     let cut2 = 25;
-    let f1 = frame(7, true, &whole_l2[..cut1]);
-    let f2 = frame(7, true, &whole_l2[cut1..cut2]);
-    let f3 = frame(7, false, &whole_l2[cut2..]);
-
     let mut r = Reassembler::with_capacity_bound();
     assert!(matches!(
-        r.push(decode_frame(&f1).unwrap().l2, true).unwrap(),
+        r.push(&whole_l2[..cut1], true).unwrap(),
         ReassemblyState::Accumulating
     ));
     assert!(matches!(
-        r.push(decode_frame(&f2).unwrap().l2, true).unwrap(),
+        r.push(&whole_l2[cut1..cut2], true).unwrap(),
         ReassemblyState::Accumulating
     ));
-    let complete = match r.push(decode_frame(&f3).unwrap().l2, false).unwrap() {
+    let complete = match r.push(&whole_l2[cut2..], false).unwrap() {
         ReassemblyState::Complete(bytes) => bytes,
         other => panic!("expected Complete, got {other:?}"),
     };
@@ -85,20 +74,18 @@ fn net_payload_reassembles_across_frames_then_decodes_once() {
     );
 }
 
-/// Binding observable: a `ReassemblyOverflow` surfacing from the proxy's live L1 path
-/// (`decode_frame` → `reassembler.push`) on cap-exceed — the reassembler's live-path proof. A small
-/// cap makes it reachable.
+/// Binding observable: a `ReassemblyOverflow` surfacing from `Reassembler::push` on cap-exceed — the
+/// reassembler's fail-closed proof. The transport's chunks are pushed directly; a small cap makes it
+/// reachable.
 #[test]
-fn reassembly_overflow_surfaces_from_the_live_l1_path() {
+fn reassembly_overflow_surfaces_from_push() {
     let mut r = Reassembler::new(8); // small reachable cap
-    let f1 = frame(1, true, &[0u8; 6]);
-    let f2 = frame(1, true, &[0u8; 6]); // 6 + 6 = 12 > 8
     assert!(matches!(
-        r.push(decode_frame(&f1).unwrap().l2, true).unwrap(),
+        r.push(&[0u8; 6], true).unwrap(),
         ReassemblyState::Accumulating
     ));
     assert_eq!(
-        r.push(decode_frame(&f2).unwrap().l2, true),
+        r.push(&[0u8; 6], true), // 6 + 6 = 12 > 8
         Err(Reject::ReassemblyOverflow { cap: 8 })
     );
 }

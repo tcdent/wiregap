@@ -2,8 +2,9 @@
 //! verbs are the head→box signals that drive it.
 //!
 //! Sprint 006, seam 6A: `open-session` (0x00) — an **empty-body** signal. The box is the sole session
-//! allocator (§2): the new session id is not a body parameter, it arrives on the **L1 envelope**
-//! `session_id` (005). So `open-session` carries nothing — it is the signal, not a carrier.
+//! allocator (§2): the new id is not a body parameter — it arrives on the **transport's L1 frame**
+//! (below the crate's copy boundary, model.md §1/§2), never in the crate body. So `open-session`
+//! carries nothing — it is the signal, not a carrier.
 
 use alloc::vec::Vec;
 
@@ -12,7 +13,7 @@ use crate::verb;
 use crate::wire::Wire;
 
 /// `open-session` (`head → box`): begin a session. An **empty** body (no fields) — the box allocates
-/// the id, which rides the envelope, not the message.
+/// the id, which arrives on the transport's L1 frame, not the crate body.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct OpenSession;
 

@@ -25,7 +25,6 @@ extern crate alloc;
 extern crate std;
 
 // CORE modules (always compiled — universal routing + the shared foundational grammars).
-mod envelope;
 mod errors;
 mod message;
 mod reject;
@@ -49,7 +48,6 @@ mod net;
 mod reassembler;
 
 // CORE re-exports (always available).
-pub use envelope::{Frame, decode_frame, encode_frame};
 pub use errors::{ErrorBody, ErrorCode, ReservedCode};
 pub use message::{Message, decode_message, encode_message};
 pub use reject::Reject;
