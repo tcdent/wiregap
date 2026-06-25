@@ -138,8 +138,12 @@ pub(crate) fn decode_list_entries(tail: &[u8]) -> Result<Vec<ListEntry>, Reject>
         // EmptyStack, a `/`/NUL → BadSegmentByte, a `.`/`..` → TraversalSegment all propagate here.
         let name = match scan_unsafe(name_bytes)?.segments() {
             [seg] => seg.clone(),
-            // Unreachable by construction: `name_bytes` has no 0x1F, so the scan yields exactly one
-            // segment. A *defensive typed reject*, never `unreachable!`/panic (G2 totality).
+            // INTENTIONALLY UNREACHABLE — the one structurally-uncoverable arm (009 coverage closeout,
+            // operator-ratified keep+document). `name_bytes` is the 0x1F-free slice taken before the
+            // terminator, so `scan_unsafe` yields exactly one segment; the multi-segment case cannot
+            // arise from any input. Kept as the 3A defense-in-depth guard — a *defensive typed reject*,
+            // never `unreachable!()`/panic (G2 totality). Excluded from the reachable-100% coverage
+            // target: hitting it would require an impossible input.
             _ => return Err(Reject::UnterminatedRecord { offset: name_offset }),
         };
 
