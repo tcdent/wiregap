@@ -1,0 +1,14 @@
+[package]
+name = "reactor"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# The std, syscall-bearing driver for the no_std `transport` crate (Sprint 1). `transport` stays pure;
+# the reactor isolates the unsafe/syscall surface. `libc` is used for DECLARATIONS ONLY (vetted typed
+# syscall bindings) — no hand-rolled syscall numbers or `epoll_event` layout; no async/event-loop crate.
+[dependencies]
+transport = { path = "../transport" }
+libc = "0.2"
+
+[dev-dependencies]
