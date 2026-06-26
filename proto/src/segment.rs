@@ -181,14 +181,19 @@ pub fn scan_safe(input: &[u8]) -> Result<SafeSegmentStack, Reject> {
         let mut text = String::with_capacity(part.len());
         let mut has_alnum = false;
         for (offset, &byte) in part.iter().enumerate() {
-            if byte.is_ascii_alphanumeric() {
-                has_alnum = true;
-            } else if !matches!(byte, b'.' | b'_' | b'-') {
-                return Err(Reject::BadSegmentByte {
-                    index,
-                    offset,
-                    byte,
-                });
+            // The safe alphabet `[A-Za-z0-9._-]`, explicit in the arms (file.md §0 / model §6). The
+            // alphanumeric range sets `has_alnum`; `.`/`_`/`-` are accepted but do not; every other
+            // byte is out of alphabet. (`0x1F` is the separator and never reaches here.)
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => has_alnum = true,
+                b'.' | b'_' | b'-' => {}
+                _ => {
+                    return Err(Reject::BadSegmentByte {
+                        index,
+                        offset,
+                        byte,
+                    });
+                }
             }
             // Every accepted byte is in `[A-Za-z0-9._-]`, hence ASCII (< 0x80), so `as char` is an
             // exact, lossless widening — no `unsafe`, no `from_utf8` fallibility.
@@ -222,13 +227,17 @@ pub fn scan_unsafe(input: &[u8]) -> Result<UnsafeSegmentStack, Reject> {
             return Err(Reject::TraversalSegment { index });
         }
         for (offset, &byte) in part.iter().enumerate() {
-            // `0x1F` cannot appear here — it is the delimiter that bounded `part`.
-            if byte == b'/' || byte == 0 {
-                return Err(Reject::BadSegmentByte {
-                    index,
-                    offset,
-                    byte,
-                });
+            // The unsafe rule (file.md §0): any byte but `/` and NUL. `0x1F` cannot appear here — it
+            // is the delimiter that bounded `part`.
+            match byte {
+                b'/' | 0x00 => {
+                    return Err(Reject::BadSegmentByte {
+                        index,
+                        offset,
+                        byte,
+                    });
+                }
+                _ => {}
             }
         }
         stack.push(UnsafeSegment(Box::from(part)));
