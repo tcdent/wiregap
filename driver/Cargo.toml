@@ -1,0 +1,19 @@
+[package]
+name = "driver"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# E3 data path: implements the E4 seams — reactor::RxDrain (the owned-frame RX-drain) and
+# transport::TransmitSink (the TX-write). Depends on BOTH (RxDrain is reactor-owned; TransmitSink and the
+# frame types are transport's). The unsafe DMA/MMIO crossing is confined to one `dma` module
+# (deny-at-root + allow-on-module); the data-path logic + adversarial guards are safe Rust above the seam.
+[dependencies]
+transport = { path = "../transport" }
+reactor = { path = "../reactor" }
+
+# Also dev-deps so the no-NIC E4 integration test (tests/e4_integration.rs) can drive the real reactor +
+# transport directly alongside the driver's sim rings.
+[dev-dependencies]
+transport = { path = "../transport" }
+reactor = { path = "../reactor" }

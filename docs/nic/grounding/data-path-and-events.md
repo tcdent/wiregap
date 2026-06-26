@@ -67,9 +67,7 @@ DCB/VTd", `:397`), ring base/length, `TXDCTL` writeback thresholds (DPDK default
   **eliminating the stranding wrinkle entirely**.
 - **Buffers are ACK-bound, not TX-completion-bound.** ixy frees a buffer on TX `DD`. Our stop-and-wait
   may retransmit a frame until acknowledged, so **we free on ACK arrival**, not TX-completion — the
-  buffer lifetime is longer, and the mempool must be sized against **ACK-hold lifetime × max
-  concurrent sessions**, not ring depth (`transport-stack.md §4.4 item 12`). A genuine divergence from
-  ixy's reclamation model.
+  buffer lifetime is longer. A genuine divergence from ixy's reclamation model.
 
 ## 4. The event model — interrupt → eventfd → epoll (the load-bearing primitive)
 
@@ -110,7 +108,6 @@ codepath cleverer. This confirms the explore docs' single-ring lean (`transport-
    ~200k/s, orders of magnitude past terminal rates) and confirm K parallel sessions scale aggregate.
 3. **Per-descriptor cleanup affordability** at our rates (vs ixy's batching) — would let us drop the
    batching complexity and its stranding wrinkle.
-4. **DMA buffer-pool sizing** against ACK-hold lifetime × max concurrent sessions — measure real
-   held-buffer counts, do not copy a default.
+4. **DMA buffer-pool sizing** — measure real held-buffer counts, do not copy a default.
 5. **Idle-wakeup loop**: confirm the poll-then-block loop and that the retransmit deadline composes
    into the same `epoll_wait` (`transport-stack.md §4.2`).
