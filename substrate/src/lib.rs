@@ -14,20 +14,22 @@
 //!
 //! The crate root is `#![deny(unsafe_code)]`; each module that needs raw hardware access
 //! re-`#![allow(unsafe_code)]`s locally, with a SAFETY note on every block. The full unsafe surface is
-//! **nine** confined sites, and nothing else:
+//! **eleven** confined sites, and nothing else:
 //! - [`serial`] — COM1 UART port I/O (the post-handoff console).
-//! - [`acpi`] — reads of the firmware ACPI tables (RSDP → XSDT → MCFG).
+//! - [`acpi`] — reads of the firmware ACPI tables (RSDP → XSDT → MCFG/DMAR).
 //! - [`ecam`] — MMIO reads/writes of this NIC's PCIe config space.
 //! - [`lapic`] — MMIO of the Local APIC (enable, one-shot timer, self-IPI, EOI).
 //! - [`interrupts`] — the naked interrupt-entry stubs + loading the IDT.
 //! - [`heap`] — handing the static heap region to the global allocator.
 //! - [`calibrate`] — PIT/`0x61` port I/O + `rdtsc` for frequency calibration.
 //! - [`reactor_host`] — `rdtsc` for the clock (the LAPIC/`hlt`/latch it uses are confined in their modules).
-//! - `main.rs` (the UEFI entry) — the `ExitBootServices` call + the QEMU debug-exit port.
+//! - [`iommu`] — MMIO of the VT-d IOMMU registers (root table, invalidation, faults, translation enable).
+//! - [`e1000e`] — MMIO of the e1000e TX registers + ring (the Slice-2 DMA inducer for the fault test).
+//! - `main.rs` (the UEFI entry) — the `ExitBootServices` call, the QEMU debug-exit port, the table copy.
 //!
 //! The pure/security-bearing logic ([`arena`], [`banner`], the `ecam`/`arena` address arithmetic, the
-//! [`interrupts::VectorPlan`] policy, and the whole [`reactor`] loop) carries **zero** `unsafe` and is
-//! host-tested.
+//! [`interrupts::VectorPlan`] policy, the whole [`reactor`] loop, and the [`dmar`] table construction +
+//! walk) carries **zero** `unsafe` and is host-tested.
 //!
 //! ## Two harness surfaces
 //!
@@ -45,6 +47,7 @@ extern crate alloc;
 pub mod acpi;
 pub mod arena;
 pub mod banner;
+pub mod dmar;
 pub mod ecam;
 pub mod interrupts;
 pub mod reactor;
@@ -53,7 +56,11 @@ pub mod reactor;
 #[cfg(target_os = "uefi")]
 pub mod calibrate;
 #[cfg(target_os = "uefi")]
+pub mod e1000e;
+#[cfg(target_os = "uefi")]
 pub mod heap;
+#[cfg(target_os = "uefi")]
+pub mod iommu;
 #[cfg(target_os = "uefi")]
 pub mod lapic;
 #[cfg(target_os = "uefi")]

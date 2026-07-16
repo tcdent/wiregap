@@ -29,9 +29,13 @@ cp "$OVMF_VARS" "$WORK/OVMF_VARS.fd"
 #    model, so the ECAM *mechanism* is validated against e1000e (82574L: PCIe, memory BAR0, MSI-X)
 #    placed at a KNOWN BDF 00:03.0 (addr=3 on pcie.0); the binary targets exactly that BDF. netdev
 #    none = a NIC that exists in config space without a backend. isa-debug-exit = deterministic exit.
+#    `-device intel-iommu` (VT-d) is our Sprint-5 vehicle for the DMAR (as e1000e is for ECAM); it must
+#    precede the devices it governs. `intremap=on` + `kernel-irqchip=split` add interrupt-remapping (the
+#    Slice-3 (B) IR (i)-source verdict).
 QEMU=qemu-system-x86_64
 cmd=( "$QEMU"
-  -machine q35 -m 512M
+  -machine q35,kernel-irqchip=split -m 512M
+  -device intel-iommu,intremap=on
   -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
   -drive "if=pflash,format=raw,file=$WORK/OVMF_VARS.fd"
   -drive "format=raw,file=fat:rw:$ESP"

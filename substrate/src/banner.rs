@@ -10,6 +10,7 @@
 use core::fmt::Write;
 
 use crate::arena::{ArenaLayout, Region};
+use crate::dmar::FaultRecord;
 use crate::ecam::{Bar, MsixCap, CMD_BUS_MASTER, CMD_MEMORY_SPACE};
 use crate::interrupts::VectorPlan;
 use crate::reactor::WakeReason;
@@ -237,6 +238,198 @@ impl ReactorFacts {
             && self.retransmit_emitted
             && self.msix_wake == WakeReason::NicMsix
     }
+}
+
+/// Observed DMAR facts (Sprint 5, Slice 1): the IOMMU register base + geometry, the (disjoint) table
+/// region, and that translation is ENABLED. Slice 1 proves the table BYTES pure (G1) + reports remapping
+/// ENABLED (G2) — NOT enforcement; the induced-fault enforcement proof is Slice 2.
+pub struct DmarFacts {
+    pub reg_base: u64,
+    pub cap: u64,
+    pub levels: u8,
+    pub arena: Region,
+    pub table_region: Region,
+    pub remapping_enabled: bool,
+}
+
+impl DmarFacts {
+    /// The DMAR tables live outside the NIC-reachable arena (the self-referential-containment guard).
+    pub fn tables_nic_unreachable(&self) -> bool {
+        !self.arena.overlaps(&self.table_region)
+    }
+    /// Slice-1 verdict: remapping ENABLED + the tables are NIC-unreachable. Enforcement is Slice 2.
+    pub fn slice1_ok(&self) -> bool {
+        self.remapping_enabled && self.tables_nic_unreachable()
+    }
+}
+
+/// Write the observed DMAR report (observed → expected). Honest to the Slice-1 bar: ENABLED, not enforced.
+pub fn write_dmar<W: Write>(w: &mut W, f: &DmarFacts) -> core::fmt::Result {
+    writeln!(w, "---- sprint-5 slice-1 : DMAR (we own the tables) ----")?;
+    writeln!(w, "iommu    : reg-base={:#014x} cap={:#018x} sl-levels={}", f.reg_base, f.cap, f.levels)?;
+    writeln!(w, "arena    : {:#014x}..{:#014x} (the only NIC-reachable region)", f.arena.base, f.arena.end())?;
+    writeln!(
+        w,
+        "tables   : {:#014x}..{:#014x} (DMAR tables; must be NIC-UNREACHABLE)",
+        f.table_region.base,
+        f.table_region.end()
+    )?;
+    writeln!(
+        w,
+        "assert   : tables-nic-unreachable  observed={} (disjoint from arena) expected true",
+        f.tables_nic_unreachable()
+    )?;
+    writeln!(
+        w,
+        "assert   : remapping-enabled       observed={} (GSTS.TES) expected true",
+        f.remapping_enabled
+    )?;
+    writeln!(w, "note     : table confinement proven PURE in G1 (host); ENFORCEMENT (induced fault) is Slice 2")?;
+    writeln!(w, "RESULT   : {} (enabled, NOT yet enforced)", if f.slice1_ok() { "PASS" } else { "FAIL" })?;
+    Ok(())
+}
+
+/// Observed DMAR ENFORCEMENT facts (Sprint 5, Slice 2): the induced in-arena-succeeds / out-of-arena-
+/// faults PAIR. The pair is the (ii) BLOCKED proof — the out fault alone is vacuous; in-arena success is
+/// load-bearing; and the fault must be the IOMMU's (FRCD IOVA == the induced address, SID == the NIC).
+pub struct DmarEnforceFacts {
+    pub in_arena_success: bool,
+    pub in_arena_no_fault: bool,
+    /// The induced out-of-arena buffer address (page-aligned).
+    pub out_addr: u64,
+    /// Whether the descriptor completed (its DD bit). Set REGARDLESS of the buffer fault — e1000e
+    /// completes the descriptor via the in-arena ring write-back; the FRCD fault, not this, is the block
+    /// signal. Reported as info, not part of the verdict.
+    pub out_completed: bool,
+    /// The IOMMU's fault record for the out-of-arena DMA.
+    pub fault: Option<FaultRecord>,
+    /// The NIC's source-id `(bus<<8)|devfn` the fault must name.
+    pub sid: u16,
+}
+
+impl DmarEnforceFacts {
+    /// The JOINT blocked proof: in-arena DMA succeeded with no fault (load-bearing), and the IOMMU
+    /// recorded a fault for the out-of-arena DMA whose IOVA is the induced address and SID is the NIC.
+    ///
+    /// Note: `out_completed` (the descriptor's DD) is NOT part of the proof — e1000e completes the
+    /// descriptor (DD write-back to the in-arena ring) regardless of the buffer read being aborted; the
+    /// FRCD fault, not DD, is what proves the out-of-arena buffer access was blocked.
+    pub fn blocked(&self) -> bool {
+        self.in_arena_success
+            && self.in_arena_no_fault
+            && matches!(self.fault, Some(f) if f.iova == (self.out_addr & !0xFFF) && f.sid == self.sid)
+    }
+}
+
+/// Write the observed enforcement report (observed → expected). Proves (ii) BLOCKED; (iii) SOUND stays
+/// honest-open (silicon).
+pub fn write_dmar_enforce<W: Write>(w: &mut W, f: &DmarEnforceFacts) -> core::fmt::Result {
+    writeln!(w, "---- sprint-5 slice-2 : DMAR enforcement (induced fault) ----")?;
+    writeln!(
+        w,
+        "assert   : in-arena-DMA-succeeds   observed=completed({}) no-fault({}) expected both true [LOAD-BEARING]",
+        f.in_arena_success, f.in_arena_no_fault
+    )?;
+    match f.fault {
+        Some(fr) => {
+            let iova_match = fr.iova == (f.out_addr & !0xFFF);
+            let sid_match = fr.sid == f.sid;
+            writeln!(
+                w,
+                "assert   : out-of-arena-BLOCKED    observed=DMAR-fault iova={:#014x} sid={:#06x} {} expected iova=={:#014x} sid={:#06x}",
+                fr.iova,
+                fr.sid,
+                if fr.is_read { "read" } else { "write" },
+                f.out_addr & !0xFFF,
+                f.sid
+            )?;
+            writeln!(w, "assert   : frcd-iova==induced       observed={} sid-matches={} expected both true", iova_match, sid_match)?;
+        }
+        None => {
+            writeln!(w, "assert   : out-of-arena-BLOCKED    observed=NO-FRCD-FAULT expected a DMAR fault record")?;
+        }
+    }
+    writeln!(
+        w,
+        "info     : e1000e-descriptor-DD    observed={} — the device completes the descriptor regardless; the",
+        f.out_completed
+    )?;
+    writeln!(w, "info     :                          FRCD fault (not DD) is the block proof — the out-of-arena READ was aborted")?;
+    writeln!(w, "note     : proves (ii) BLOCKED in QEMU; (iii) SOUND stays honest-open (silicon residual)")?;
+    writeln!(w, "RESULT   : {} (blocked; not yet silicon-verified)", if f.blocked() { "PASS" } else { "FAIL" })?;
+    Ok(())
+}
+
+/// Observed (B) airtightness facts (Sprint 5, Slice 3). Each item carries its LEVEL: (i) source (our
+/// config/tables, reviewed-by-reading + observed) vs (ii) induced. A (ii)/(iii) claim on (i) evidence is
+/// a defect; un-inducible items stay HONEST-OPEN.
+pub struct AirtightnessFacts {
+    /// GSTS.IRES — our IRT is programmed + IR enabled (the IR (i)-source observed half).
+    pub ir_enabled: bool,
+    pub ir_vector: u8,
+    pub ir_sid: u16,
+    /// ATS is NOT enabled by our config (context translation-type = 0). (i)-source.
+    pub ats_enabled_by_us: bool,
+    /// ECAP.DT — whether the hardware advertises Device-TLB/ATS (informational: even so, we don't enable).
+    pub hw_supports_ats: bool,
+    /// Our SL tables map no device-to-device (only host RAM / the arena). (i)-source.
+    pub p2p_mapped: bool,
+    /// DMA translation (TE) is STILL enabled after enabling IR — proves the GCMD write preserved the
+    /// persistent TE bit (enabling IRE alone would have silently disabled the DMAR).
+    pub te_still_enabled: bool,
+}
+
+impl AirtightnessFacts {
+    /// Slice-3 verdict: the (i)-SOURCE items hold (IR enabled, ATS not enabled by us, no p2p mapping) AND
+    /// enabling IR did not disable the DMAR (TE still on). The (ii) / silicon items are HONEST-OPEN and
+    /// are NOT part of pass/fail.
+    pub fn slice3_ok(&self) -> bool {
+        self.ir_enabled && !self.ats_enabled_by_us && !self.p2p_mapped && self.te_still_enabled
+    }
+}
+
+/// Write the (B) airtightness report — per item: expected → observed → verdict, LEVEL stated. Never
+/// claims (ii) blocked/airtight on (i) evidence.
+pub fn write_airtightness<W: Write>(w: &mut W, f: &AirtightnessFacts) -> core::fmt::Result {
+    writeln!(w, "---- sprint-5 slice-3 : (B) airtightness verdicts ----")?;
+
+    // Interrupt remapping.
+    writeln!(w, "[B1] interrupt-remapping")?;
+    writeln!(
+        w,
+        "  (i)-source  : our IRT written (vector={:#04x}, source-validated sid={:#06x}) + IR enabled observed={} (GSTS.IRES) expected true",
+        f.ir_vector, f.ir_sid, f.ir_enabled
+    )?;
+    writeln!(w, "  (ii)        : HONEST-OPEN — rogue-NIC-MSI-to-arbitrary-address BLOCKED is UN-INDUCIBLE in QEMU (a well-behaved emulated device fires no rogue MSI); NOT claimed")?;
+    writeln!(w, "  verdict     : (i)-source PASS; (ii) open")?;
+
+    // ATS off.
+    writeln!(w, "[B2] ATS-off")?;
+    writeln!(
+        w,
+        "  (i)-source  : ATS not enabled by our config (context translation-type=0) observed=ats-enabled-by-us({}) expected false; hw-advertises-ATS={} (informational — we do not enable it)",
+        f.ats_enabled_by_us, f.hw_supports_ats
+    )?;
+    writeln!(w, "  inferred    : bypass-blocked INFERRED from ATS-disabled (the (ii) induced ATS-bypass test unattempted — NOT read as (ii))")?;
+    writeln!(w, "  open        : HONEST-OPEN — the 82599 ATS-advertise datasheet half re-verifies on silicon (Sprint 6)")?;
+    writeln!(w, "  verdict     : (i)-source PASS; bypass-blocked inferred; datasheet open")?;
+
+    // No peer-to-peer.
+    writeln!(w, "[B3] no-peer-to-peer")?;
+    writeln!(
+        w,
+        "  (i)-source  : single-NIC topology + our SL tables map only host RAM (the arena), no device-to-device observed=p2p-mapped({}) expected false",
+        f.p2p_mapped
+    )?;
+    writeln!(w, "  verdict     : (i)-source PASS")?;
+
+    writeln!(
+        w,
+        "assert   : DMAR-preserved          observed=TE-still-enabled({}) expected true (enabling IR kept the persistent TE bit)",
+        f.te_still_enabled
+    )?;
+    writeln!(w, "RESULT   : {} (the (i)-source verdicts; (ii)/silicon items HONEST-OPEN)", if f.slice3_ok() { "PASS" } else { "FAIL" })?;
+    Ok(())
 }
 
 /// Write the observed reactor report (observed → expected).

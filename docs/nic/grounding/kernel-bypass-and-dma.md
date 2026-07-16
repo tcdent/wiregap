@@ -81,6 +81,17 @@ not the only thing standing between this firmware and the trusted host, but it i
   tables confine the device's DMA to exactly our mapped IOVAs (above), so its reach is the memory we
   handed it, never the host's RAM. The confinement the design leans on is precisely this, and it is now
   ours to build and read.
+
+  > **As-built (Sprint 5, proven-in-QEMU — not yet silicon).** The DMAR is now written and owned in the
+  > substrate: the root/context/second-level tables (pure, host-tested to map only the arena and leave
+  > every other IOVA unmapped — including the DMAR tables' own region, so the device cannot rewrite its
+  > confinement) + the enable sequence (RTADDR+SRTP -> context-cache + IOTLB invalidate -> set TE).
+  > Vector-1 confinement is **realized**, and the **(ii) BLOCKED** proof landed in QEMU `intel-iommu`: an
+  > induced out-of-arena device DMA faults at the IOMMU (recorded FRCD IOVA == the induced address,
+  > source-id == the NIC) while an in-arena DMA succeeds. Interrupt remapping is written + enabled
+  > (source-validated IRT — its (i)-source verdict). The real-silicon soundness (iii), the rogue-MSI (ii),
+  > and the 82599-ATS datasheet half remain open (`concerns-to-watch.md`). QEMU proves the mechanism + the
+  > induced fault; the bench card re-verifies on real VT-d + the real 82599.
 - **Vector 2 — descriptor content (bounded by the driver, NOT the IOMMU).** The IOMMU does *not* stop the
   firmware from writing malformed or malicious descriptors *into the rings we mapped* — those rings are
   mapped, so the writes are allowed. That residual is carried by the **read-verified driver that
@@ -142,17 +153,25 @@ assumption ever weakens, this is where it bites first. Recorded, not silently dr
 (`concerns-to-watch.md`). *(Credit: zero.policy flagged this in spine review — the convergence is two
 places for the wire, three once the posture is taken at its word.)*
 
-**Grounding status — stated honestly, because the gap is the point.** Vector 2 and DMA-reach (vector 1)
-are grounded. The rest of (B) — that interrupt remapping is enabled and governs the NIC's MSIs, and that
-ATS and peer-to-peer are disabled on the 82599 and in our topology — is now **code we write and review in
-our DMAR configuration**, and must still be **confirmed on silicon** (that our enable sequence takes, and
-that a crafted out-of-bounds DMA / crafted MSI is actually blocked). This is a better place to stand than
-under a kernel: the airtightness is no longer *asserted about a platform we cannot read* — it is *our
-configuration to get right and to verify*. But until confirmed on the bench, "the IOMMU contains a rogue
-NIC" remains a claim with a known unverified half. Tracked as open in `concerns-to-watch.md`. Closing
-(A)+(B) is not just "verify containment" — it is the work that **deletes the firmware from the trusted
-base**, realizing the §2.1 posture (`architecture.md`); it is the highest-leverage grounding in the
-subsystem.
+**Grounding status — stated honestly, because the gap is the point.** Vector 2 is grounded. **DMA-reach
+(vector 1) is now built and owned, and proven-in-QEMU — not yet silicon.** The DMAR is written in the
+substrate: the pure, host-tested root/context/second-level tables map only the arena and leave every other
+IOVA unmapped — *including the DMAR tables' own region, so the device cannot rewrite its own confinement* —
+and the enable sequence (set-root-pointer → context-cache + IOTLB invalidate → enable translation)
+installs it. The enforcement proof landed on QEMU `intel-iommu`: an induced out-of-arena device DMA faults
+at the IOMMU (the recorded fault IOVA is the induced address, the source-id is the NIC) while an in-arena
+DMA succeeds. Interrupt remapping is written and enabled with a source-validated table. What remains
+**open and needs silicon** (tracked in `concerns-to-watch.md`): real-VT-d **soundness** — a QEMU-green
+fault corroborates the mechanism, it does not discharge cache/IOTLB/errata/topology behavior on the real
+part; that a **crafted rogue-NIC MSI is actually blocked** — un-inducible in QEMU, so "wrote + enabled the
+interrupt-remap table" is not yet "interrupt remapping is airtight"; and whether the real **82599
+advertises ATS** and the platform would honor a pre-translated request — the datasheet/bench half
+(Sprint 6). So the airtightness is no longer *asserted about a platform we cannot read* — it is *our
+configuration, built and QEMU-proven, with the silicon half honestly open*. Until that half is confirmed
+on the bench, "the IOMMU contains a rogue NIC" remains a claim with a known unverified part. Fully closing
+(A) the read-verified 82599 driver (Sprint 6) and (B) the silicon airtightness is what **deletes the
+firmware from the trusted base**, realizing the §2.1 posture (`architecture.md`); it is the
+highest-leverage grounding in the subsystem.
 
 ### How this posture evolved (do not re-introduce the old one)
 
@@ -181,6 +200,10 @@ is ours (the substrate), and the IOMMU is a confinement we configure — there i
 surface anywhere in the path.
 
 ## 4. Bench-gated / build-time open items (this topic)
+
+Items 2–4 are **built and QEMU-proven** as of Sprint 5 (see the grounding status in §2); what these bench
+items now add is the **silicon** re-verification the QEMU proof cannot give — real VT-d, the real 82599,
+and the interrupt-remap block that is un-inducible in emulation.
 
 1. **The X520-DA2's two functions** — confirm the dark function is left unmapped/disabled in our DMAR
    context setup so it cannot DMA. (Security-relevant now that the mapping is ours to get right.)

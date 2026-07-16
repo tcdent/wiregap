@@ -76,6 +76,37 @@ which the parent threat model already excludes — not by the runtime box-over-w
 physical-control assumption ever weakens, because this is the one "NIC untrusted" channel the IOMMU
 does not bound.
 
+## DMAR now ours + confined in QEMU — the residuals that need silicon (Sprint 5, 2026-07-16)
+
+Sprint 5 wrote and owns the VT-d DMAR in the substrate and demonstrated the confinement **in QEMU
+`intel-iommu`** — the mechanism, not silicon. What QEMU proved has moved into the design docs
+(`grounding/kernel-bypass-and-dma.md §2`, pending ratification): the DMA-reach confinement is realized,
+and the **(ii) BLOCKED** proof landed — an induced out-of-arena device DMA faults at the IOMMU (FRCD IOVA
+== the induced address, source-id == the NIC) while the in-arena DMA succeeds. What QEMU **cannot**
+discharge stays open here, on purpose:
+
+- **(iii) SOUND — the setup's real-silicon soundness.** QEMU validates our table construction + the
+  enable ordering (`RTADDR`+`SRTP` → context-cache + IOTLB invalidate → `TE`) *as emulated*. Unanalyzed:
+  whether the same tables + sequence confine on the **real platform VT-d + the real 82599** — cache/IOTLB
+  behaviour, errata, the actual DRHD topology. A QEMU-green fault **corroborates**; it does not discharge.
+  Residual: the confinement is proven-in-QEMU, not proven-on-silicon.
+
+- **Rogue-MSI blocked (the interrupt-remapping (ii)).** We wrote the IRT (source-validated against the
+  NIC's SID) and enabled interrupt remapping — its **(i)-source** verdict. But "a rogue NIC MSI to an
+  arbitrary address is **blocked**" is **un-inducible in QEMU**: a well-behaved emulated device fires no
+  rogue MSI. Unverified: that the IRT's source-validation actually *stops* a crafted MSI on silicon. Do
+  not read "we wrote+enabled the IRT" as "interrupt remapping is airtight."
+
+- **82599 ATS-advertise (the ATS-off datasheet half).** Our config does not enable ATS (context
+  translation-type = 0) — the **(i)-source** verdict, with bypass-blocked *inferred*. Unverified: whether
+  the real 82599 **advertises** ATS and whether the platform would honour a pre-translated request — the
+  datasheet + bench half, Sprint 6.
+
+These are the honest residuals of "the IOMMU contains a rogue NIC": DMA-reach is now grounded
+(proven-in-QEMU) and the airtightness items carry their **(i)-source** verdicts, but the **(ii)/(iii)**
+and silicon halves above are **not closed**. Until the bench card, "contained on silicon" remains a
+claim, not a fact — the gap that still stands between proven-in-QEMU and proven.
+
 ## Why this file exists
 
 These are real, and they are also exactly the kind of thing that *looks* handled the moment it is written

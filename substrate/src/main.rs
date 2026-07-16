@@ -24,12 +24,16 @@ mod app {
     use substrate::acpi::Acpi;
     use substrate::arena::{self, ArenaConfig, Region};
     use substrate::banner::{
-        write_arena, write_banner, write_ecam, write_interrupts, write_reactor, BootFacts, EcamFacts,
-        InterruptFacts, ReactorFacts,
+        write_airtightness, write_arena, write_banner, write_dmar, write_dmar_enforce, write_ecam,
+        write_interrupts, write_reactor, AirtightnessFacts, BootFacts, DmarEnforceFacts, DmarFacts,
+        EcamFacts, InterruptFacts, ReactorFacts,
     };
     use substrate::calibrate::{self, Calibration};
+    use substrate::dmar::{self, DmarConfig};
+    use substrate::e1000e::E1000e;
     use substrate::ecam::Device;
     use substrate::interrupts::{self, VectorPlan, MSIX_HITS, MSIX_PENDING, TIMER_TICKS};
+    use substrate::iommu::Iommu;
     use substrate::lapic::Lapic;
     use substrate::reactor::{Reactor, RxSource, WakeReason};
     use substrate::reactor_host::SubstrateHost;
@@ -181,6 +185,143 @@ mod app {
     const MODEL_NOTE: &str =
         "QEMU has no 82599 model -> ECAM mechanism validated on e1000e(82574L); real 82599 = Slice 6 (bench)";
 
+    /// Copy the DMAR table image into physical (identity-mapped) memory the IOMMU reads.
+    fn write_phys(dst: u64, bytes: &[u8]) {
+        // SAFETY: `dst` is the base of the substrate-carved, NIC-unreachable table region inside a
+        // CONVENTIONAL usable region we own after ExitBootServices; identity-mapped, so the physical
+        // address IS the pointer. We write exactly the `bytes` we produced; no aliasing with Rust memory.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
+        }
+    }
+
+    /// Sprint-5 Slice 1: build the DMAR tables (pure) confining the NIC to the arena, install them, and
+    /// enable translation. Reports observed→expected; the Slice-1 verdict is remapping ENABLED (+ tables
+    /// NIC-unreachable), NOT enforcement (that is Slice 2).
+    /// Slice 2 — the induced out-of-range test: drive e1000e to DMA an in-arena buffer (must succeed)
+    /// and an out-of-arena buffer (must fault), and confirm the IOMMU recorded the fault (FRCD IOVA ==
+    /// the induced address, SID == the NIC). The pair is the (ii) BLOCKED proof.
+    fn run_enforce(iommu: &Iommu, arena: Region, ecam_base: u64, devfn: u8, com: &mut Serial) -> bool {
+        let bar0 = Device::new(ecam_base, NIC_BUS, NIC_DEV, NIC_FUNC).bar0().base;
+        let nic = E1000e::new(bar0);
+        let ring_phys = arena.base; // in-arena: the device DMA-reads descriptors from here
+        let in_buf = arena.base + 0x1_0000; // in-arena buffer
+        let out_buf = arena.end() + 0x20_0000; // out-of-arena (unmapped), page-aligned
+        let sid = ((NIC_BUS as u16) << 8) | (devfn as u16);
+
+        nic.init_tx(ring_phys, 4096);
+        iommu.clear_faults();
+
+        // Test A — in-arena DMA (load-bearing: must succeed with no fault).
+        let in_arena_success = nic.induce_tx(ring_phys, 0, in_buf, 64);
+        let in_arena_no_fault = iommu.take_fault().is_none();
+        iommu.clear_faults();
+
+        // Test B — out-of-arena DMA (must fault, not complete).
+        let out_completed = nic.induce_tx(ring_phys, 1, out_buf, 64);
+        let fault = iommu.take_fault();
+
+        let facts = DmarEnforceFacts {
+            in_arena_success,
+            in_arena_no_fault,
+            out_addr: out_buf,
+            out_completed,
+            fault,
+            sid,
+        };
+        let _ = write_dmar_enforce(com, &facts);
+        facts.blocked()
+    }
+
+    /// Slice 3 — the (B) airtightness verdicts, LEVEL stated per item. Writes the IRT (falls naturally in
+    /// the DMAR setup) for the interrupt-remapping (i)-source verdict + enables IR; ATS-off and no-p2p are
+    /// (i)-source from our config/topology. The (ii) rogue-MSI and the silicon residuals stay honest-open.
+    fn run_airtightness(iommu: &Iommu, table_region: Region, devfn: u8, com: &mut Serial) -> bool {
+        let nic_vector = VectorPlan::NIC.nic_msix;
+        let sid = ((NIC_BUS as u16) << 8) | (devfn as u16);
+        // The IRT lives in the NIC-unreachable table region, past the DMAR tables.
+        let irt_phys = table_region.base + 0x8000;
+        let irt = dmar::build_irt(256, nic_vector, 0, sid);
+        write_phys(irt_phys, &irt);
+        iommu.enable_ir(irt_phys, 256);
+
+        let facts = AirtightnessFacts {
+            ir_enabled: iommu.ir_enabled(),
+            ir_vector: nic_vector,
+            ir_sid: sid,
+            ats_enabled_by_us: false, // our context translation-type = 0 (see dmar::build)
+            hw_supports_ats: iommu.supports_ats(),
+            p2p_mapped: false, // our SL tables map only the arena (host RAM), never a device BAR
+            te_still_enabled: iommu.translation_enabled(), // read AFTER enable_ir: TE must survive
+        };
+        let _ = write_airtightness(com, &facts);
+        facts.slice3_ok()
+    }
+
+    fn run_dmar_slice(rsdp: u64, arena_extent: Option<Region>, usable: Region, ecam_base: u64, com: &mut Serial) -> bool {
+        let hdr = "---- sprint-5 slice-1 : DMAR ----";
+        let reg_base = match Acpi::new(rsdp).dmar_drhd_reg_base(PCI_SEGMENT) {
+            Some(b) => b,
+            None => {
+                let _ = writeln!(com, "{hdr}\nassert   : dmar-acpi-table  observed=NOT-FOUND expected present\nRESULT   : FAIL");
+                return false;
+            }
+        };
+        let extent = match arena_extent {
+            Some(e) => e,
+            None => {
+                let _ = writeln!(com, "{hdr}\nassert   : arena            observed=UNAVAILABLE\nRESULT   : FAIL");
+                return false;
+            }
+        };
+        let iommu = Iommu::new(reg_base);
+        let levels = iommu.levels();
+        let devfn = (NIC_DEV << 3) | NIC_FUNC;
+        // The DMAR tables live just above the arena extent (2 MiB-aligned end) — disjoint, NIC-unreachable.
+        let table_region = Region { base: extent.end(), len: 0x1_0000 };
+        if !table_region.within(&usable) {
+            let _ = writeln!(com, "{hdr}\nassert   : table-region-in-usable  observed=false\nRESULT   : FAIL");
+            return false;
+        }
+        let cfg = DmarConfig { arena: extent, table_region, bus: NIC_BUS, devfn, levels, domain_id: 1 };
+        let image = match dmar::build(&cfg) {
+            Ok(img) => img,
+            Err(e) => {
+                let _ = writeln!(com, "{hdr}\nassert   : build            observed=FAILED({e:?}) expected Ok\nRESULT   : FAIL");
+                return false;
+            }
+        };
+        write_phys(table_region.base, image.bytes());
+        iommu.enable(image.root_phys());
+        let facts = DmarFacts {
+            reg_base,
+            cap: iommu.cap(),
+            levels,
+            arena: extent,
+            table_region,
+            remapping_enabled: iommu.translation_enabled(),
+        };
+        let _ = write_dmar(com, &facts);
+        let slice1_ok = facts.slice1_ok();
+
+        // Slice 2 — enforcement (the induced fault), only meaningful with translation enabled.
+        let slice2_ok = if slice1_ok {
+            run_enforce(&iommu, extent, ecam_base, devfn, com)
+        } else {
+            let _ = writeln!(com, "---- sprint-5 slice-2 : DMAR enforcement ----\nSKIPPED (remapping not enabled)");
+            false
+        };
+
+        // Slice 3 — the (B) airtightness verdicts (IR (i)-source + ATS-off + no-p2p; honest-open named).
+        let slice3_ok = if slice1_ok {
+            run_airtightness(&iommu, table_region, devfn, com)
+        } else {
+            false
+        };
+
+        slice1_ok && slice2_ok && slice3_ok
+    }
+
     /// Locate the ACPI RSDP from the UEFI configuration table — **before** `ExitBootServices`, while
     /// the boot-services config table is live. Prefer ACPI 2.0+ (XSDT-rooted); fall back to legacy 1.0.
     /// Returns 0 if neither is present (a handoff failure the banner surfaces).
@@ -269,14 +410,14 @@ mod app {
         };
 
         // Slice 2b — carve this NIC's DMA arena in the chosen usable region.
-        let arena_ok = match arena::plan(arena_region, &ArenaConfig::NIC_82599) {
+        let (arena_ok, arena_extent) = match arena::plan(arena_region, &ArenaConfig::NIC_82599) {
             Ok(layout) => {
                 let _ = write_arena(&mut com, &layout, &arena_region);
-                layout.sound(&arena_region)
+                (layout.sound(&arena_region), Some(layout.extent))
             }
             Err(e) => {
                 let _ = writeln!(com, "---- slice-2 : arena ----\nassert   : plan  observed=FAILED({e:?}) expected Ok\nRESULT   : FAIL");
-                false
+                (false, None)
             }
         };
 
@@ -328,8 +469,11 @@ mod app {
         let _ = write_reactor(&mut com, &reactor);
         let reactor_ok = reactor.reactor_ok();
 
-        let all_ok = facts.handoff_ok() && ecam_ok && arena_ok && ints_ok && reactor_ok;
-        let _ = writeln!(com, "==== SLICE-4 OVERALL : {} ====", if all_ok { "PASS" } else { "FAIL" });
+        // Sprint 5 — the DMAR: Slice 1 confine (pure tables) + enable; Slice 2 the induced-fault proof.
+        let dmar_ok = run_dmar_slice(rsdp, arena_extent, arena_region, ecam_base, &mut com);
+
+        let all_ok = facts.handoff_ok() && ecam_ok && arena_ok && ints_ok && reactor_ok && dmar_ok;
+        let _ = writeln!(com, "==== OVERALL (s4 substrate + s5 DMAR confine+enforce+airtightness) : {} ====", if all_ok { "PASS" } else { "FAIL" });
         exit_qemu(&mut com, all_ok);
     }
 
