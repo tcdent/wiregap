@@ -96,13 +96,19 @@ the reactor's ACK-bound buffer lifecycle (`data-path-and-events.md §3`) manages
 is a few dozen lines: a bump pointer with alignment, no fragmentation, no lifetimes — trivially held in
 the head. Buffer-pool sizing stays a bench item (§8).
 
-**The DMA-able regions must be DMAR-isolatable — a forward-coupling to Sprint 5.** The arena decides what
-memory the device is later pointed at, and the Sprint-5 DMAR must be able to *confine* exactly those
-regions — so their layout is not free. The DMA-able allocations (the rings, the buffer pool, and the DMAR
-tables themselves) must be laid out **aligned and contiguous to the DMAR's page granularity**, so Sprint 5
-can map the device to *only* confinable memory and nothing adjacent falls inside a mapped page. Getting
-this shape right in the arena is cheap now; a re-layout once the DMAR is built on top is expensive. It is
-a constraint the arena honors from the start, not a Sprint-5 discovery.
+**Two categories, and the DMAR-isolatability coupling to Sprint 5.** The arena holds two kinds of region,
+and the distinction is security-critical. **NIC-reachable DMA regions** — the RX/TX rings and the
+packet-buffer pool — are the only memory the device ever touches; they go *into* the Sprint-5 second-level
+map, laid out **aligned and contiguous to the DMAR's page granularity** so that map can bound the device
+to *exactly* them and nothing adjacent falls inside a mapped page. **The DMAR tables themselves are not
+DMA-able**: they are read by the IOMMU *hardware*, never by the NIC, and are deliberately **left out of
+the second-level map** — the tables that define the device's confinement must sit outside what that
+confinement exposes, or a rogue NIC could DMA to its own translation tables and rewrite its permissions (a
+total containment break). So the arena's job is not just to make the reachable regions confinable; it is
+to keep the two categories cleanly separable — reachable regions page-isolatable and mapped, the DMAR
+tables unmapped and unreachable. Getting this shape right in the arena is cheap now; a re-layout once the
+DMAR is built on top is expensive — a constraint the arena honors from the start, not a Sprint-5
+discovery.
 
 ## 6. Interrupts — IDT / Local APIC / one-shot timer
 
