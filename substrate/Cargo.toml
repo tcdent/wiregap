@@ -1,0 +1,40 @@
+[package]
+name = "substrate"
+version = "0.0.0"
+edition = "2024"
+publish = false
+build = "build.rs"
+
+# The bare-metal foundation, sized to binding THIS 82599 (epic E2, bare-metal re-scope). `uefi`/`x86_64`
+# supply boot/register BOILERPLATE only, and only on the target; everything security-bearing (the Slice-2+
+# arena, ECAM, DMAR) is hand-written and ours. The deps are gated to `cfg(target_os = "uefi")` so a host
+# `cargo test` compiles ONLY the pure no_std logic (harness surface (a)) with neither crate in the way.
+[dependencies]
+# The reused, unchanged no_std session protocol (E5). The bare-metal reactor drives it. no_std + alloc,
+# so it compiles for both the host test build and the uefi target.
+transport = { path = "../transport" }
+
+# The UEFI app is not a libtest target — it is `no_main` with our own `#[panic_handler]`, which collides
+# with the std test harness. The pure logic is host-tested via `tests/` against the library instead.
+[[bin]]
+name = "substrate"
+path = "src/main.rs"
+test = false
+doctest = false
+
+[target.'cfg(target_os = "uefi")'.dependencies]
+# `alloc` only (not `global_allocator`): the bare-metal reactor + reused transport need a heap AFTER
+# ExitBootServices, where UEFI's boot-services allocator is gone — so the substrate provides its own
+# `#[global_allocator]` over a static heap (see `heap.rs`).
+uefi = { version = "0.35", default-features = false, features = ["alloc"] }
+x86_64 = { version = "0.15", default-features = false, features = ["instructions"] }
+linked_list_allocator = { version = "0.10", default-features = false, features = ["use_spin"] }
+
+[dev-dependencies]
+
+# Bare-metal: no unwinder. Abort on panic so no `eh_personality` is pulled in.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
