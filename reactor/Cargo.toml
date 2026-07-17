@@ -9,6 +9,5 @@ publish = false
 # syscall bindings) — no hand-rolled syscall numbers or `epoll_event` layout; no async/event-loop crate.
 [dependencies]
 transport = { path = "../transport" }
-libc = "0.2"
 
 [dev-dependencies]

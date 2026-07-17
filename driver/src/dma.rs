@@ -69,7 +69,11 @@ const RXD_STAT_DD: u32 = 1 << 0;
 /// the open residual above.
 pub struct VolatileRxRing {
     desc: *mut AdvRxDescWb,
+    /// The buffers' **virtual** base (CPU access — `copy_out`).
     bufs: *mut u8,
+    /// The buffers' **physical** base (the device DMA target written into the descriptor's `pkt_addr`).
+    /// Pure-direct has no IOMMU, so virt != phys: the CPU uses `bufs`, the device uses `bufs_phys`.
+    bufs_phys: u64,
     depth: usize,
     buffer_len: usize,
     rdt: *mut u32,
@@ -78,12 +82,14 @@ pub struct VolatileRxRing {
 impl VolatileRxRing {
     /// # Safety
     /// `desc` must point to `depth` contiguous, properly-aligned [`AdvRxDescWb`] in mapped DMA; `bufs`
-    /// to `depth * buffer_len` contiguous bytes in mapped DMA; `rdt` to the RX-tail MMIO register. The
-    /// region must stay mapped for `'static`. (Device-concurrency soundness of accessing it is the
+    /// to `depth * buffer_len` contiguous bytes in mapped DMA; `bufs_phys` the **physical** address of
+    /// that same buffer region (pagemap-resolved, Gate-2-validated); `rdt` to the RX-tail MMIO register.
+    /// The region must stay mapped for `'static`. (Device-concurrency soundness of accessing it is the
     /// undischarged residual — see the module docs.)
     pub unsafe fn new(
         desc: *mut AdvRxDescWb,
         bufs: *mut u8,
+        bufs_phys: u64,
         depth: usize,
         buffer_len: usize,
         rdt: *mut u32,
@@ -91,10 +97,17 @@ impl VolatileRxRing {
         Self {
             desc,
             bufs,
+            bufs_phys,
             depth,
             buffer_len,
             rdt,
         }
+    }
+
+    /// The **physical** address of slot `slot`'s buffer (the device DMA target). Distinct from the
+    /// virtual `bufs.add(slot*buffer_len)` used for CPU copy. Contiguous hugepage ⇒ base + offset.
+    fn buffer_phys(&self, slot: usize) -> u64 {
+        self.bufs_phys + (slot * self.buffer_len) as u64
     }
 }
 
@@ -149,12 +162,21 @@ impl RxRing for VolatileRxRing {
 
     fn refill(&mut self, slot: usize) {
         debug_assert!(slot < self.depth);
-        // SAFETY (local): in-bounds aligned `u32` write clearing the writeback status (hands the slot back
-        // to the device); `rdt` is the valid MMIO tail register. (Ordering of the descriptor write vs the
-        // tail bump vs the device is part of the undischarged crossing residual — module docs.)
+        let pkt_addr = self.buffer_phys(slot);
+        // SAFETY (local): `slot < depth` ⇒ `desc.add(slot)` is the in-bounds 16-byte descriptor. We write
+        // its READ format — pkt_addr (u64 @ off 0) = the buffer's PHYSICAL address, hdr_addr (u64 @ off 8)
+        // = 0 — which hands the slot back to the device and overwrites the writeback status (clearing DD).
+        // `rdt` is the valid MMIO tail register. NEW code for the real device (the sim never needed the
+        // pkt_addr write); the physaddr is the pagemap-resolved, Gate-2-validated `bufs_phys`. (Ordering
+        // of the descriptor write vs the tail bump vs the device is the undischarged crossing residual.)
         unsafe {
-            ptr::write_volatile(ptr::addr_of_mut!((*self.desc.add(slot)).status_error), 0);
-            ptr::write_volatile(self.rdt, slot as u32);
+            let d = self.desc.add(slot) as *mut u64;
+            ptr::write_volatile(d, pkt_addr); // read-format pkt_addr (physical)
+            ptr::write_volatile(d.add(1), 0); // read-format hdr_addr
+            // RDT points ONE PAST the last descriptor handed to the device (next-to-fill), so slot `slot`
+            // is device-owned only when RDT > slot. Writing `slot` (not slot+1) would leave RDH==RDT for a
+            // freshly-armed slot 0 — an empty ring the device never reads. (Wraps at `depth`.)
+            ptr::write_volatile(self.rdt, ((slot + 1) % self.depth) as u32);
         }
     }
 }
@@ -177,7 +199,10 @@ const TXD_STAT_DD: u32 = 1 << 0;
 /// `reclaim` frees per-descriptor. Not exercised this sprint (no NIC).
 pub struct VolatileTxRing {
     desc: *mut AdvTxDesc,
+    /// Buffers' **virtual** base (CPU access — the `post` byte copy).
     bufs: *mut u8,
+    /// Buffers' **physical** base (the device DMA target written into the descriptor's `buffer_addr`).
+    bufs_phys: u64,
     depth: usize,
     buffer_len: usize,
     tdt: *mut u32,
@@ -185,10 +210,12 @@ pub struct VolatileTxRing {
 
 impl VolatileTxRing {
     /// # Safety
-    /// As [`VolatileRxRing::new`], for the TX descriptor array, packet buffers, and the TX-tail MMIO.
+    /// As [`VolatileRxRing::new`], for the TX descriptor array, packet buffers, `bufs_phys` the buffers'
+    /// physical base, and the TX-tail MMIO.
     pub unsafe fn new(
         desc: *mut AdvTxDesc,
         bufs: *mut u8,
+        bufs_phys: u64,
         depth: usize,
         buffer_len: usize,
         tdt: *mut u32,
@@ -196,10 +223,17 @@ impl VolatileTxRing {
         Self {
             desc,
             bufs,
+            bufs_phys,
             depth,
             buffer_len,
             tdt,
         }
+    }
+
+    /// The **physical** address of slot `slot`'s buffer (the device DMA target). Distinct from the
+    /// virtual `bufs.add(...)` used for the CPU byte copy.
+    fn buffer_phys(&self, slot: usize) -> u64 {
+        self.bufs_phys + (slot * self.buffer_len) as u64
     }
 }
 
@@ -230,17 +264,30 @@ impl TxRing for VolatileTxRing {
         // each `dstp.add(i)` (`i < n`) is in-bounds; bytes copied volatile; the descriptor fields are
         // in-bounds aligned writes. `RS` (report-status) is set so the device writes DD back. (Ordering
         // of the buffer write vs the descriptor write vs the tail bump is the undischarged residual.)
+        let buffer_addr = self.buffer_phys(slot);
         unsafe {
+            // CPU byte copy via the VIRTUAL buffer pointer...
             let dstp = self.bufs.add(slot * self.buffer_len);
             for (i, &b) in src.iter().take(n).enumerate() {
                 ptr::write_volatile(dstp.add(i), b);
             }
-            ptr::write_volatile(ptr::addr_of_mut!((*self.desc.add(slot)).buffer_addr), dstp as u64);
+            // ...but the descriptor's DMA target is the PHYSICAL address (no IOMMU: the device reads
+            // physical). Writing `dstp` (a virtual address) here would DMA to arbitrary host RAM.
+            ptr::write_volatile(ptr::addr_of_mut!((*self.desc.add(slot)).buffer_addr), buffer_addr);
+            // olinfo carries the payload length (PAYLEN, bits [31:14]); write it before the cmd_type_len
+            // that arms the descriptor. Descriptor fields all precede the TDT doorbell below.
+            ptr::write_volatile(
+                ptr::addr_of_mut!((*self.desc.add(slot)).olinfo_status),
+                (n as u32) << ADVTXD_PAYLEN_SHIFT,
+            );
             ptr::write_volatile(
                 ptr::addr_of_mut!((*self.desc.add(slot)).cmd_type_len),
-                (n as u32) | TX_CMD_RS_EOP,
+                (n as u32) | TXD_CMD_TYPE,
             );
-            ptr::write_volatile(self.tdt, slot as u32);
+            // TDT points ONE PAST the last descriptor to transmit (next-to-fill): the device transmits
+            // [TDH, TDT). Writing `slot` (not slot+1) leaves TDH==TDT for slot 0 — an empty ring the device
+            // never fetches. (Wraps at `depth`.)
+            ptr::write_volatile(self.tdt, ((slot + 1) % self.depth) as u32);
         }
     }
 
@@ -258,6 +305,72 @@ impl TxRing for VolatileTxRing {
     }
 }
 
-/// TX command bits: `RS` (report status, so DD is written back) | `EOP` (end of packet). Representative
-/// of `IXGBE_ADVTXD_DCMD_*`.
-const TX_CMD_RS_EOP: u32 = (1 << 27) | (1 << 24);
+/// Advanced TX **data** descriptor command+type bits (82599, `ixgbe_type.h` `IXGBE_ADVTXD_*`), OR'd with
+/// the data length in the low bits: `EOP` (end of packet) | `RS` (report status → the device writes DD
+/// back) | `IFCS` (insert the Ethernet CRC) | `DEXT` (1 = advanced descriptor, not legacy) | `DTYP_DATA`
+/// (advanced data descriptor). Without DEXT+DTYP_DATA the device mis-reads the descriptor as legacy;
+/// without IFCS the frame is sent with no FCS. (The sim ring, being software, tolerated the earlier
+/// RS|EOP placeholder; the real device does not.)
+const TXD_CMD_TYPE: u32 = (1 << 24)  // EOP
+    | (1 << 27)  // RS
+    | (1 << 25)  // IFCS
+    | (1 << 29)  // DEXT (advanced)
+    | 0x0030_0000; // DTYP = advanced data descriptor
+/// Advanced TX descriptor PAYLEN shift (`olinfo_status` bits [31:14]).
+const ADVTXD_PAYLEN_SHIFT: u32 = 14;
+
+#[cfg(test)]
+mod virt_phys_tests {
+    //! The virt/phys split (pure-direct retarget): the descriptor DMA target is the buffer's PHYSICAL
+    //! address, DISTINCT from the virtual pointer used for the CPU byte copy. Proven over host memory
+    //! with a synthetic physical base (no hardware). The guard/copy-boundary above the seam are frozen.
+    use super::*;
+    use crate::seam::{RxRing, TxRing};
+
+    const DEPTH: usize = 4;
+    const BLEN: usize = 2048;
+    const SYNTH_PHYS: u64 = 0x8_4360_0000; // a synthetic hugepage physical base (!= any host VA)
+
+    #[test]
+    fn tx_post_writes_physical_buffer_addr_not_the_virtual_pointer() {
+        let mut descs: Vec<AdvTxDesc> =
+            (0..DEPTH).map(|_| AdvTxDesc { buffer_addr: 0, cmd_type_len: 0, olinfo_status: 0 }).collect();
+        let mut bufs = vec![0u8; DEPTH * BLEN];
+        let mut tdt = 0u32;
+        let virt_base = bufs.as_ptr() as u64;
+        let mut ring =
+            unsafe { VolatileTxRing::new(descs.as_mut_ptr(), bufs.as_mut_ptr(), SYNTH_PHYS, DEPTH, BLEN, &mut tdt) };
+        let slot = 2;
+        ring.post(slot, b"hello");
+        // the descriptor DMA target is PHYSICAL...
+        assert_eq!(descs[slot].buffer_addr, SYNTH_PHYS + (slot * BLEN) as u64, "buffer_addr is physical");
+        assert_ne!(descs[slot].buffer_addr, virt_base + (slot * BLEN) as u64, "NOT the virtual pointer");
+        // ...while the bytes were copied to the VIRTUAL buffer.
+        assert_eq!(&bufs[slot * BLEN..slot * BLEN + 5], b"hello", "copy used the virtual buffer");
+        assert_eq!(tdt, ((slot + 1) % DEPTH) as u32, "tail bumped to next-to-fill (slot+1)");
+        // The real-device advanced data descriptor: length in the low bits, EOP|RS|IFCS|DEXT|DTYP_DATA in
+        // the command/type bits, and the payload length in olinfo PAYLEN[31:14].
+        assert_eq!(descs[slot].cmd_type_len, 5u32 | TXD_CMD_TYPE, "cmd_type_len = len | advanced cmd bits");
+        assert_eq!(descs[slot].cmd_type_len & (1 << 29), 1 << 29, "DEXT set (advanced, not legacy)");
+        assert_eq!(descs[slot].cmd_type_len & (1 << 25), 1 << 25, "IFCS set (device appends the CRC)");
+        assert_eq!(descs[slot].olinfo_status, 5u32 << ADVTXD_PAYLEN_SHIFT, "olinfo PAYLEN = payload length");
+    }
+
+    #[test]
+    fn rx_refill_writes_physical_pkt_addr_new_code() {
+        let mut descs: Vec<AdvRxDescWb> = (0..DEPTH)
+            .map(|_| AdvRxDescWb { lo_dword: 0, hi_dword: 0, status_error: RXD_STAT_DD, length: 0, vlan: 0 })
+            .collect();
+        let mut bufs = vec![0u8; DEPTH * BLEN];
+        let mut rdt = 0u32;
+        let mut ring =
+            unsafe { VolatileRxRing::new(descs.as_mut_ptr(), bufs.as_mut_ptr(), SYNTH_PHYS, DEPTH, BLEN, &mut rdt) };
+        let slot = 3;
+        ring.refill(slot);
+        // the read-format pkt_addr (first u64 of the descriptor) = PHYSICAL, and DD is cleared.
+        let pkt_addr = unsafe { ptr::read(descs.as_ptr().add(slot) as *const u64) };
+        assert_eq!(pkt_addr, SYNTH_PHYS + (slot * BLEN) as u64, "pkt_addr is physical (new refill code)");
+        assert!(!ring.descriptor_done(slot), "refill cleared DD (handed the slot to the device)");
+        assert_eq!(rdt, ((slot + 1) % DEPTH) as u32, "tail bumped to next-to-fill (slot+1)");
+    }
+}

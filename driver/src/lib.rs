@@ -36,7 +36,7 @@ mod seam;
 pub mod sim;
 mod tx;
 
-pub use dma::{VolatileRxRing, VolatileTxRing};
+pub use dma::{AdvRxDescWb, AdvTxDesc, VolatileRxRing, VolatileTxRing};
 pub use rx::{RXD_ENUMERATED, RXD_STAT_EOP, RxPath};
 pub use seam::{RxRing, TxRing};
 pub use tx::TxPath;

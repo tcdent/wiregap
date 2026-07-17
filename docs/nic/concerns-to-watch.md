@@ -63,6 +63,29 @@ What stays **open, on purpose:**
   its residual — whether we have enumerated *every* device-written field we read, not just the obvious
   length — stays exactly as it was.
 
+## The residuals are now EXERCISED on silicon — Slice 4 transmission (2026-07-17)
+
+Slice 4 proved data transmission across the DAC (`41:00.0` → `63:00.0`, pure-direct, no IOMMU): a unique
+per-run nonce transmitted by 41 arrived at 63 **byte-equal**, out of pre-cleared buffers, through the real
+`copy_out`/`RxDrain` seam, DD set by the device, `RXDGPC` confirming the DMA-to-host (reproduced across
+runs; TX-first showed `RXDGPC=0` with RX unarmed, then `RXDGPC>=1` after arming). This closes
+**PATH-WORKS** only. The transmission pass **EXERCISED** the two residuals below; it did **not** discharge
+either.
+
+- **The no-IOMMU owned-DMA posture is EXERCISED at the first live RX-write (unattended, on production);
+  owned per §2 (policy-audited post-PoC); path-works != crossing-sound != contained.** The hard stop was
+  dropped by operator ruling, so the first RX per-buffer device-write ran unattended on the live host,
+  gated only by gate-2(i) + TX-first — **both CONTENT-BLIND on the RX buffer**. The byte-equal proof reads
+  the buffer AFTER the device already wrote it, so it is an end-to-end PATH proof, NOT a pre-write guard.
+  The §2 DMA-anywhere risk is therefore **concrete and realized in this run**, not abstract or future.
+
+- **`dma.rs` crossing-soundness stays UNDISCHARGED (visibility / DD-ordering / no-tearing).** A frame
+  crossing intact proves the path works; it does **not** prove the crossing is *sound* — the
+  device-concurrency visibility, the DD→read memory ordering, and no-tearing hazards enumerated under "The
+  unsafe DMA / memory boundary" above — **nor** that it is *contained*. The run relied on x86 cache-coherent
+  DMA + TSO + the UC-MMIO-doorbell ordering WITHOUT explicit fences; that it worked is evidence of
+  path-works, not a memory-ordering soundness proof. Neither residual is discharged by the transmission pass.
+
 ## How this went wrong in the past
 
 Two containment approaches were explored and abandoned before the pure-direct posture. First, a

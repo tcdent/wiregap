@@ -17,7 +17,6 @@
 //! (`tests/reactor.rs`); the substrate side (LAPIC one-shot timer / `hlt` / MSI-X, the Slice-1..3
 //! substrate) is confined entirely in the [`Host`] *impl* (`main.rs`, bare-metal only).
 
-extern crate alloc;
 use alloc::vec::Vec;
 use core::time::Duration;
 use transport::{Delivery, Instant, SessionId, SessionTable, TransmitSink};

@@ -6,7 +6,7 @@
 use core::cell::Cell;
 use core::time::Duration;
 use std::collections::VecDeque;
-use substrate::reactor::{arm_from_deadline, can_pull_rx, Arm, Host, Reactor, RxSource, WakeReason};
+use reactor::{arm_from_deadline, can_pull_rx, Arm, Host, Reactor, RxSource, WakeReason};
 use transport::{Instant, SessionTable, TransmitSink};
 
 // ---- deadline composition (the three edge-facts) ----------------------------------------------

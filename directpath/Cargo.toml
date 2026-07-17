@@ -1,0 +1,16 @@
+[package]
+name = "directpath"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# The pure-direct control module (ixy pci.c/memory.c shape) — Sprint 6. A userspace process on running
+# Linux that takes the bench NIC and drives it directly. This crate's PRIMARY safety leg is the pure
+# `gate` (below): every state-changing op (unbind/BME/mmap/DMA, Part B) routes through it. std (userspace).
+[dependencies]
+libc = "0.2"
+# The E3 driver crate: the confined volatile DMA rings (VolatileRxRing/TxRing) + the RxDrain copy-out seam
+# (RxPath). Slice 4 drives the real device through these over the datapath bring-up (src/datapath.rs).
+driver = { path = "../driver" }
+
+[dev-dependencies]
