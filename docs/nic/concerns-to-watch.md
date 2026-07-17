@@ -39,73 +39,40 @@ have a verified account of its soundness. Suspected hazards, each unproven:
   firmware-written length must be bounded, not trusted. Residual we have not closed: whether we have
   enumerated *every* field we read from device-written memory, or only the obvious one.
 
-## Whether the IOMMU actually contains a rogue NIC (the airtightness half)
+## The NIC's DMA is owned, not contained — the residual of dropping the IOMMU (2026-07-16)
 
-The privilege-escalation surface from the untrusted box NIC over the wire converges on two places
-(`grounding/kernel-bypass-and-dma.md §2`): the driver's vector-2 handling (grounded), and the IOMMU
-being *airtight*. DMA-reach remapping is grounded; the rest of airtightness is **asserted, not
-verified.** We state it as the attack surface anyway — this is where a rogue NIC would try to escape:
+The subsystem drives the NIC on the pure-direct path with **no IOMMU** (`grounding/kernel-bypass-and-dma.md`):
+the device DMAs to physical addresses we resolve, unbounded by any hardware confinement. This is the
+operator's ratified posture — an IOMMU confinement would rest on the kernel that programs it, and the
+kernel is excluded from the trusted base, so it would launder the risk through kernel trust rather than
+remove it. The rogue-NIC DMA risk is owned directly.
 
-- **Interrupt remapping.** We suspect that without IOMMU interrupt remapping governing the NIC's
-  MSI/MSI-X writes, a rogue NIC could craft memory writes to arbitrary addresses (an escalation, not a
-  DoS). Unverified: that it is enabled and effective in our platform + VFIO/iommufd config.
+What stays **open, on purpose:**
 
-- **ATS (Address Translation Services).** We suspect that if the 82599 supports ATS and it is enabled, a
-  rogue NIC could present pre-translated requests that skip the IOMMU check. Unverified: whether the part
-  supports it, whether it is off, and whether our config forces it off.
+- **The owned firmware-DMA risk.** With no confinement, a compromised NIC firmware — bulky vendor code we
+  cannot read, written from box-controlled wire bytes (`grounding/data-path-and-events.md §1`) — could DMA
+  anywhere in proxy memory. We do not mitigate this in hardware; we own it. The concern to watch is
+  whether that ownership actually holds: whether the parent threat model tolerates un-contained firmware
+  DMA on the trusted side, or whether some containment that does *not* rest on the untrusted kernel is
+  later wanted. This is the security-load-bearing question, and it is **audited with the policy layer
+  after the PoC is built** — until that audit returns, the posture is committed but not ratified, and
+  `architecture.md §2.1` / the spine remain to be reconciled to it.
 
-- **Peer-to-peer DMA.** We suspect device-to-device DMA could be a path around the memory-confinement
-  intent. Unverified: whether it is reachable/relevant in our single-NIC, IOMMU-on topology.
+- **Vector 2 is unchanged, and still open where it always was.** The driver interpreting adversary-written
+  descriptors is the one guard the posture shift does not touch (`grounding/kernel-bypass-and-dma.md §3`);
+  its residual — whether we have enumerated *every* device-written field we read, not just the obvious
+  length — stays exactly as it was.
 
-These together are the **unverified half of "the IOMMU contains a rogue NIC."** Until grounded against
-the VFIO/IOMMU docs and the datasheet, that sentence is a claim, not a fact.
+## How this went wrong in the past
 
-The stakes are higher than verification: this (with vector 2) is the containment that lets the firmware
-be **untrusted-but-contained** rather than trusted-by-diligence (`architecture.md §2.1`). Grounding it
-is what **deletes the firmware from the trusted base** and eliminates the subsystem's last hope-and-pray
-member. Until then, that posture is committed but not yet fact — the gap here is exactly what stands
-between "almost" and "done."
-
-**A third channel, explicitly scoped out — kept here so the scope-out stays visible.** Taking "the NIC
-is untrusted" at its word exposes a surface neither over-the-wire nor IOMMU-covered: **boot-time PCI
-config-space enumeration** (stock kernel parses NIC-controlled BAR/capability values before any IOMMU
-mapping; `grounding/kernel-bypass-and-dma.md §2`). We scope it **out of the runtime threat model**
-because it is reachable only by a NIC compromised at/before provisioning (supply-chain / physical) —
-which the parent threat model already excludes — not by the runtime box-over-wire adversary. This is a
-*stated* scope-out, not a verification: the concern to watch is whether that provisioning-time /
-physical-control assumption ever weakens, because this is the one "NIC untrusted" channel the IOMMU
-does not bound.
-
-## DMAR now ours + confined in QEMU — the residuals that need silicon (Sprint 5, 2026-07-16)
-
-Sprint 5 wrote and owns the VT-d DMAR in the substrate and demonstrated the confinement **in QEMU
-`intel-iommu`** — the mechanism, not silicon. What QEMU proved has moved into the design docs
-(`grounding/kernel-bypass-and-dma.md §2`, pending ratification): the DMA-reach confinement is realized,
-and the **(ii) BLOCKED** proof landed — an induced out-of-arena device DMA faults at the IOMMU (FRCD IOVA
-== the induced address, source-id == the NIC) while the in-arena DMA succeeds. What QEMU **cannot**
-discharge stays open here, on purpose:
-
-- **(iii) SOUND — the setup's real-silicon soundness.** QEMU validates our table construction + the
-  enable ordering (`RTADDR`+`SRTP` → context-cache + IOTLB invalidate → `TE`) *as emulated*. Unanalyzed:
-  whether the same tables + sequence confine on the **real platform VT-d + the real 82599** — cache/IOTLB
-  behaviour, errata, the actual DRHD topology. A QEMU-green fault **corroborates**; it does not discharge.
-  Residual: the confinement is proven-in-QEMU, not proven-on-silicon.
-
-- **Rogue-MSI blocked (the interrupt-remapping (ii)).** We wrote the IRT (source-validated against the
-  NIC's SID) and enabled interrupt remapping — its **(i)-source** verdict. But "a rogue NIC MSI to an
-  arbitrary address is **blocked**" is **un-inducible in QEMU**: a well-behaved emulated device fires no
-  rogue MSI. Unverified: that the IRT's source-validation actually *stops* a crafted MSI on silicon. Do
-  not read "we wrote+enabled the IRT" as "interrupt remapping is airtight."
-
-- **82599 ATS-advertise (the ATS-off datasheet half).** Our config does not enable ATS (context
-  translation-type = 0) — the **(i)-source** verdict, with bypass-blocked *inferred*. Unverified: whether
-  the real 82599 **advertises** ATS and whether the platform would honour a pre-translated request — the
-  datasheet + bench half, Sprint 6.
-
-These are the honest residuals of "the IOMMU contains a rogue NIC": DMA-reach is now grounded
-(proven-in-QEMU) and the airtightness items carry their **(i)-source** verdicts, but the **(ii)/(iii)**
-and silicon halves above are **not closed**. Until the bench card, "contained on silicon" remains a
-claim, not a fact — the gap that still stands between proven-in-QEMU and proven.
+Two containment approaches were explored and abandoned before the pure-direct posture. First, a
+**kernel-configured IOMMU (VFIO)** — rejected because the confinement's correctness would rest on the
+excluded kernel, so it was not real containment. Then, **owning the VT-d DMAR ourselves** on a bare-metal
+substrate (Sprint 4–5; the DMAR table construction was even proven-in-QEMU) — rejected because it required
+a bare-metal runtime the system does not use: we stay a userspace process on running Linux. The current
+posture — own the device directly, own the DMA risk — replaces both. Do not re-introduce either: not the
+kernel-IOMMU (it trusts the kernel), not the own-the-DMAR substrate (it is bare-metal). The residual above
+is the honest cost of that choice, and it is the policy layer's to audit.
 
 ## Why this file exists
 

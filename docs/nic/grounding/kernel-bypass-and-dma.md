@@ -1,218 +1,95 @@
-# Kernel-bypass and DMA confinement
+# Kernel-bypass and direct device ownership
 
-> How packets move between the wire and our process with **no kernel in the path at all**, and how the
-> IOMMU — a confinement **we configure ourselves** — bounds the NIC's DMA so "we gave a device direct
-> memory access" does not mean "the device can scribble all of RAM." This is the subsystem's reason for
-> being: the kernel is excluded from the trusted base for being un-reviewable (spine assertion 16), so we
-> run on the bare metal, own the hardware, and configure the IOMMU in our own reviewable code — no kernel
-> to trust for the confinement, and no kernel network stack (a large, box-reachable parser) in the path.
+> How we drive the proxy's NIC **directly** from a userspace process on a **running Linux system** — the
+> kernel network stack, and the kernel itself, out of the interaction — and the DMA posture that follows:
+> the device DMAs to physical memory we own, with **no IOMMU containment**. This is the subsystem's reason
+> for being: spine assertion 16 excludes the kernel from the trusted base and drives "a minimal,
+> datasheet-built driver over a kernel-bypassed link." We take the device entirely and talk to the
+> hardware ourselves.
 >
-> Grounded in the Intel VT-d spec (DMA-remapping / DMAR programming), the UEFI spec (the boot-time
-> handoff to owned hardware — see `bare-metal-substrate.md`), and `reference/ixy` for the DMA
-> ring/buffer data-path concepts (`memory.c`) — **not** its VFIO control plane, which does not apply to
-> the bare-metal model.
+> Grounded in `reference/ixy` — the **direct (non-VFIO) path**: `pci.c` (`remove_driver`, `enable_dma`,
+> `pci_map_resource`) and `memory.c` (`memory_allocate_dma`, `virt_to_phys`).
 
-The runtime model is the operator's ratified direction (2026-07): the trusted core owns the hardware with
-no kernel above it and configures the IOMMU itself — no VFIO, no kernel intermediary.
+The runtime model is the operator's ratified direction (2026-07): Linux stays running and untrusted; we
+take the NIC device entirely and drive it directly — pure direct path, **no kernel tooling** (no VFIO, no
+kernel-mediated IOMMU). The device is ours; we own the whole stack.
 
-## 1. Owning the device and the IOMMU on the bare-metal substrate (one-time setup, not in the data path)
+## 1. Taking and driving the device (the pure direct path)
 
-We enter as a UEFI application, call `ExitBootServices`, and take ownership of the machine — after which
-no firmware code is resident above us and there is no kernel. The handoff gives us the two things we need:
-the physical **memory map** and the **ACPI table pointers** (MCFG, DMAR). From there the device and the
-confinement bring-up are entirely ours (substrate mechanics — ECAM, physical memory — are grounded in
-`bare-metal-substrate.md`; this doc owns the confinement):
+We are a userspace process on a running Linux system. We take the proxy's NIC and drive it directly — no
+kernel driver for it, no VFIO, no kernel framework. One-time setup, off the per-frame path:
 
-- **Find the device** via ECAM PCIe config (the ACPI MCFG table gives the config-space base): scan for
-  the 82599 (`8086:10FB`), read **BAR0** (the register block — identity-mapped physical memory we touch
-  directly), set **Bus-Master-Enable** in the Command register, read the **MSI-X capability**.
-- **Configure the IOMMU ourselves** (this doc's core): from the ACPI **DMAR** table, locate the
-  DMA-remapping hardware; build the **root table → context table → second-level page tables** in memory
-  we own, mapping **only** our rings/buffers' IOVAs to their physical addresses; program the DMAR
-  registers (set the root-table pointer, invalidate the context-cache + IOTLB, set Translation Enable);
-  and set the airtightness controls (interrupt remapping, ATS-off, no peer-to-peer — §2 (B)).
+- **Unbind the NIC from its kernel driver** — write the PCI address to
+  `/sys/bus/pci/devices/<addr>/driver/unbind` (`pci.c:remove_driver`). After this the kernel is not
+  touching the device.
+- **Enable bus-mastering** — set bit 2 (Bus Master Enable) in the Command register at config-space offset
+  4, via `/sys/bus/pci/devices/<addr>/config` (`pci.c:enable_dma`).
+- **Map the registers** — `mmap` `/sys/bus/pci/devices/<addr>/resource0` (BAR0) (`pci.c:pci_map_resource`).
+  From here we drive the 82599 by reading and writing its registers directly, as CPU loads/stores to the
+  mapped BAR.
+- **DMA memory** — allocate 2 MiB hugepages (hugetlbfs), `mlock` them so they never swap, and resolve
+  their **physical addresses** via `/proc/self/pagemap` (`memory.c:virt_to_phys`). The device DMAs to
+  those physical addresses **directly** — there is no IOMMU translation in the path (§2). 82599 rings/
+  buffers keep their 128-byte alignment requirement.
 
-All of this is **boot-time/setup, non-attacker-facing** (the box does not control the proxy's PCI bus)
-and **not in the per-frame path**. The register-level DMAR sequence is datasheet-built against the VT-d
-spec, exactly as the NIC bring-up is built against the 82599 datasheet (§4.6).
+This requires root (config-space write, `resource0` `mmap`, `pagemap`, hugepages) — expected, since we own
+the machine. None of it is in the per-frame path.
 
-## 2. The confinement guarantee (the load-bearing security property)
+## 2. The DMA posture — owned, not IOMMU-contained (security-critical; policy-audited post-PoC)
 
-The IOMMU bounds the NIC's DMA to exactly the IOVAs our page tables map; every unmapped IOVA faults, so
-unmapped memory is unreachable by the device. **The correctness of that confinement rests on our own
-reviewable code** — the DMAR tables we build and the enable sequence we run — not on a kernel we cannot
-review. This is what lets the IOMMU remain a confinement while we run with no kernel at all: the one
-confinement we depend on is one we configure and can read.
+The device DMAs to physical addresses we resolve; **no IOMMU translates or bounds its DMA.** This is a
+deliberate posture, not an omission:
 
-**One address space, no physical-address leak.** We own physical memory directly (the substrate's arena
-over the UEFI memory map) and **identity-map** it — CPU virtual = physical = IOVA — so there is a single
-address space to reason about across the CPU, the NIC, and the IOMMU. There is no `/proc/self/pagemap`
-and no physical-address-exposure question; those are artifacts of a userspace-under-Linux driver, which
-this is not.
+**Rationale (operator, 2026-07).** An IOMMU confinement would have to be programmed by the **kernel**, and
+the kernel is excluded from the trusted base (spine assertion 16). A confinement whose correctness rests
+on the untrusted kernel is not real containment — it launders the risk through kernel trust rather than
+removing it. The rogue-NIC DMA risk is the same whether or not a kernel-configured IOMMU is in the
+picture; so we own the device and the risk directly rather than add kernel trust for no real reduction.
 
-**We own the whole IOMMU.** "IOMMU groups" are a kernel abstraction for sharing one IOMMU among mutually
-distrusting owners; with no kernel, that sharing does not exist — we own the IOMMU wholesale. The
-hardware fact that survives is that the X520-DA2 exposes **two PCIe functions** (two ports; we light one,
-leave the other dark): our DMAR **context-table** setup covers both functions, giving the dark function
-no mapping (or leaving it disabled) so it cannot DMA. A platform fact to confirm at the bench (§4).
+**The posture shift.** The NIC moves from *"untrusted-but-**contained** (by the IOMMU)"*
+(`architecture.md §2.1`) to *"**owned** directly; the DMA risk is owned."* The "own the IOMMU ourselves"
+and "VFIO" directions that were briefly explored are both rejected: the first requires a substrate we do
+not run (bare-metal), the second requires the kernel tooling this posture excludes.
 
-**The X520 firmware is not trusted — it is contained; its trustworthiness is immaterial.** (Posture:
-`architecture.md §2.1`.) Every other member of this subsystem's trusted surface is either tiny-and-ours
-(the driver and the substrate, reviewed by reading; `driver-minimality.md`) or off-surface (there is no
-kernel and so no kernel network stack — the prior largest by-assumption parser simply does not exist).
-The X520's on-chip firmware is neither: it is **bulky vendor code we cannot read**, and it is
-**box-reachable** — it populates our descriptor rings from the wire bytes the box controls
-(`data-path-and-events.md §1`), and it manipulates AUTOC during link setup (the LESM finding,
-`device-bring-up-and-link.md §3`). So it is the one member that is *neither* reviewable-by-reading *nor*
-enumerable — and rather than close that gap with trust (diligence on code we cannot read, the subsystem's
-old "hope-and-pray" member), we **remove the need to trust it**: a maximally hostile NIC's only in-scope
-effect is escalation (bounded below) or data corruption (caught by CRC + retransmit); everything else is
-DoS/link-down, out of scope. Its soundness is therefore immaterial, the box's own logic applied to a
-device on the trusted host. What we *do* still record as diligence is the choice of *part* — the 82599 is
-the reference for userspace networking, complete public datasheet, long field history — but that
-diligence now backs *functioning* (will the link work), not *containment* (which is structural, below).
+**The honest residual (stated, not papered over).** With no IOMMU, a compromised NIC firmware — bulky
+vendor code we cannot read, populated from box-controlled wire bytes (`data-path-and-events.md §1`) —
+could DMA anywhere in proxy memory. This risk is **owned** per the decision above, not mitigated by
+hardware confinement. It is exactly the kind of hazard `concerns-to-watch.md` keeps visibly open.
 
-And it is **honest *and* bounded — by two distinct guards, for two distinct vectors.** The confinement is
-not the only thing standing between this firmware and the trusted host, but it is important to name
-*which* guard covers *which* failure, so neither is silently load-bearing for something it does not cover:
+**Audit.** This posture is security-load-bearing and changes `architecture.md §2.1` and the spine's
+"untrusted-but-contained" framing. Per the operator it is **audited with the policy layer after the PoC is
+built** — not settled here. Until that audit, §2.1 and the spine are known-inconsistent with this
+direction: this doc records the direction; the policy audit ratifies or adjusts the posture, and §2.1 /
+the spine are reconciled to whatever it returns.
 
-- **Vector 1 — DMA reach (bounded by the IOMMU we configure).** A misbehaving or compromised firmware
-  that tries to DMA *outside* our mapped buffers — to scribble arbitrary host RAM — is blocked: our DMAR
-  tables confine the device's DMA to exactly our mapped IOVAs (above), so its reach is the memory we
-  handed it, never the host's RAM. The confinement the design leans on is precisely this, and it is now
-  ours to build and read.
+## 3. The surviving guard — descriptor content bounded by the driver
 
-  > **As-built (Sprint 5, proven-in-QEMU — not yet silicon).** The DMAR is now written and owned in the
-  > substrate: the root/context/second-level tables (pure, host-tested to map only the arena and leave
-  > every other IOVA unmapped — including the DMAR tables' own region, so the device cannot rewrite its
-  > confinement) + the enable sequence (RTADDR+SRTP -> context-cache + IOTLB invalidate -> set TE).
-  > Vector-1 confinement is **realized**, and the **(ii) BLOCKED** proof landed in QEMU `intel-iommu`: an
-  > induced out-of-arena device DMA faults at the IOMMU (recorded FRCD IOVA == the induced address,
-  > source-id == the NIC) while an in-arena DMA succeeds. Interrupt remapping is written + enabled
-  > (source-validated IRT — its (i)-source verdict). The real-silicon soundness (iii), the rogue-MSI (ii),
-  > and the 82599-ATS datasheet half remain open (`concerns-to-watch.md`). QEMU proves the mechanism + the
-  > induced fault; the bench card re-verifies on real VT-d + the real 82599.
-- **Vector 2 — descriptor content (bounded by the driver, NOT the IOMMU).** The IOMMU does *not* stop the
-  firmware from writing malformed or malicious descriptors *into the rings we mapped* — those rings are
-  mapped, so the writes are allowed. That residual is carried by the **read-verified driver that
-  interprets the descriptors** (`data-path-and-events.md` — the surface "understood completely"): it must
-  robustly handle *any* descriptor content the firmware can produce, treating the ring as
-  adversary-influenced input. This is exactly *why* the driver being small and reviewed-by-reading is
-  load-bearing — it is the guard for the vector the IOMMU leaves open.
+One guard is unchanged by the posture shift and remains load-bearing: the descriptor ring and DMA buffers
+are **adversary-influenced** — the firmware writes them from box-controlled wire bytes — and the
+read-verified driver that interprets them is the guard. Bound the reported length to the buffer size,
+treat unexpected status bits as drop-and-refill, never derive a memory access from an unchecked descriptor
+field, copy each frame out of DMA memory early (`data-path-and-events.md §1`, `architecture.md §3.1`). This
+is runtime-independent — it held under every runtime model considered and holds here.
 
-So the firmware needs no trust: it is walled on both vectors — the IOMMU bounds where it can reach, and
-the read-verified driver bounds what malformed ring content can do. Neither guard is asked to cover the
-other's vector. Containment, not soundness, is what carries the firmware — which is why its
-trustworthiness can be immaterial.
+## 4. The kernel-free interaction — bypassed stack, and polling (not interrupts)
 
-**The privilege-escalation surface this confinement bounds (scoped) — and where it is not yet grounded.**
-The threat we scope here is narrow and specific: the **untrusted box-side NIC**, over the twinax (DAC)
-wire, used for **privilege escalation** on the **trusted proxy side** — *not* denial-of-service, *not*
-link-down, *not* physical damage, which are explicitly out of scope. Also out of scope: guarding the
-trusted (proxy) NIC against *becoming* compromised — we do not try to prevent that; we bound its
-*consequence*. The two are the same coin: we can treat the trusted NIC's compromise as out of scope
-*because* the IOMMU contains what a rogue NIC can do.
+Once set up, the per-frame path touches no kernel: we poll the descriptor's `DD` bit in host memory (no
+MMIO) and write the tail register as a direct CPU store to the mapped BAR. The kernel network stack is
+entirely out of the path (spine assertion 16).
 
-The adversary model is maximal at the wire: the box owns its NIC **down to the firmware**, so it can
-drive *arbitrary twinax signaling* — not merely malformed Ethernet frames, but out-of-spec PHY, abusive
-link negotiation, hostile framing, content crafted to trip the receiver. Tracing that input up the proxy
-receive path, every layer is either out of scope or bounded, and the escalation surface from the
-**runtime over-the-wire adversary** converges on **two places**:
+**Interrupts become polling.** The pure-direct path has no kernel mechanism to deliver an MSI-X interrupt
+to our process — that would require UIO or VFIO, the kernel tooling this model rejects. So the idle-wakeup
+is **bounded polling**, not an eventfd/epoll wait: the reactor's poll-then-block holds, with "block"
+realized as a bounded poll / short sleep rather than a delivered interrupt. This is affordable at the
+subsystem's real demand (hundreds of frames/sec against ~200k/s single-session headroom); it replaces the
+interrupt→eventfd→epoll idle-wakeup of the earlier (VFIO/bare-metal) drafts. The reactor *algorithm* is
+unchanged; only its wakeup primitive is.
 
-- **(A) The driver's handling of box-controlled descriptor/buffer content — vector 2.** In *our* code,
-  the prime surface, and the one we have grounded (bound the length, treat status as adversarial, never
-  deref an unchecked field, copy out early; `data-path-and-events.md §1`).
-- **(B) The IOMMU's containment being *airtight*.** DMA remapping bounding *reach* (vector 1) is
-  necessary but not sufficient — it is airtight only if nothing lets the device step *around* it. That
-  requires, at least: **interrupt remapping** governing the device's MSI/MSI-X writes (or a rogue NIC
-  crafts memory writes to arbitrary addresses via MSI — an escalation, not a DoS); and the device's
-  IOMMU-**bypass features disabled** — **ATS** (Address Translation Services: translated requests that
-  skip the IOMMU check) and **peer-to-peer DMA**. In the bare-metal model **every one of these is a
-  control we set in our own DMAR configuration** — not a platform default we inherit and hope for.
+## 5. Bench-gated / build-time open items (this topic)
 
-Everything else *over the wire* collapses cleanly: the electrical/SerDes and link-negotiation layers
-reduce to bit-errors / link-state, i.e. DoS/down (out of scope); and a proxy-NIC firmware compromise
-triggered over the wire is bounded by (B), which is why preventing it is out of scope.
-
-**A third surface the posture-flip exposes — config space / boot-time PCI enumeration — explicitly scoped
-out, stated not assumed.** Once we declare the NIC *untrusted*, we must account for *every* channel by
-which it reaches the trusted host, not just the over-the-wire ones. **Our own** PCIe config scan reads
-NIC-controlled **config-space** values (BAR sizes, capability structures) **before the IOMMU is
-configured** — so it is **neither over-the-wire nor IOMMU-covered**, and the (A)+(B) convergence misses
-it. A maximally hostile NIC could present hostile config space to trip that parser. Two things bound it.
-First, the parser is now **ours and tiny** — a handful of field reads (vendor/device ID, BAR0, Command,
-the MSI-X capability) in reviewed code, not a large stock-kernel enumerator — so the surface is far
-smaller than it was under a kernel. Second, and dispositive: this is reachable **only by a NIC already
-compromised at or before provisioning** — a firmware implant placed via supply-chain or physical access —
-because the box, over the wire, cannot alter the proxy NIC's config space. The **runtime** box-over-wire
-adversary this subsystem defends does **not** reach it, and the triggering adversary (supply-chain /
-physical) is already **out of scope in the parent threat model** (`containment-by-construction.md §2` —
-physical access is the locked-door concern). So it sits **outside the runtime threat model** — but it is
-the one "NIC untrusted" channel the IOMMU does not cover, so if the provisioning-time / physical-control
-assumption ever weakens, this is where it bites first. Recorded, not silently dropped
-(`concerns-to-watch.md`). *(Credit: zero.policy flagged this in spine review — the convergence is two
-places for the wire, three once the posture is taken at its word.)*
-
-**Grounding status — stated honestly, because the gap is the point.** Vector 2 is grounded. **DMA-reach
-(vector 1) is now built and owned, and proven-in-QEMU — not yet silicon.** The DMAR is written in the
-substrate: the pure, host-tested root/context/second-level tables map only the arena and leave every other
-IOVA unmapped — *including the DMAR tables' own region, so the device cannot rewrite its own confinement* —
-and the enable sequence (set-root-pointer → context-cache + IOTLB invalidate → enable translation)
-installs it. The enforcement proof landed on QEMU `intel-iommu`: an induced out-of-arena device DMA faults
-at the IOMMU (the recorded fault IOVA is the induced address, the source-id is the NIC) while an in-arena
-DMA succeeds. Interrupt remapping is written and enabled with a source-validated table. What remains
-**open and needs silicon** (tracked in `concerns-to-watch.md`): real-VT-d **soundness** — a QEMU-green
-fault corroborates the mechanism, it does not discharge cache/IOTLB/errata/topology behavior on the real
-part; that a **crafted rogue-NIC MSI is actually blocked** — un-inducible in QEMU, so "wrote + enabled the
-interrupt-remap table" is not yet "interrupt remapping is airtight"; and whether the real **82599
-advertises ATS** and the platform would honor a pre-translated request — the datasheet/bench half
-(Sprint 6). So the airtightness is no longer *asserted about a platform we cannot read* — it is *our
-configuration, built and QEMU-proven, with the silicon half honestly open*. Until that half is confirmed
-on the bench, "the IOMMU contains a rogue NIC" remains a claim with a known unverified part. Fully closing
-(A) the read-verified 82599 driver (Sprint 6) and (B) the silicon airtightness is what **deletes the
-firmware from the trusted base**, realizing the §2.1 posture (`architecture.md`); it is the
-highest-leverage grounding in the subsystem.
-
-### How this posture evolved (do not re-introduce the old one)
-
-Earlier framing treated the firmware as a **trusted member accepted by diligence** — "the reference part,
-public datasheet, field history, so we trust it" — recorded as the subsystem's honest soft spot. That
-diligence-trust was a quiet **exception to assertion 16** ("reject code you cannot read"), *not* something
-16 endorsed; it was the last hope-and-pray member, trust placed in code we cannot read, an un-answerable
-bet. The current posture **removes the exception**: the firmware is *untrusted-but-contained*, its
-soundness immaterial, and the only diligence that remains backs the *part choice for functioning*, not
-*containment*. So this makes the subsystem *more* 16-compliant, not less — nothing in the spine changes.
-Do not re-introduce "the firmware is vetted, so trust it" — the whole point is that we removed the place
-where its trustworthiness could matter. Containment (A + B), once grounded, is what makes that real.
-
-(This also retired the three-trust-bases model from the earlier box-reachability grounding —
-read / enumerate / **diligence**. The diligence basis is gone: the trusted base aims for no hope-and-pray
-member, only small-and-ours, structural-hardware, or untrusted-contained.)
-
-## 3. The kernel-free hot path
-
-The per-frame path touches no kernel because **there is no kernel**: packets DMA straight into our mapped
-buffers; we poll the descriptor's `DD` bit in host memory (no MMIO) and write the tail register as a
-direct CPU store to the identity-mapped BAR. The QEMU/VMexit model does **not** apply — this is bare-metal
-code that owns the machine, not a guest, so the tail-write does not trap. This is what makes the
-"kernel-bypassed link, single-digit-µs RTT" claim exactly (not approximately) true. The one-time bring-up
-is ours (the substrate), and the IOMMU is a confinement we configure — there is no persistent kernel
-surface anywhere in the path.
-
-## 4. Bench-gated / build-time open items (this topic)
-
-Items 2–4 are **built and QEMU-proven** as of Sprint 5 (see the grounding status in §2); what these bench
-items now add is the **silicon** re-verification the QEMU proof cannot give — real VT-d, the real 82599,
-and the interrupt-remap block that is un-inducible in emulation.
-
-1. **The X520-DA2's two functions** — confirm the dark function is left unmapped/disabled in our DMAR
-   context setup so it cannot DMA. (Security-relevant now that the mapping is ours to get right.)
-2. **Confirm the IOMMU actually bounds DMA** on the bench: a deliberately out-of-range device access
-   faults rather than reaching host RAM.
-3. **Confirm VT-d enables from our code** (the enable sequence takes — Translation-Enable status set) and
-   that our DMAR configuration is effective *before* the device is allowed to bus-master.
-4. **Confirm the (B) airtightness on silicon** — interrupt remapping is effective (a crafted MSI to a
-   non-remapped address is blocked), ATS is off, and peer-to-peer is unreachable in our single-NIC
-   topology. Now our configuration to verify, not a platform default to assume.
-5. **Confirm the per-frame loop is pure CPU + MMIO** with no privilege transitions or hidden traps
-   (`transport-stack.md §4.2`).
+1. **The direct path on the real 82599** — unbind, bus-master enable, `resource0` `mmap`, and hugepage DMA
+   with `pagemap`-resolved physical addresses, on the bench card.
+2. **Polling idle-wakeup** — confirm the bounded poll / short-sleep loop meets the latency and CPU budget
+   at the real frame rates, and that the retransmit deadline composes into it (was the `epoll` timeout).
+3. **The DMA posture (§2)** — the policy audit (post-PoC), and the `architecture.md §2.1` / spine
+   reconciliation that follows from it.
