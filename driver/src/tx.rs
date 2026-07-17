@@ -19,6 +19,11 @@ use crate::seam::TxRing;
 /// threads it into every `transport` call (the sole-writer property, compile-enforced by `&mut`).
 pub struct TxPath<T: TxRing> {
     ring: T,
+    /// The **monotonic produce cursor** — the next slot to post (the software TDT position). The device
+    /// consumes TDH→TDT in ring order, so the tail MUST advance monotonically; posting at the lowest free
+    /// slot (out-of-order reclaim frees a low slot while TDH is ahead) would write TDT *backwards* of TDH
+    /// and the device would stop transmitting / re-run stale descriptors. Wraps at ring depth.
+    produce: usize,
     /// Count of frames dropped because the ring was full (back-pressure → retransmit). Observability.
     dropped: u64,
 }
@@ -26,7 +31,7 @@ pub struct TxPath<T: TxRing> {
 impl<T: TxRing> TxPath<T> {
     /// Wrap a TX ring.
     pub fn new(ring: T) -> Self {
-        Self { ring, dropped: 0 }
+        Self { ring, produce: 0, dropped: 0 }
     }
 
     /// Borrow the ring (inspection / test).
@@ -54,21 +59,21 @@ impl<T: TxRing> TxPath<T> {
         }
     }
 
-    /// The first free slot, if any.
-    fn first_free(&self) -> Option<usize> {
-        (0..self.ring.depth()).find(|&slot| self.ring.is_free(slot))
-    }
 }
 
 impl<T: TxRing> transport::TransmitSink for TxPath<T> {
-    /// Emit one L1 frame: reclaim completed descriptors (free DMA on `DD`), then copy the app-owned
-    /// bytes into a free DMA buffer and post. A **full** ring (no free slot after cleanup) **drops** —
-    /// infallible by construction (no error/block/panic/grow); the absent ACK drives the retransmit.
+    /// Emit one L1 frame: reclaim completed descriptors (free DMA on `DD`), then post at the **monotonic
+    /// produce cursor** (the software TDT) and advance it. If the cursor's slot is still in flight (the
+    /// ring is full — the device has not caught up), **drop** — infallible by construction (no
+    /// error/block/panic/grow); the absent ACK drives the retransmit. Posting strictly at the advancing
+    /// cursor (never the lowest free slot) keeps the ring tail monotonic, as the device requires.
     fn emit(&mut self, frame: &[u8]) {
         self.reclaim_completed();
-        match self.first_free() {
-            Some(slot) => self.ring.post(slot, frame),
-            None => self.dropped += 1,
+        if self.ring.is_free(self.produce) {
+            self.ring.post(self.produce, frame);
+            self.produce = (self.produce + 1) % self.ring.depth();
+        } else {
+            self.dropped += 1; // ring full at the cursor → drop; do NOT skip to a lower free slot
         }
     }
 }
@@ -156,5 +161,38 @@ mod tests {
         // 0 and 2 were freed (one reused for "4"); exactly one of them is now in flight with "4".
         let reused = (tx.ring().buffer(0) == b"4") ^ (tx.ring().buffer(2) == b"4");
         assert!(reused, "exactly one freed slot (0 or 2) was reused for the new frame");
+    }
+
+    /// Out-of-order reclaim must NOT send the produce cursor backwards: a HIGHER slot (1) completes while
+    /// a LOWER one (0) is still in flight; the next emit posts at the MONOTONIC cursor (slot 2), never the
+    /// freed low slot (1) that a lowest-free-slot policy would pick. On real hardware, posting slot 1 with
+    /// TDT=2 while TDH is already at 2 writes TDT *backwards* and stalls the ring — the Slice-1 TDT-backwards
+    /// bug this cursor fixes. (The sim has no TDH/TDT; the fix is observable as WHICH slot is posted.)
+    #[test]
+    fn out_of_order_reclaim_keeps_the_produce_cursor_monotonic() {
+        let mut tx = TxPath::new(SimTxRing::new(4, BUF));
+        tx.emit(b"f0"); // slot0
+        tx.emit(b"f1"); // slot1 (both in flight; cursor now at 2)
+        tx.ring_mut().complete(1); // the HIGHER slot completes first; slot0 still in flight
+        tx.emit(b"f2"); // reclaims slot1, but posts at the MONOTONIC cursor (slot2), NOT the freed slot1
+        assert_eq!(tx.ring().buffer(2), b"f2", "posted at the monotonic cursor (slot2)");
+        assert_eq!(tx.ring().state(0), TxSlot::InFlight, "slot0 still in flight");
+        assert_eq!(tx.ring().state(1), TxSlot::Free, "slot1 reclaimed but NOT reused (no backwards post)");
+        assert!(tx.ring().buffer(1).is_empty(), "the reclaimed low slot left free, not overwritten");
+    }
+
+    /// The produce cursor wraps at depth: after a full cycle of completions, the next emit reuses slot 0.
+    #[test]
+    fn produce_cursor_wraps_at_depth() {
+        let mut tx = TxPath::new(SimTxRing::new(4, BUF));
+        for f in [b"0".as_slice(), b"1", b"2", b"3"] {
+            tx.emit(f); // fills 0..3, cursor wraps back to 0
+        }
+        for s in 0..4 {
+            tx.ring_mut().complete(s); // the device consumes the whole ring
+        }
+        tx.emit(b"4"); // cursor at 0 (wrapped) → reuses slot0
+        assert_eq!(tx.ring().buffer(0), b"4", "cursor wrapped to slot0");
+        assert_eq!(tx.dropped(), 0, "no drops across the wrap");
     }
 }

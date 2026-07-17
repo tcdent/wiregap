@@ -173,10 +173,13 @@ impl RxRing for VolatileRxRing {
             let d = self.desc.add(slot) as *mut u64;
             ptr::write_volatile(d, pkt_addr); // read-format pkt_addr (physical)
             ptr::write_volatile(d.add(1), 0); // read-format hdr_addr
-            // RDT points ONE PAST the last descriptor handed to the device (next-to-fill), so slot `slot`
-            // is device-owned only when RDT > slot. Writing `slot` (not slot+1) would leave RDH==RDT for a
-            // freshly-armed slot 0 — an empty ring the device never reads. (Wraps at `depth`.)
-            ptr::write_volatile(self.rdt, ((slot + 1) % self.depth) as u32);
+            // RX RDT = the JUST-REFILLED slot (ixy `rx_batch`: `RDT = last_rx_index`) — NOT slot+1. As the
+            // consumer advances in order, RDT tracks it monotonically, one slot behind, so RDT never meets
+            // RDH (RDT==RDH reads as an empty ring). Setting slot+1 here sends RDT *backwards* the moment a
+            // consumed slot is refilled after the initial arming left RDT ahead — stalling steady-state RX
+            // (the Sprint-6 single-frame PoC never re-armed, so it hid this). Contrast TX, where TDT=slot+1
+            // is correct (the device transmits [TDH, TDT), so the tail is one PAST the last posted).
+            ptr::write_volatile(self.rdt, slot as u32);
         }
     }
 }
@@ -371,6 +374,6 @@ mod virt_phys_tests {
         let pkt_addr = unsafe { ptr::read(descs.as_ptr().add(slot) as *const u64) };
         assert_eq!(pkt_addr, SYNTH_PHYS + (slot * BLEN) as u64, "pkt_addr is physical (new refill code)");
         assert!(!ring.descriptor_done(slot), "refill cleared DD (handed the slot to the device)");
-        assert_eq!(rdt, ((slot + 1) % DEPTH) as u32, "tail bumped to next-to-fill (slot+1)");
+        assert_eq!(rdt, slot as u32, "RX tail = the refilled slot (ixy rx_batch: RDT=last_rx_index), NOT slot+1");
     }
 }

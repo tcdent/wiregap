@@ -12,5 +12,9 @@ libc = "0.2"
 # The E3 driver crate: the confined volatile DMA rings (VolatileRxRing/TxRing) + the RxDrain copy-out seam
 # (RxPath). Slice 4 drives the real device through these over the datapath bring-up (src/datapath.rs).
 driver = { path = "../driver" }
+# Sprint 7: the moved reactor (Host/RxSource/TransmitSink seams + the loop) and the transport (Instant,
+# SessionTable). directpath supplies the bounded-poll Host + the Ethernet encap/decap wiring behind the seams.
+reactor = { path = "../reactor" }
+transport = { path = "../transport" }
 
 [dev-dependencies]
