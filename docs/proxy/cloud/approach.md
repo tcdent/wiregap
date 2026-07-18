@@ -169,13 +169,16 @@ Every web request the box makes decomposes into two kinds of data, classified by
 and the classification governs what the proxy *represents and keeps*, never what it *allows*
 (gating is orthogonal to it and unchanged by it):
 
-- **Trusted — the address: scheme, domain, path.** Bounded and *very definable*. It gets its
-  **own safe representation** — purpose-built for a URL's structure, inspired by the file-leaf
-  pattern (safe components, the proxy supplies the structure — `://`, `.`, `/` — and a
-  malicious character is unrepresentable) but a *distinct* system, because a URL is not a path.
-  Spec-complete for the address it must carry, and incapable of expressing a dangerous byte.
-  This is the only box-originated data the proxy puts into its own representation, matches
-  against the route (§2, §6), and writes to a log.
+- **Trusted — the address: scheme, domain, path.** Bounded and *very definable*. It reuses the
+  file leaf's **safe segment stack** — the same scanned-segment machinery and restricted, loggable
+  alphabet (`proto/net.md` §1; `proto/model.md` §6) — positioned for a URL rather than duplicated
+  into a separate system: a fixed `scheme` prefix and a position convention make it a distinct
+  *address*, while the encoding is shared. The box supplies the segments — the first is the domain,
+  its dots carried *within* that segment's safe alphabet, the rest the path — and the proxy supplies
+  the structure it may not author, `://` and `/`. A separator or control byte is unrepresentable, so
+  the assembled address is safe by construction. Spec-complete for the address it must carry and
+  incapable of expressing a dangerous byte, it is the only box-originated data the proxy puts into
+  its own representation, matches against the route (§2, §6), and writes to a log.
 
 - **Untrusted — the payload: query parameters, headers, body** (for GET and POST alike; a GET's
   query string is payload, not address). A separate field. It is **never** put through the safe

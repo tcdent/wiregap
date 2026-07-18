@@ -45,22 +45,42 @@ separators, the box never gets a `/`. Traversal is **unsayable, not caught**. (T
 owns a sane element-count bound and a require-at-least-one-element rule — frame well-formedness,
 not intent-reasoning.)
 
+**The leaf rule confines what the box can *say*; a second floor must confine where the bytes can
+*land*.** Textual validation is necessary but not sufficient — a symlink anywhere in the path
+could redirect the actual write out of the quarantine without the box ever saying `..`. So the
+write needs a filesystem-level floor as well: the open must resolve *strictly beneath* the
+quarantine root, so that no symlink or `..` at **any** component — not merely the last — can escape
+it, and no mount boundary is crossed. This is where the naïve primitive fails: `O_NOFOLLOW` refuses
+a symlink only at the *final* component (`open(2)`), leaving an intermediate-component symlink free
+to redirect the write out. The primitive that actually closes the gap is **`openat2` with
+`RESOLVE_BENEATH`** (resolution confined beneath the root descriptor), narrowed further by
+`RESOLVE_NO_XDEV` (no mount crossing) and no-symlink resolution; the leaf is created no-overwrite
+(`O_CREAT | O_EXCL`), so a name collision fails closed rather than silently overwriting. With that
+floor, traversal is *unsayable* (the leaf rule) **and** symlink-escape is *unreachable* (the
+resolution discipline) — the two floors a confined write needs. (Primitives settled in
+filesystem-review; ledger L6.)
+
 This is the array-of-leaves move: the filesystem analog of the cloud route's exact-match
 whitelist. Same posture, different surface.
 
 ---
 
-## 2. The quarantine — one invariant
+## 2. The quarantine — inert by construction
 
-Confining the destination is only half; *where* the bytes land must also be safe. That reduces
-to a single invariant:
+Confining the destination is only half; *where* the bytes land must also be inert. The invariant
+is firm: **nothing on the trusted side executes in — or auto-processes — quarantine.** Reads of it
+are immaterial (bytes are bytes, and the proxy's own configuration and core live elsewhere, so it
+never sources its instructions *from* the quarantine); a `.bashrc`, a systemd unit, a config
+deposited there are inert if nothing runs them. What the invariant rules out is not just the proxy
+executing there, but *anything* on the trusted side that would read-and-interpret box content —
+**no indexer, loader, or watcher** (the same detonation risk as rendering a box-content log in a
+real terminal). Deposit-only ground until a human promotes from it.
 
-> **The proxy never executes in quarantine.**
-
-Whether the proxy can *read* from quarantine is immaterial — bytes are bytes. A `.bashrc`, a
-systemd unit, a config file deposited there are all inert if nothing runs them. The box can
-write nothing outside quarantine (the leaf-validator confines it), and nothing inside
-quarantine executes. Those two facts are the complete write-path security story.
+*How* that inertness is enforced is a design-review question, not settled here. The intended
+approach — to confirm, not take as final — is to mount the quarantine `noexec,nosuid,nodev` so
+"nothing executes here" is a kernel-enforced floor rather than the proxy's restraint, and to point
+no auto-indexing service at the region. The *requirement* (inert) is the assertion; the *mount
+flags* are the likely way to meet it.
 
 ---
 
@@ -116,11 +136,14 @@ Two knobs carry no security weight:
 
 ## Summary
 
-The filesystem subsystem is **two facts and a character class**:
+The filesystem subsystem is **two structural floors and a character class**:
 
-1. The write gate — the leaf-validator (`[A-Za-z0-9._-]`, at least one alphanumeric) — confines
-   every box write to the quarantine root; traversal is unsayable.
-2. The proxy never executes in quarantine.
+1. The write is confined to the quarantine on two floors — *textually*, by the leaf-validator
+   (`[A-Za-z0-9._-]`, at least one alphanumeric → traversal unsayable), and at the *filesystem
+   level*, by an open discipline that keeps a symlink from redirecting the write out (§1;
+   primitives pending design review).
+2. The quarantine is **inert by construction** — nothing on the trusted side executes in or
+   auto-processes it (§2; enforcement mechanism pending design review).
 
 The read path is the safe direction: addressed, not gated, and interpreter-free. Everything
 else — quarantine structure, readable scope — is operational.

@@ -446,11 +446,15 @@ and no box byte is served until every rung a channel depends on is up:
    L15).
 2. **Transport up** — rings armed, the reactor loop running, link up. Below this rung no box
    byte can be received (`nic/architecture.md` §3).
-3. **Authority loaded and validated, per channel** — the route register parsed and
-   validated; the filesystem roots resolved and checked (quarantine root present and on its
-   inert mount, readable root resolved); the credential loaded if proxy-held (§6, §8). A
-   validation failure fails *that authority* closed and is surfaced by name — the same
-   block-in-the-open legibility the route gate uses (`cloud/approach.md` §3).
+3. **Authority and environment validated** — the route register parsed and validated; the
+   filesystem roots resolved and checked (quarantine root present and on its inert mount,
+   readable root resolved); the credential loaded if proxy-held (§6, §8). And, as a standing
+   convention, the proxy **verifies at boot that the kernel-enforced protections it relies on
+   are actually in effect** — the quarantine truly mounted `noexec,nosuid,nodev`, the `openat2`
+   resolve-flag confinement available (§3 tier 1; L6; the kernel-standing question, L11) —
+   failing closed if any is absent rather than trusting the floor unchecked. Any validation
+   failure is surfaced by name and holds the whole proxy closed (all-or-nothing, below) — the
+   same block-in-the-open legibility the route gate uses (`cloud/approach.md` §3).
 4. **Channels open — all or none.** Every channel serves iff *all* configured authority
    validated; a single failure holds the whole proxy closed (all-or-nothing readiness,
    below). There is no partial-authority serving state (the derived constraint).
