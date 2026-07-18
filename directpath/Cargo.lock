@@ -3,9 +3,17 @@
 version = 4
 
 [[package]]
+name = "benchtools"
+version = "0.0.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "directpath"
 version = "0.0.0"
 dependencies = [
+ "benchtools",
  "driver",
  "libc",
  "reactor",

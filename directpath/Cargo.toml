@@ -9,6 +9,9 @@ publish = false
 # `gate` (below): every state-changing op (unbind/BME/mmap/DMA, Part B) routes through it. std (userspace).
 [dependencies]
 libc = "0.2"
+# Isolated verification/measurement tooling for the bench HARNESSES only (self-hashing run provenance, core
+# pinning, the APERF idle instrument). Used by the src/bin/ harnesses; the production modules do not touch it.
+benchtools = { path = "../benchtools" }
 # The E3 driver crate: the confined volatile DMA rings (VolatileRxRing/TxRing) + the RxDrain copy-out seam
 # (RxPath). Slice 4 drives the real device through these over the datapath bring-up (src/datapath.rs).
 driver = { path = "../driver" }

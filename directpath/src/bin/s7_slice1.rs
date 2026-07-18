@@ -4,8 +4,8 @@
 //! `41:00.0 ↔ 63:00.0`, pure-direct, no IOMMU. 41 originates a session (unique-nonce payload); 63's
 //! reactor RX-demuxes it, the session reacts inline (delivers the payload up + returns a bare ACK); 41's
 //! reactor receives + accepts the ACK. The frozen reactor algorithm + transport + guard/copy-boundary
-//! drive it; only the backing is new: the bounded-poll `Host` ([`pollhost`]) and the Ethernet encap/decap
-//! ([`ethframe`]) behind the reactor's seams.
+//! drive it; only the backing is new: the event-driven `Host` ([`directpath::ddwaithost`]) and the Ethernet
+//! encap/decap ([`directpath::ethframe`]) behind the reactor's seams.
 //!
 //! Safety spine (unchanged): every state-change takes an `Allowed(Bdf)` token minted only by the gate for
 //! the bench cards; production `61:00.0` is never touched; one Gate-2-validated 2 MiB hugepage backs both
@@ -18,7 +18,8 @@ use directpath::gate2::validate_physaddr;
 use directpath::link::{LinkRestart, apply_restart, link_state, reset_and_init};
 use directpath::mem::{self, Hugepage};
 use directpath::pci::{self, Bar0};
-use directpath::pollhost::PollHost;
+use directpath::ddwaithost::DdWaitHost;
+use directpath::mwaitx::rdtsc;
 use driver::{RxPath, RxRing, TxPath, VolatileRxRing, VolatileTxRing};
 use reactor::{Reactor, RxDrainAsSource};
 use std::io::{self, Read};
@@ -27,13 +28,12 @@ use transport::SessionTable;
 
 const BENCH_41: &str = "0000:41:00.0";
 const BENCH_63: &str = "0000:63:00.0";
-const POLL_INTERVAL: Duration = Duration::from_micros(50);
 const NONCE_LEN: usize = 8;
 const PAYLOAD_LEN: usize = 24; // 8-byte nonce + 16-byte marker; < 60 on the wire → exercises pad-strip
 
 type LiveSink = EthSink<TxPath<VolatileTxRing>>;
 type LiveSource = EthSource<RxDrainAsSource<RxPath<VolatileRxRing>>>;
-type LiveReactor = Reactor<PollHost, LiveSource, LiveSink>;
+type LiveReactor = Reactor<DdWaitHost, LiveSource, LiveSink>;
 
 fn err(msg: impl Into<String>) -> io::Error {
     io::Error::other(msg.into())
@@ -75,7 +75,7 @@ fn bring_up_link(bar: &Bar0, name: &str) -> io::Result<()> {
 
 /// Bring up one card's TX + RX over its layout and build the wired live reactor. `peer_mac` is the dst for
 /// this card's TX (the other card); `own_mac` its src.
-fn build_reactor(bar: &Bar0, layout: &Layout, own_mac: [u8; 6], peer_mac: [u8; 6], name: &str) -> io::Result<LiveReactor> {
+fn build_reactor(bar: &Bar0, layout: &Layout, own_mac: [u8; 6], peer_mac: [u8; 6], tsc_hz: f64, name: &str) -> io::Result<LiveReactor> {
     if !datapath::init_tx(bar, layout) {
         return Err(err(format!("{name}: TXDCTL.ENABLE did not read back")));
     }
@@ -89,13 +89,22 @@ fn build_reactor(bar: &Bar0, layout: &Layout, own_mac: [u8; 6], peer_mac: [u8; 6
     if !datapath::start_rx(bar, layout) {
         return Err(err(format!("{name}: RXDCTL.ENABLE did not read back")));
     }
-    for slot in 0..datapath::DEPTH - 1 {
-        rx_ring.refill(slot);
+    for slot in 0..datapath::DEPTH {
+        rx_ring.refill(slot); // arm ALL depth slots: RDT ends at depth-1 so (RDT+1)%depth == the consumer's
+        // first slot, which the event-driven DdWaitHost monitors (steady-state re-arm discipline).
     }
     let sink = EthSink::new(TxPath::new(tx_ring), peer_mac, own_mac);
     let source = EthSource::new(RxDrainAsSource::new(RxPath::new(rx_ring)));
-    println!("  {name}: TX+RX armed, reactor wired (bounded-poll Host + Ethernet encap)");
-    Ok(Reactor::new(SessionTable::new(), PollHost::new(POLL_INTERVAL), source, sink))
+    let host = DdWaitHost::new(layout.rx_desc_base_va(), datapath::rx_tail_ptr(bar), datapath::DEPTH, tsc_hz, 5.0);
+    println!("  {name}: TX+RX armed, reactor wired (event-driven DdWaitHost + Ethernet encap)");
+    Ok(Reactor::new(SessionTable::new(), host, source, sink))
+}
+
+/// Calibrate the invariant TSC rate for the DdWaitHost deadline conversion.
+fn calibrate_tsc_hz() -> f64 {
+    let a = rdtsc();
+    std::thread::sleep(Duration::from_millis(200));
+    (rdtsc() - a) as f64 / 0.2
 }
 
 fn read_nonce() -> io::Result<[u8; NONCE_LEN]> {
@@ -120,6 +129,7 @@ fn main() {
 }
 
 fn run() -> io::Result<()> {
+    println!("{}\n", benchtools::Provenance::capture().header("s7_slice1"));
     let bdf41 = Bdf::parse(BENCH_41).ok_or_else(|| err("bad BDF 41"))?;
     let bdf63 = Bdf::parse(BENCH_63).ok_or_else(|| err("bad BDF 63"))?;
     let allowlist = [bdf41, bdf63];
@@ -177,8 +187,9 @@ fn round_trip(tok41: &Allowed, tok63: &Allowed) -> io::Result<()> {
 
     // Wire both reactors: 41 sends to 63's MAC, 63 sends to 41's MAC.
     println!("wiring reactors...");
-    let mut reactor_41 = build_reactor(&bar41, &layout_41, mac41, mac63, "41")?;
-    let mut reactor_63 = build_reactor(&bar63, &layout_63, mac63, mac41, "63")?;
+    let tsc_hz = calibrate_tsc_hz();
+    let mut reactor_41 = build_reactor(&bar41, &layout_41, mac41, mac63, tsc_hz, "41")?;
+    let mut reactor_63 = build_reactor(&bar63, &layout_63, mac63, mac41, tsc_hz, "63")?;
 
     // Baseline the (read-to-clear) counters before the round-trip.
     let _ = datapath::read_counter(&bar41, datapath::GPTC);
@@ -199,13 +210,15 @@ fn round_trip(tok41: &Allowed, tok63: &Allowed) -> io::Result<()> {
     // Phase 1: 63 RX-demux-react → deliver the payload up (through copy_out) + emit the bare ACK.
     let start = Instant::now();
     let delivered = loop {
-        reactor_63.pump_once();
-        if let Some(p) = reactor_63.take_delivery() {
+        let mut got = None;
+        reactor_63.pump_all(|p| got = Some(p)); // busy-drain (no park while frames present, §3)
+        if let Some(p) = got {
             break p;
         }
         if start.elapsed() > Duration::from_secs(3) {
             return Err(err("63 did not deliver the session payload within 3s"));
         }
+        reactor_63.park(); // idle: block for the frame
     };
     if delivered != payload {
         return Err(err(format!("payload mismatch on 63: got {} bytes", delivered.len())));

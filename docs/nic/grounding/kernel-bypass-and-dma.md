@@ -71,25 +71,59 @@ treat unexpected status bits as drop-and-refill, never derive a memory access fr
 field, copy each frame out of DMA memory early (`data-path-and-events.md §1`, `architecture.md §3.1`). This
 is runtime-independent — it held under every runtime model considered and holds here.
 
-## 4. The kernel-free interaction — bypassed stack, and polling (not interrupts)
+## 4. The kernel-free interaction — bypassed stack, and the NIC's own event to our memory
 
 Once set up, the per-frame path touches no kernel: we poll the descriptor's `DD` bit in host memory (no
 MMIO) and write the tail register as a direct CPU store to the mapped BAR. The kernel network stack is
 entirely out of the path (spine assertion 16).
 
-**Interrupts become polling.** The pure-direct path has no kernel mechanism to deliver an MSI-X interrupt
-to our process — that would require UIO or VFIO, the kernel tooling this model rejects. So the idle-wakeup
-is **bounded polling**, not an eventfd/epoll wait: the reactor's poll-then-block holds, with "block"
-realized as a bounded poll / short sleep rather than a delivered interrupt. This is affordable at the
-subsystem's real demand (hundreds of frames/sec against ~200k/s single-session headroom); it replaces the
-interrupt→eventfd→epoll idle-wakeup of the earlier (VFIO/bare-metal) drafts. The reactor *algorithm* is
-unchanged; only its wakeup primitive is.
+**The idle-wakeup is the NIC's own event, in memory we already read — no kernel, no system interrupt
+machinery.** On every received frame the NIC writes back the **RX descriptor** (`DD` bit set) by DMA into
+the descriptor ring — a device write to memory *we own*, and the very signal the reactor already reads to
+detect a frame. So the idle-wait needs no new mechanism: we **wait on the next descriptor's cache line**
+(a userspace `MONITOR`/`UMWAIT` on the line the NIC is about to write) and the NIC's `DD` writeback wakes
+us. No MSI-X, no APIC, no IDT, no kernel — the NIC signals us directly in memory we own, exactly like the
+DMA it already is. (The NIC's MSI-X — a Dword memory write to an address we program, datasheet §9.3.8 —
+could be redirected to a doorbell word for the same effect, but it is **redundant**: the `DD` writeback is
+already the per-frame NIC event the reactor consumes, so monitoring it directly is the minimal mechanism.
+The `EICR` cause register is a further NIC-emitted signal we read directly.)
+
+So the reactor is **event-driven**, as it was always meant to be: busy-drain while there is work, then
+**wait on the descriptor** when idle — unblocking on the NIC's `DD` writeback (a frame arrived) or on a
+deadline (the retransmit timer) — with **no polling-sleep compromise and no kernel interrupt bridge**.
+What stays for the integration to prove on silicon (§5) is the *efficient wait*: whether the device's
+`DD` write reliably **wakes** a userspace `MONITOR`/`UMWAIT` on this CPU (a CPU-capability + write-vs-wait
+coherency question — the same un-relaxable coherence class the descriptor poll already relies on). That is
+proven on silicon, not assumed.
+
+The wait is a **bounded** `UMWAIT` — the OS caps its duration (`IA32_UMWAIT_CONTROL`) so a shared core is
+yielded — with a **lightweight re-entry** when it times out: a low-frequency *idle* re-check (the CPU sits
+in a low-power C0 substate between events, never a spin), not a return to polling. The NIC's `DD` write
+wakes it immediately regardless, so the re-entry is only the idle **scheduling** tax, never on the
+frame-latency path. A truly-unbounded idle (the CPU doing nothing at all until the NIC writes) reduces to
+one thing — **owning the core**: a dedicated, isolated core (`isolcpus`/`nohz_full`) with the OS `UMWAIT`
+bound removed, at which point nothing competes for the cycles and the wait idles until the NIC's write. It
+is a *deployment* arrangement, not a code change, and the same `UMWAIT`-on-`DD` code serves both. The
+lightweight re-entry loop is accepted (operator, 2026-07-18); the dedicated-core option is left open, not
+required.
+
+**How this went wrong before — do not re-introduce, at two levels.** First, an earlier draft asserted
+"interrupts become polling — the pure-direct path has no kernel mechanism to deliver an MSI-X interrupt."
+That was **wrong**: an MSI-X "interrupt" is a memory write to an address *we* own, needing no kernel — the
+polling compromise, and its sleep-granularity latency, followed from that false assumption, not any real
+constraint. Second, the *fix* first reached for MSI-X redirected to a doorbell — a whole capability to
+program (table, cause arming, re-arm) for a signal the NIC **already emits** as the `DD` writeback.
+Monitoring the `DD` line directly is the minimal mechanism; the doorbell over-engineered the answer.
 
 ## 5. Bench-gated / build-time open items (this topic)
 
 1. **The direct path on the real 82599** — unbind, bus-master enable, `resource0` `mmap`, and hugepage DMA
    with `pagemap`-resolved physical addresses, on the bench card.
-2. **Polling idle-wakeup** — confirm the bounded poll / short-sleep loop meets the latency and CPU budget
-   at the real frame rates, and that the retransmit deadline composes into it (was the `epoll` timeout).
+2. **The event-driven DD-wait wakeup** — integrate the descriptor-line wait (§4) into the reactor and
+   validate on silicon: the reactor's idle-wait is a userspace `MONITOR`/`UMWAIT` on the next RX
+   descriptor's cache line, and the NIC's `DD` writeback (or the retransmit deadline) unblocks it. The
+   make-or-break to prove **standalone, first**: whether the device's `DD` write reliably **wakes** the
+   `MONITOR`/`UMWAIT` on this CPU (CPU capability + write-vs-wait coherency). No fallback — if it does not
+   wake reliably, that is a blocker to surface, not a poll path to keep.
 3. **The DMA posture (§2)** — the policy audit (post-PoC), and the `architecture.md §2.1` / spine
    reconciliation that follows from it.

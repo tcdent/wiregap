@@ -149,10 +149,26 @@ impl<H: Host, R: RxSource, S: TransmitSink> Reactor<H, R, S> {
         }
     }
 
-    /// Drain all work, then park once. One poll-then-block cycle.
-    pub fn pump_once(&mut self) -> Option<WakeReason> {
-        while self.step() {}
-        self.park()
+    /// Busy-drain: run [`step`](Self::step) until no work remains, handing each delivery to `consume`
+    /// **inside** the drain (so back-pressure never latches mid-burst), and return the number of work
+    /// units drained. This method **never parks** — the caller blocks (via [`park`](Self::park)) only
+    /// when this returns `0` (genuinely idle: RX ring empty, no due retransmit).
+    ///
+    /// This is the burst-safe drive (`architecture.md` §3, "busy-poll drains the ring while frames are
+    /// present, then blocks"): draining a K-frame backlog costs **zero** parks. It is the correct
+    /// alternative to a drive-one-then-park loop, which under the §3.1 stop-and-wait back-pressure parks
+    /// once *per delivery* — pacing a K-burst against the §7 retransmit window (the reactor's
+    /// `drive_one_then_park_per_delivery_is_the_defect` test pins that defect as a contrast to this
+    /// method's zero).
+    pub fn pump_all(&mut self, mut consume: impl FnMut(Vec<u8>)) -> usize {
+        let mut work = 0;
+        while self.step() {
+            work += 1;
+            if let Some(delivery) = self.take_delivery() {
+                consume(delivery);
+            }
+        }
+        work
     }
 
     /// The consumer takes the in-flight delivery (releasing back-pressure).

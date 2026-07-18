@@ -1,0 +1,13 @@
+[package]
+name = "benchtools"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Isolated verification/measurement tooling for the nic bench harnesses — NOT part of the production driver
+# stack (driver/reactor/transport) or the directpath integration lib. Provides self-documenting run
+# provenance (the binary self-hashes /proc/self/exe so every capture binds to the exact delivered binary),
+# core pinning, and the APERF idle instrument. The harness bins depend on this; the production code does not.
+
+[dependencies]
+libc = "0.2"

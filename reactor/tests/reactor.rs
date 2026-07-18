@@ -148,8 +148,10 @@ fn deadline_park_then_timer_wake_drives_retransmit() {
     );
     r.originate(b"payload");
 
-    // Idle (no RX, deadline in the future) → park; the fake timer wake advances the clock to the deadline.
-    let reason = r.pump_once();
+    // Idle (no RX, deadline in the future) → drain nothing, then park; the fake timer wake advances the
+    // clock to the deadline.
+    assert_eq!(r.pump_all(|_| {}), 0, "nothing to drain while idle");
+    let reason = r.park();
     assert_eq!(reason, Some(WakeReason::Timer), "woke by the one-shot timer");
     assert_eq!(r.parks(), 1, "it actually parked");
 
@@ -166,7 +168,56 @@ fn park_forever_when_no_deadline_and_wakes_on_nic_msix() {
         StubRx::new([]),
         CaptureSink::default(),
     );
-    let reason = r.pump_once();
+    assert_eq!(r.pump_all(|_| {}), 0, "nothing to drain while idle");
+    let reason = r.park();
     assert_eq!(reason, Some(WakeReason::NicMsix), "no deadline → parked forever, woken by NIC MSI-X");
     assert_eq!(r.parks(), 1);
+}
+
+// ---- the burst-safe drive: pump_all (salvaged from directpath::drive::drain) -------------------
+
+#[test]
+fn pump_all_busy_drains_a_backlog_with_zero_parks() {
+    // The accepted §7 fix, tested where the code now lives: feed a K-frame backlog and drive with
+    // `pump_all`; it drains the whole burst handing each delivery to `consume`, with ZERO parks (§3
+    // busy-poll while frames are present); the caller parks exactly once, when genuinely idle.
+    const K: usize = 32;
+    let frames = (0..K).map(|i| inbound(1000 + i as u64, &[i as u8; 8])).collect::<Vec<_>>();
+    let mut r =
+        Reactor::new(SessionTable::new(), FakeHost::new([]), StubRx::new(frames), CaptureSink::default());
+
+    let mut consumed = 0;
+    let work = r.pump_all(|_| consumed += 1);
+
+    assert_eq!(consumed, K, "all K frames delivered in ONE busy-drain");
+    assert_eq!(work, K, "K work units (one step per delivery)");
+    assert_eq!(r.parks(), 0, "ZERO parks across the whole backlog drain (§3: busy-poll while frames present)");
+
+    // Genuinely idle now (ring empty, no due retransmit) → exactly one park.
+    r.park();
+    assert_eq!(r.parks(), 1, "one park once genuinely idle (block only when idle)");
+}
+
+#[test]
+fn drive_one_then_park_per_delivery_is_the_defect() {
+    // The DEFECT `pump_all` removes, pinned in-crate as a contrast to the ZERO above. The old drive —
+    // drain-one-then-park with the take OUTSIDE the drain — parks once PER delivery: under §3.1
+    // back-pressure `step()` delivers one (latching `pending`) then returns false until the consumer
+    // takes it, so a park falls between every delivery. Reproduced here with the public step/take/park
+    // primitives (there is no `pump_once` to misuse — it was removed); K parks for a K-burst, vs zero.
+    const K: usize = 8;
+    let frames = (0..K).map(|i| inbound(2000 + i as u64, &[i as u8; 8])).collect::<Vec<_>>();
+    let mut r =
+        Reactor::new(SessionTable::new(), FakeHost::new([]), StubRx::new(frames), CaptureSink::default());
+
+    let mut consumed = 0;
+    for _ in 0..K {
+        while r.step() {} // delivers one, then back-pressure halts the drain
+        if r.take_delivery().is_some() {
+            consumed += 1;
+        }
+        r.park(); // parks after EACH single delivery — the defect
+    }
+    assert_eq!(consumed, K);
+    assert_eq!(r.parks(), K as u32, "the DEFECT: one park PER delivery (contrast pump_all's zero)");
 }

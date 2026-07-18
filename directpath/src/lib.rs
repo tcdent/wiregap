@@ -23,11 +23,12 @@
 //! any device DMA (no ring enable, no tail kick). Device DMA is later slices, operator-present.
 
 pub mod datapath;
+pub mod ddwaithost;
 pub mod ethframe;
 pub mod gate;
 pub mod gate2;
 pub mod link;
-pub mod pollhost;
 pub mod mem;
+pub mod mwaitx;
 pub mod pagemap;
 pub mod pci;

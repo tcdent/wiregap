@@ -57,6 +57,12 @@ impl Layout {
     fn rx_desc_va(&self) -> u64 {
         self.va + RX_DESC_OFF as u64
     }
+    /// The RX descriptor ring's **virtual** base — exposed so a wake-mechanism harness (Sprint 8) can
+    /// compute the MONITORX target (the 64-byte line containing the next-expected descriptor). Read-only;
+    /// the ring construction still owns the descriptor writes.
+    pub fn rx_desc_base_va(&self) -> u64 {
+        self.rx_desc_va()
+    }
     fn rx_desc_phys(&self) -> u64 {
         self.phys + RX_DESC_OFF as u64
     }
@@ -137,6 +143,15 @@ pub const RXMPC0: usize = 0x03FA0; // Rx Missed Packets (buffer 0): arrived-but-
 
 pub fn read_counter(bar: &Bar0, off: usize) -> u32 {
     bar.read32(off)
+}
+
+/// The RX tail register (`RDT`) as a raw read pointer — the software's last-refilled descriptor index.
+/// The **next-expected** descriptor the consumer will read (and the device will fill) is `(RDT+1) % DEPTH`;
+/// unlike the device head `RDH`, `RDT` is not advanced by the device, so it never races ahead of an
+/// arrived-but-unconsumed frame. The event-driven `DdWaitHost` uses it to locate the MONITORX target
+/// without coupling to the frozen `RxPath` cursor. Read-only.
+pub fn rx_tail_ptr(bar: &Bar0) -> *const u32 {
+    bar.reg_ptr(RDT0) as *const u32
 }
 
 /// Read the device's factory MAC from receive-address filter 0 (RAL0/RAH0, loaded from EEPROM on reset).

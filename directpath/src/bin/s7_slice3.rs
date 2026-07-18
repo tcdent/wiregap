@@ -23,7 +23,8 @@ use directpath::gate2::validate_physaddr;
 use directpath::link::{LinkRestart, apply_restart, link_state, reset_and_init};
 use directpath::mem::{self, Hugepage};
 use directpath::pci::{self, Bar0};
-use directpath::pollhost::PollHost;
+use directpath::ddwaithost::DdWaitHost;
+use directpath::mwaitx::rdtsc;
 use driver::{RxPath, RxRing, TxPath, VolatileRxRing, VolatileTxRing};
 use reactor::{Reactor, RxDrainAsSource};
 use std::collections::BTreeSet;
@@ -33,14 +34,13 @@ use transport::SessionTable;
 
 const BENCH_41: &str = "0000:41:00.0";
 const BENCH_63: &str = "0000:63:00.0";
-const POLL_INTERVAL: Duration = Duration::from_micros(50);
 const NONCE_LEN: usize = 8;
 const PAYLOAD_LEN: usize = 24;
 const K: usize = 32; // concurrent sessions (all in flight at once; < depth-64, no TX wrap during the burst)
 
 type LiveSink = EthSink<TxPath<VolatileTxRing>>;
 type LiveSource = EthSource<RxDrainAsSource<RxPath<VolatileRxRing>>>;
-type LiveReactor = Reactor<PollHost, LiveSource, LiveSink>;
+type LiveReactor = Reactor<DdWaitHost, LiveSource, LiveSink>;
 
 fn err(msg: impl Into<String>) -> io::Error {
     io::Error::other(msg.into())
@@ -79,7 +79,13 @@ fn bring_up_link(bar: &Bar0, name: &str) -> io::Result<()> {
     Err(err(format!("{name}: link did not come up 10G")))
 }
 
-fn build_reactor(bar: &Bar0, layout: &Layout, own_mac: [u8; 6], peer_mac: [u8; 6], name: &str) -> io::Result<LiveReactor> {
+fn calibrate_tsc_hz() -> f64 {
+    let a = rdtsc();
+    std::thread::sleep(Duration::from_millis(200));
+    (rdtsc() - a) as f64 / 0.2
+}
+
+fn build_reactor(bar: &Bar0, layout: &Layout, own_mac: [u8; 6], peer_mac: [u8; 6], tsc_hz: f64, name: &str) -> io::Result<LiveReactor> {
     if !datapath::init_tx(bar, layout) {
         return Err(err(format!("{name}: TXDCTL.ENABLE did not read back")));
     }
@@ -98,8 +104,9 @@ fn build_reactor(bar: &Bar0, layout: &Layout, own_mac: [u8; 6], peer_mac: [u8; 6
     }
     let sink = EthSink::new(TxPath::new(tx_ring), peer_mac, own_mac);
     let source = EthSource::new(RxDrainAsSource::new(RxPath::new(rx_ring)));
-    println!("  {name}: TX+RX armed, reactor wired");
-    Ok(Reactor::new(SessionTable::new(), PollHost::new(POLL_INTERVAL), source, sink))
+    let host = DdWaitHost::new(layout.rx_desc_base_va(), datapath::rx_tail_ptr(bar), datapath::DEPTH, tsc_hz, 5.0);
+    println!("  {name}: TX+RX armed, reactor wired (event-driven DdWaitHost)");
+    Ok(Reactor::new(SessionTable::new(), host, source, sink))
 }
 
 fn read_nonce() -> io::Result<[u8; NONCE_LEN]> {
@@ -131,6 +138,7 @@ fn main() {
 }
 
 fn run() -> io::Result<()> {
+    println!("{}\n", benchtools::Provenance::capture().header("s7_slice3"));
     let bdf41 = Bdf::parse(BENCH_41).ok_or_else(|| err("bad BDF 41"))?;
     let bdf63 = Bdf::parse(BENCH_63).ok_or_else(|| err("bad BDF 63"))?;
     let allowlist = [bdf41, bdf63];
@@ -177,8 +185,9 @@ fn multiplex(tok41: &Allowed, tok63: &Allowed) -> io::Result<()> {
     datapath::preinit_desc_rings(&layout_63);
     println!("hugepage Gate-2 validated (two carves)");
 
-    let mut reactor_41 = build_reactor(&bar41, &layout_41, mac41, mac63, "41")?;
-    let mut reactor_63 = build_reactor(&bar63, &layout_63, mac63, mac41, "63")?;
+    let tsc_hz = calibrate_tsc_hz();
+    let mut reactor_41 = build_reactor(&bar41, &layout_41, mac41, mac63, tsc_hz, "41")?;
+    let mut reactor_63 = build_reactor(&bar63, &layout_63, mac63, mac41, tsc_hz, "63")?;
 
     // ================= K CONCURRENT SESSIONS =================
     println!("\n--- MULTIPLEX: {K} concurrent sessions, all in flight, interleaved on the one wire ---");
@@ -201,17 +210,22 @@ fn multiplex(tok41: &Allowed, tok63: &Allowed) -> io::Result<()> {
     // 63 demuxes each frame to its session (byte-equal); 41 processes the returning ACKs. Interleave both.
     let mut delivered: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut total_deliveries = 0usize;
+    let mut foreign = false;
     let start = Instant::now();
     while delivered.len() < K {
-        reactor_63.pump_once();
-        if let Some(p) = reactor_63.take_delivery() {
-            if !sent.contains(&p) {
-                return Err(err("63 delivered a FOREIGN payload — demux mis-routed a frame"));
+        // BUSY-DRAIN both (§3): drain the whole backlog with no per-delivery park.
+        reactor_63.pump_all(|p| {
+            if sent.contains(&p) {
+                total_deliveries += 1;
+                delivered.insert(p);
+            } else {
+                foreign = true;
             }
-            delivered.insert(p);
-            total_deliveries += 1;
+        });
+        if foreign {
+            return Err(err("63 delivered a FOREIGN payload — demux mis-routed a frame"));
         }
-        reactor_41.step(); // process ACKs (and any retransmit) as they arrive
+        reactor_41.pump_all(|_| {}); // process the returning ACKs
         if start.elapsed() > Duration::from_secs(3) {
             return Err(err(format!("only {}/{K} sessions demuxed+delivered", delivered.len())));
         }
@@ -223,9 +237,8 @@ fn multiplex(tok41: &Allowed, tok63: &Allowed) -> io::Result<()> {
     // session round-tripped + was released — no leak).
     let settle = Instant::now();
     while settle.elapsed() < Duration::from_millis(40) {
-        reactor_63.pump_once();
-        let _ = reactor_63.take_delivery();
-        reactor_41.step();
+        reactor_63.pump_all(|_| {});
+        reactor_41.pump_all(|_| {});
     }
     let _ = datapath::read_counter(&bar41, datapath::GPTC); // clear
     let q1 = Instant::now();

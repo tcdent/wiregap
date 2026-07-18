@@ -19,7 +19,8 @@ use directpath::gate2::validate_physaddr;
 use directpath::link::{LinkRestart, apply_restart, link_state, reset_and_init};
 use directpath::mem::{self, Hugepage};
 use directpath::pci::{self, Bar0};
-use directpath::pollhost::PollHost;
+use directpath::ddwaithost::DdWaitHost;
+use directpath::mwaitx::rdtsc;
 use driver::{RxPath, RxRing, TxPath, VolatileRxRing, VolatileTxRing};
 use reactor::{Reactor, RxDrainAsSource};
 use std::io::{self, Read};
@@ -28,14 +29,13 @@ use transport::SessionTable;
 
 const BENCH_41: &str = "0000:41:00.0";
 const BENCH_63: &str = "0000:63:00.0";
-const POLL_INTERVAL: Duration = Duration::from_micros(50);
 const NONCE_LEN: usize = 8;
 const PAYLOAD_LEN: usize = 24;
 const N: usize = 128; // 2 full wraps of the depth-64 rings → proves slot reuse + monotonic tail
 
 type LiveSink = EthSink<TxPath<VolatileTxRing>>;
 type LiveSource = EthSource<RxDrainAsSource<RxPath<VolatileRxRing>>>;
-type LiveReactor = Reactor<PollHost, LiveSource, LiveSink>;
+type LiveReactor = Reactor<DdWaitHost, LiveSource, LiveSink>;
 
 fn err(msg: impl Into<String>) -> io::Error {
     io::Error::other(msg.into())
@@ -74,7 +74,13 @@ fn bring_up_link(bar: &Bar0, name: &str) -> io::Result<()> {
     Err(err(format!("{name}: link did not come up 10G")))
 }
 
-fn build_reactor(bar: &Bar0, layout: &Layout, own_mac: [u8; 6], peer_mac: [u8; 6], name: &str) -> io::Result<LiveReactor> {
+fn calibrate_tsc_hz() -> f64 {
+    let a = rdtsc();
+    std::thread::sleep(Duration::from_millis(200));
+    (rdtsc() - a) as f64 / 0.2
+}
+
+fn build_reactor(bar: &Bar0, layout: &Layout, own_mac: [u8; 6], peer_mac: [u8; 6], tsc_hz: f64, name: &str) -> io::Result<LiveReactor> {
     if !datapath::init_tx(bar, layout) {
         return Err(err(format!("{name}: TXDCTL.ENABLE did not read back")));
     }
@@ -97,8 +103,9 @@ fn build_reactor(bar: &Bar0, layout: &Layout, own_mac: [u8; 6], peer_mac: [u8; 6
     }
     let sink = EthSink::new(TxPath::new(tx_ring), peer_mac, own_mac);
     let source = EthSource::new(RxDrainAsSource::new(RxPath::new(rx_ring)));
-    println!("  {name}: TX+RX armed, reactor wired");
-    Ok(Reactor::new(SessionTable::new(), PollHost::new(POLL_INTERVAL), source, sink))
+    let host = DdWaitHost::new(layout.rx_desc_base_va(), datapath::rx_tail_ptr(bar), datapath::DEPTH, tsc_hz, 5.0);
+    println!("  {name}: TX+RX armed, reactor wired (event-driven DdWaitHost)");
+    Ok(Reactor::new(SessionTable::new(), host, source, sink))
 }
 
 fn read_nonce() -> io::Result<[u8; NONCE_LEN]> {
@@ -118,13 +125,15 @@ fn round_trip(r41: &mut LiveReactor, r63: &mut LiveReactor, payload: &[u8]) -> i
     r41.originate(payload);
     let start = Instant::now();
     let delivered = loop {
-        r63.pump_once();
-        if let Some(p) = r63.take_delivery() {
+        let mut got = None;
+        r63.pump_all(|p| got = Some(p)); // busy-drain (no park while frames present, §3)
+        if let Some(p) = got {
             break p;
         }
         if start.elapsed() > Duration::from_secs(2) {
             return Err(err("63 did not deliver"));
         }
+        r63.park(); // idle: block for the frame
     };
     if delivered != payload {
         return Err(err("payload byte mismatch on 63"));
@@ -158,6 +167,7 @@ fn main() {
 }
 
 fn run() -> io::Result<()> {
+    println!("{}\n", benchtools::Provenance::capture().header("s7_slice2"));
     let bdf41 = Bdf::parse(BENCH_41).ok_or_else(|| err("bad BDF 41"))?;
     let bdf63 = Bdf::parse(BENCH_63).ok_or_else(|| err("bad BDF 63"))?;
     let allowlist = [bdf41, bdf63];
@@ -204,8 +214,9 @@ fn steady_state(tok41: &Allowed, tok63: &Allowed) -> io::Result<()> {
     datapath::preinit_desc_rings(&layout_63);
     println!("hugepage Gate-2 validated (two carves)");
 
-    let mut reactor_41 = build_reactor(&bar41, &layout_41, mac41, mac63, "41")?;
-    let mut reactor_63 = build_reactor(&bar63, &layout_63, mac63, mac41, "63")?;
+    let tsc_hz = calibrate_tsc_hz();
+    let mut reactor_41 = build_reactor(&bar41, &layout_41, mac41, mac63, tsc_hz, "41")?;
+    let mut reactor_63 = build_reactor(&bar63, &layout_63, mac63, mac41, tsc_hz, "63")?;
 
     // Baseline RXMPC on 63.
     let _ = datapath::read_counter(&bar63, datapath::RXMPC0);
