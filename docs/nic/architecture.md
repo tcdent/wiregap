@@ -68,25 +68,35 @@ The subsystem's scope, in one line: **manage sessions within an epoch.**
 
 ### 2.1 Trusted-base posture: the NIC is untrusted-but-contained
 
-The subsystem's trusted base has exactly three kinds of member, and — once this posture is fully
-realized — **none is trusted by hope**:
+The subsystem's trusted base has two kinds of member — a third, the IOMMU, was expected but is **not
+used** (below):
 
 - **small-and-ours** — the driver and protocol, verified by *reading* (`grounding/driver-minimality.md`);
-- **structural hardware** — the IOMMU, the platform-containment floor the whole system already stands
-  on (the same hardware trust that contains the box);
-- **untrusted-but-contained** — the **NIC and its firmware**, whose *trustworthiness is immaterial*.
+- **untrusted-but-contained** — the **NIC and its firmware**, whose *trustworthiness is immaterial*: we
+  depend on the NIC to **function** (liveness), never to **behave** (security), exactly the box's status
+  (assertions 4–5). It is bulky vendor code we cannot read; we do not trust it to be sound.
 
-The third is the posture this section commits, and it eliminates the subsystem's last **"hope-and-pray"**
-member. We do **not** trust the X520 firmware to be sound — it is bulky vendor code we cannot read. We
-**contain** it. A maximally hostile NIC's only in-scope options are to *escalate* (bounded by the IOMMU
-+ the descriptor-validating driver) or to *corrupt data* (caught by hardware CRC + retransmit);
-everything else it can do is DoS / link-down, which is out of scope. So a fully-malicious firmware's
-worst in-scope effect is *nothing*. We depend on the NIC to **function** (liveness), never to **behave**
-(security) — exactly the box's status (assertions 4–5: trustworthiness made immaterial by removing every
-place it could matter). This is the box's containment logic applied to a device *on* the trusted host —
-the VFIO threat model (secure userspace drivers for assigned, untrusted devices), not a novel
-construction — and it adds no new platform trust: a rogue NIC bounded by the IOMMU is the same
-hardware-containment that bounds the box.
+A maximally hostile firmware's in-scope reach converges on **two vectors**, and after the pure-direct
+pivot the two are handled by different means:
+
+- **Vector 2 — adversary-written descriptor/buffer *content*: CONTAINED, by the small-and-ours driver.**
+  The read-verified driver bounds any content the firmware can produce — bound the reported length, treat
+  status as hostile, never deref an unchecked field, copy out early (§3.1,
+  `grounding/data-path-and-events.md §1`). This is the live guard, unchanged across every runtime model
+  considered.
+- **Vector 1 — device DMA *reach*: OWNED, not contained.** This was to be the IOMMU's job (the
+  structural-hardware floor). The subsystem runs **pure-direct with no IOMMU**
+  (`grounding/kernel-bypass-and-dma.md`): a userspace process on running Linux drives the NIC directly,
+  and nothing hardware-bounds where the device can DMA. The operator's ratified posture is to **own** this
+  risk rather than route containment through a kernel-configured IOMMU — which would rest on the excluded
+  kernel, laundering the risk through kernel trust rather than removing it. Whether the parent threat
+  model tolerates un-contained firmware DMA on the trusted side is the **policy layer's call, audited
+  after the PoC**; until then this vector is *owned and committed, not yet ratified as contained*
+  (`concerns-to-watch.md`).
+
+Corrupt-data (a third failure) is caught by hardware CRC + retransmit; everything else the firmware can do
+is DoS / link-down, out of scope. A fully-malicious firmware's worst *contained* effect is nothing; its
+*owned* effect (vector 1) is what the policy audit weighs.
 
 This posture is *more* compliant with the spine, not in tension with it. Assertion 16 says **reject
 code you cannot read** — and the diligence-trust we had been extending to the un-readable firmware was a
@@ -94,42 +104,47 @@ quiet *exception* to 16, not a thing 16 endorsed. Containing the firmware instea
 **removes the exception**: we no longer trust code we cannot read; we contain it. Nothing in the spine
 needs to change to accommodate this — it closes a gap the spine already wanted closed.
 
-**Why this is necessary to the spec, and the honest gap.** It converts the firmware from the *weakest*
-trust we had — diligence on un-reviewable code, an *un-answerable* question — into a *verifiable
-structural property*: is the containment airtight? That replacement is what eliminates hope-and-pray. We
-no longer place load-bearing trust in firmware soundness; we place it in containment, and containment is
-checkable. The containment is **not yet fully grounded** — it requires (A) a driver provably robust to
-any descriptor/buffer content (vector 2), and (B) the IOMMU airtight against bypass (interrupt
-remapping, ATS-off, no peer-to-peer) — tracked in `concerns-to-watch.md`, detailed in
-`grounding/kernel-bypass-and-dma.md §2`. But the difference from the posture it replaces is decisive:
-the remaining work is **verification, not hope.** A grounded "the containment holds" *deletes* the soft
-spot; an un-grounded "the firmware is sound" never could. The posture is committed now; closing (A)+(B)
-is what makes it fact.
+**What reconciles, and what stands.** The original commitment framed the containment gap as (A) a driver
+robust to any descriptor content and (B) the IOMMU airtight against bypass. **(A) stands** — it is the
+live vector-2 guard, verified by reading. **(B) is what moved**: with no IOMMU, vector-1 reconciles from
+*structural-hardware containment* to *owned risk under policy audit* (`grounding/kernel-bypass-and-dma.md §2`,
+`concerns-to-watch.md`). So the posture — untrusted firmware, content vector contained, DMA-reach vector
+owned, functioning-not-behaving dependence — **stands**; only the vector-1 *mechanism* changed, from IOMMU
+to owned. This is "the mechanism reconciles," not "the containment is invalidated," with the honest caveat
+that vector-1 is *owned rather than contained* until the policy layer rules. One way this is *more*
+spine-compliant than the original plan: that plan leaned on a kernel-configured IOMMU for containment, and
+the spine excludes the kernel from the trusted base — owning the risk instead removes a would-be
+kernel-trust dependency the spine never wanted.
 
 ## 3. The runtime architecture — a flat, single-threaded reactor
 
-One thread owns the wire, both rings, all session state, and one `epoll`. The loop:
+One thread owns the wire, both rings, all session state, and one bounded-poll loop. The loop:
 
 ```
 poll the RX ring (busy-poll drain)         → for each frame: demux by session ID → its session reacts inline
 drain pending output to the TX ring        → the reactor is the sole TX-ring writer
-when idle: epoll_wait(eventfd, deadline)   → two wake reasons: a frame arrived, or a retransmit deadline passed
+when idle: bounded poll (capped sleep)     → re-poll after a short sleep; a frame arrives, or a retransmit deadline passes
 ```
 
-- **One `epoll` watches everything**: the NIC's idle-wakeup eventfd, the earliest retransmit
-  deadline, and the application's own source fds (PTYs, etc.). Every readiness is an event.
+- **One bounded-poll loop drives everything**: it drains the NIC's RX ring, checks the earliest
+  retransmit deadline, and services the application in-process. There is **no `epoll` and no eventfd** on
+  the pure-direct path (`grounding/kernel-bypass-and-dma.md §4`) — no MSI-X interrupt is delivered to a
+  userspace directly-owned device. When there is work the loop busy-drains with zero waits; when idle it
+  re-polls after a capped short sleep. Every readiness is still an event; the loop just discovers it by
+  polling rather than by a kernel wakeup.
 - **The packet is the event.** A frame arrives, it is keyed by the session ID in its header, it
   bubbles straight to that session, which reacts. Nothing stages it, pulls it later, or
   paces it. There are **no intermediary buffers** — the decoupled "rings → staging → worker-pool →
   backpressure-pacing" pattern of conventional stacks (thousands of lines) does not exist here.
-- **Busy-poll is the drain, not the architecture.** The system is event-driven, not polling-driven;
-  the busy-poll only empties the ring while frames are present, then the loop blocks on the interrupt.
+- **Busy-poll is the drain, not the architecture.** The system is event-driven, not busy-spin-driven;
+  the busy-poll only empties the ring while frames are present, then the loop idles on a bounded poll (a
+  capped sleep before re-polling), rather than a busy spin.
 - **Single producer, no locks.** Because the reactor is the only thing that touches either ring,
   there are no locks and no races on ring or session state. This resolves the open fork in
   `transport-stack.md §4.4 item 14` — single-producer into the one TX ring.
 - **Why single-threaded**, on the three lenses: *simplicity* (no locks/races), *understandability*
-  (the whole event flow is one readable loop), *firmware surface* (one MSI-X vector, one RX/one TX
-  ring, one eventfd — multi-threading would push back toward multiqueue/RSS/multiple vectors, the
+  (the whole event flow is one readable loop), *firmware surface* (one RX / one TX ring, polled — no
+  MSI-X, no eventfd; multi-threading would push back toward multiqueue/RSS/multiple vectors, the
   surface we reject; see `grounding/data-path-and-events.md §5`).
 - **The flatness invariant:** event handlers are fast and non-blocking — true *by construction* for
   the transport's own work (frame a chunk, advance the session, write the ring). Genuinely heavy
@@ -159,8 +174,8 @@ once:
    (§7) exists to prevent.
 
 This is **stronger than ixy's model**, which swaps buffers (hands the caller the mempool buffer,
-refills the ring with a fresh one) — what the caller holds is out of the ring but still in the IOMMU-
-mapped region. We copy fully out into non-mapped memory. The **TX side is the mirror**: the app works
+refills the ring with a fresh one) — what the caller holds is out of the ring but still in
+**device-writable DMA memory**. We copy fully out into app-owned memory the device never addresses. The **TX side is the mirror**: the app works
 in app-safe memory; the transport copies *into* a DMA buffer at the send edge and holds it ACK-bound
 until acked (`grounding/data-path-and-events.md §3`). So the DMA region is touched **only by the
 transport, only at the two edges** — RX-in and TX-out.
@@ -200,24 +215,26 @@ Consequences:
   application need not create shared-memory threads to get concurrency — it gets it by opening more
   sessions.
 
-## 5. The interrupt / event model
+## 5. The event model — one local idle-wakeup, many derived events
 
-Two things are called "interrupt"; conflating them is where complexity comes from, so they are kept
+Two kinds of "event" exist, and conflating them is where complexity comes from, so they are kept
 distinct:
 
-- **The hardware interrupt — one, local, idle-wakeup only.** A single MSI-X vector meaning "the ring
-  went non-empty." It is *per-ring, not per-session*; it never crosses the wire (a local NIC→CPU
-  signal); and it is taken *only when blocked idle* — during active traffic the loop busy-polls and
-  takes zero interrupts. This is the entire firmware surface for events. (Grounded:
-  `grounding/data-path-and-events.md §4`.)
+- **The idle-wakeup — one, local, idle-only.** On the pure-direct path no interrupt is delivered to our
+  userspace process, so the idle-wakeup is a **bounded poll**, not an MSI-X vector: when the ring is empty
+  the loop re-polls after a capped short sleep rather than parking on an interrupt. It is still
+  *per-ring, not per-session*, it never crosses the wire, and it matters *only when blocked idle* — during
+  active traffic the loop busy-drains and does zero sleeping. The two-kinds-of-event split below is
+  unchanged; only this primitive reconciled, from MSI-X to bounded poll
+  (`grounding/kernel-bypass-and-dma.md §4`).
 - **Application-layer events — many, software, derived.** "Session N has data," "session N was ACKed":
   the reactor manufactures these by demuxing frames after the fact. They are not interrupts and not
   on the wire.
 
 So: **"how do interrupts work across the wire?" — they don't.** The wire carries only data frames
 keyed by session ID. There is no control message, nothing out-of-band, nothing to route or inspect.
-Backpressure is the *absence* of an ACK. The one hardware interrupt is a local "wake, there's work";
-every per-session event is derived locally from the data. Refusing to put any signal on the wire is
+Backpressure is the *absence* of an ACK. The one local idle-wakeup — now a bounded poll, not an interrupt
+— is just "there's work"; every per-session event is derived locally from the data. Refusing to put any signal on the wire is
 what keeps both the protocol and the firmware surface tiny.
 
 ## 6. The protocol — UART + ACK + ID
@@ -226,11 +243,15 @@ A session is a UART plus exactly two additions: a **per-frame ACK** (because we 
 about the one real failure, receiver overrun) and a **session ID** (so many share the one wire).
 Nothing else.
 
-**Frame shape:** `[session ID][payload]`. There is **no software length field** — the length
-is read from the RX descriptor rather than carried in our framing. But that descriptor field is
-firmware-written from box-influenced wire bytes, so it is **bounded by the driver, not trusted**
-(`grounding/data-path-and-events.md §1` — the descriptor is adversary-influenced input). **There is no
-flag byte.**
+**Frame shape:** `[session ID][payload]`. There is **no software length field** in the transport frame.
+The true L1 frame length rides in the **802.3 length field** of the Ethernet frame — in the link encap
+*below* the transport frame (directpath `EthSink`/`EthSource`), **not** the RX descriptor: the live 82599
+pads sub-60-byte frames to the 60-byte minimum, so the descriptor length includes the pad and does not
+delimit the frame (a bare 8-byte ACK padded to 60 would otherwise mis-read as a data frame). That 802.3
+length is itself device/wire-influenced, so it is **bounded, not trusted** — `EthSource` clamps it to the
+bytes that actually arrived, the same discipline the descriptor length was held to, now with its own
+regression test (`grounding/data-path-and-events.md §1`). This is a link-framing detail below the
+transport, not a change to the transport frame. **There is no flag byte.**
 
 - **ACKs are bare return frames** on the same discriminator, opposite direction. Data-vs-ACK is told
   by **role/direction**, not a flag: a session's data is one-directional, so at each endpoint an
@@ -271,22 +292,43 @@ Sizing rationale:
 
 - The **wire RTT is tiny** — single-digit µs (1m ≈ 5 ns propagation; a 1500-byte frame serializes in
   ~1.2 µs at 10G; a bare ACK ~50 ns; PCIe/DMA + wakeup a few µs).
-- What sizes the deadline is **receiver backlog** — how long an ACK can sit behind other frames
-  before the reactor reaches it. Stop-and-wait bounds this: the receiver's ring never holds more than
-  ~**K** frames (K = concurrent sessions, since each is capped at one in flight — which is why the
-  ring is sized to K). So worst-case ACK latency ≈ `K × per-frame-processing + wire RTT` ≈ a few
-  hundred µs even for hundreds of sessions.
-- **~10 ms** is ~100–1000× the wire RTT, several times over the worst-case backlog, and still well
-  under the threshold of human perception — so a genuine-loss retransmit is invisible. The band of
-  good values is wide (hundreds of µs to tens of ms); stay **under ~tens of ms** so a genuine loss
-  never becomes a *visible* hang.
+- What sizes the deadline is **receiver backlog** — how long an ACK can sit behind other frames before
+  the reactor processes it. Stop-and-wait bounds the *depth*: the ring never holds more than ~**K** frames
+  (K = concurrent sessions, each capped at one in flight — why the ring is sized to K). The *time* to
+  drain that depth is the **real per-frame processing** throughput — ~25 µs/frame measured — so ≈ `K ×
+  25 µs`. At the current ring cap **K ≤ 64** that is **~2.29 ms** (measured at K=60), **4.4× under** the
+  10 ms window. (An earlier bounded-poll defect briefly inflated this: the idle sleep was pacing a present
+  backlog — one delivery per ~112 µs poll cycle — pushing the drain to ~11.3 ms at K=32 and reaching the
+  window; the remedy below made the sleep idle-only and removed it. The original "a few hundred µs" here
+  assumed sub-µs per-frame processing; the real figure is ~25 µs/frame.)
+- **~10 ms** is ~4× the measured worst-of-burst at the K ≤ 64 cap (2.29 ms) and ~100–1000× the wire RTT —
+  well under human perception, so a genuine-loss retransmit is invisible. The band of good values is wide;
+  stay **under ~tens of ms** so a genuine loss never becomes a *visible* hang — which is also why dialing
+  the window up is *not* the fix for the drain-latency scaling (it would cross that bound at large K;
+  fixing the drain, below, is).
 - **Buffers are ACK-bound** (held until the ACK, one per session in flight; `grounding/data-path-and-events.md §3`).
   The 10 ms window only extends a hold on the *rare* genuine loss, so steady-state occupancy stays
   ≈ K and the window does not move pool sizing.
 
-Bench-gated (one knob): confirm 10 ms stays comfortably above the worst observed ACK latency under a
-deliberate redraw storm; the only cost of a larger window is slightly slower recovery from a rare
-genuine loss, so it can be dialed up freely if a measurement surprises us.
+**The 7a finding, and the remedy (designer's call).** No spurious retransmit fired — the reactor **drains
+the RX ring and processes arrived ACKs before it checks any deadline** (§6; §7 below), so an arrived ACK is
+always seen before its timer — but the latency-to-window *margin* is exhausted, and at larger K, a coarser
+poll, or a busier core the drain would cross the window and fire spuriously. The remedy is **not** to dial
+the window up alone: the drain latency scales ~linearly with K, so covering a large-K storm would push the
+window past the human-perception bound (tens of ms), the one edge this sizing must stay under. Instead,
+fix the root cause — **the bounded-poll sleep is an idle-only primitive and must not pace a present
+backlog.** When the reactor has work (RX frames or pending deliveries) it busy-drains with zero sleeps; the
+capped sleep applies *only* when there is genuinely nothing to do. That restores the ≈ hundreds-of-µs
+worst case and a comfortable, human-invisible window margin. The per-delivery back-pressure remains for
+*steady-state* pacing — its real purpose — decoupled from the idle sleep. The window stays generous at
+**~10 ms**, now **confirmed on the bench**: with the busy-drain landed, the worst-of-burst is **2.29 ms at
+K=60**, 4.4× under the window, zero spurious retransmits, all gates pass — so §7 is validated across the
+current operating range, **K ≤ 64** (the ring cap; K is a ring-sized parameter). Growing K past the cap is
+a capacity decision that needs a re-measure before extending this range — the scaling is sublinear (a
+conservative floor puts the window-crossing near K≈200), measured not assumed. A larger window is still
+free if a future max-K wants it, its only cost slightly slower recovery on a rare genuine loss. (Ring
+depth and DMA-pool sizing are the adjacent knobs; the busy-drain remedy keeps steady-state occupancy ≈ K,
+so it does not move them.)
 
 **Retransmit is bounded — the give-up is silent internal cleanup.** Retransmit does *not* persist
 forever (an earlier draft said it did; that was wrong — a sender retrying a dead peer forever holds its
@@ -364,9 +406,10 @@ What remains is silicon measurement, not design.
   file-service / proxy designer, not designed here.
 - **Bench-gated (reserved as open research; see each `grounding/` note's §"open" list):** the minimal
   link-restart form and whether LESM is enabled (`grounding/device-bring-up-and-link.md §5`);
-  single-ring throughput and the reactor keeping up on one core; the 10 ms window under load; DMA
-  buffer-pool sizing against ACK-hold (`grounding/data-path-and-events.md §6`); the IOMMU group
-  composition (`grounding/kernel-bypass-and-dma.md §5`).
+  single-ring throughput and the reactor keeping up on one core; the retransmit window vs. the
+  bounded-poll backlog-drain latency under load (§7 — the 7a finding and the busy-drain remedy); DMA
+  buffer-pool sizing against ACK-hold (`grounding/data-path-and-events.md §6`); and the pure-direct
+  bring-up items (`grounding/kernel-bypass-and-dma.md §5`).
 
 ---
 
