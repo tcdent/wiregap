@@ -24,20 +24,32 @@
 //!   enumeration is complete, not just the obvious fields).
 //! - TX writeback: the descriptor status `DD` bit (`descriptor_done`) — read for per-descriptor reclaim.
 //!
-//! ## Crossing soundness — UNDISCHARGED, bench-gated (concerns-to-watch; gate 6)
+//! ## Crossing soundness — a cited account, PLATFORM-SCOPED (Sprint 7b; `grounding/crossing-soundness.md`)
 //!
-//! The SAFETY comments below discharge each block's **local** preconditions (pointer validity/alignment
-//! for *that* access, the length bound). They do **NOT** discharge the **device-concurrency** soundness:
-//! the NIC mutates this memory outside the language model, so (a) **volatile visibility** (is a plain
-//! access even sound against concurrent device writes?), (b) the **DD→read memory barrier** (are the
-//! device's field writes coherently visible before we observe DD?), and (c) **no tearing** of a
-//! multi-byte field/payload are **open hazards deferred to `concerns-to-watch.md`** and provable only on
-//! silicon. **This module does not claim the crossing is sound.** (A SAFETY comment asserting "we observe
-//! the device writes correctly" would be a defect.) The control-flow order (poll DD, only then
-//! read+copy; a DD-clear descriptor is never read/delivered) is the testable half — proven on the sim
-//! (gates 2/3) — and is distinct from this memory-ordering residual.
+//! The device-concurrency crossing is a **verified, cited account** — sound **on the deployment platform**
+//! (x86-64 + cache-coherent DMA + this 82599 over PCIe), with the residual STATED, not papered. The full
+//! reasoning (each link cited to a primary spec) lives in `docs/nic/grounding/crossing-soundness.md`; the
+//! two ordering points are realized in code here and annotated at their `SAFETY`/ordering comments:
+//! - **RX-READ crossing** (`descriptor_done` → `copy_out`): the device writes the payload BEFORE the
+//!   descriptor `DD` (datasheet §3.1.4.4 item 2; §3.1.4.5.3 keeps it under relaxed ordering; PCIe
+//!   posted-write ordering carries it to memory in that order). The CPU reads `DD` with an **Acquire**
+//!   load, which orders the later payload read after it (SDM Vol.3A §8.2.2 LOAD-LOAD; the Acquire is
+//!   explicit/portable). So the payload read observes the complete, non-torn payload.
+//! - **WRITE crossing** (`post`/`refill` stores → the TDT/RDT doorbell): the buffer/descriptor stores are
+//!   made globally visible with a **Release** fence BEFORE the UC-MMIO doorbell (SDM §8.2.2 STORE-STORE +
+//!   the strongly-ordered store-buffer-draining MMIO write), so the device DMA-reads a fully-written
+//!   descriptor/buffer only after the doorbell.
+//!
+//! The ordering primitives are **no-ops beyond a compiler barrier on x86** (TSO already provides the
+//! order); they make the ordering explicit and portable, and pair — *in the hardware sense* — with the
+//! device's cited write/read ordering (coherent DMA provides VISIBILITY; the datasheet/PCIe/TSO provide the
+//! SEQUENCE — the two are distinct). **RESIDUAL (stated):** the account is platform-scoped as above, and
+//! Rust's abstract machine does not model device-DMA'd memory — this is a hardware-level argument, not a
+//! language-machine proof. The control-flow order (poll `DD`, only then read+copy) is the separately-tested
+//! half (sim gates 2/3); the ordering EFFECT is a reasoning artifact certified by reading, not by a run.
 
 use core::ptr;
+use core::sync::atomic::{AtomicU32, Ordering, fence};
 
 use crate::seam::{RxRing, TxRing};
 
@@ -64,9 +76,8 @@ pub struct AdvRxDescWb {
 const RXD_STAT_DD: u32 = 1 << 0;
 
 /// The confined real-volatile RX descriptor ring. Holds raw pointers into mapped DMA/MMIO (private). A
-/// **thin** seam impl — no guard logic. Constructed by E1/E2 on real silicon; **not exercised this
-/// sprint** (no NIC — the no-NIC validation uses [`crate::sim::SimRxRing`]); its crossing soundness is
-/// the open residual above.
+/// **thin** seam impl — no guard logic. Constructed by E1/E2 on real silicon; its crossing soundness is
+/// the cited, platform-scoped account above (`grounding/crossing-soundness.md`).
 pub struct VolatileRxRing {
     desc: *mut AdvRxDescWb,
     /// The buffers' **virtual** base (CPU access — `copy_out`).
@@ -84,8 +95,8 @@ impl VolatileRxRing {
     /// `desc` must point to `depth` contiguous, properly-aligned [`AdvRxDescWb`] in mapped DMA; `bufs`
     /// to `depth * buffer_len` contiguous bytes in mapped DMA; `bufs_phys` the **physical** address of
     /// that same buffer region (pagemap-resolved, Gate-2-validated); `rdt` to the RX-tail MMIO register.
-    /// The region must stay mapped for `'static`. (Device-concurrency soundness of accessing it is the
-    /// undischarged residual — see the module docs.)
+    /// The region must stay mapped for `'static`. (Device-concurrency ordering is the cited, platform-scoped
+    /// account in the module docs / `grounding/crossing-soundness.md`.)
     pub unsafe fn new(
         desc: *mut AdvRxDescWb,
         bufs: *mut u8,
@@ -118,10 +129,19 @@ impl RxRing for VolatileRxRing {
 
     fn descriptor_done(&self, slot: usize) -> bool {
         debug_assert!(slot < self.depth);
-        // SAFETY (local): `slot < depth`, so `desc.add(slot)` is in-bounds of the `depth`-element
-        // descriptor array (new()'s precondition); `status_error` is an aligned `u32`; `read_volatile`
-        // reads exactly it. (Device-concurrency visibility of this read is the undischarged residual.)
-        let status = unsafe { ptr::read_volatile(ptr::addr_of!((*self.desc.add(slot)).status_error)) };
+        // The DD-gating ACQUIRE load — the CPU side of the RX-READ crossing (grounding/crossing-soundness.md
+        // §RX). Reading DD with `Acquire` orders every LATER load in this single-threaded reactor
+        // (`status`/`reported_len`/`copy_out`'s payload reads) AFTER this one, so the payload read observes
+        // the device's payload bytes, which the device wrote to memory BEFORE this DD (datasheet §3.1.4.4
+        // item 2 + §3.1.4.5.3 + PCIe posted-write ordering — the cited HARDWARE half). On x86 the Acquire is
+        // a compiler barrier only (LOAD-LOAD is already TSO-ordered, SDM Vol.3A §8.2.2); on weaker archs it
+        // is the required barrier. `AtomicU32::load` (not `read_volatile`) because the acquire ordering is
+        // defined for atomic loads. Aligned `u32` ⇒ the single-word DD read is non-tearing.
+        // SAFETY: `slot < depth` ⇒ `desc.add(slot)` is in-bounds (new()'s precondition); `status_error` is a
+        // naturally-aligned `u32`; `AtomicU32::from_ptr` over that valid, aligned, mapped location.
+        let status = unsafe {
+            AtomicU32::from_ptr(ptr::addr_of_mut!((*self.desc.add(slot)).status_error)).load(Ordering::Acquire)
+        };
         status & RXD_STAT_DD != 0
     }
 
@@ -149,8 +169,9 @@ impl RxRing for VolatileRxRing {
         // SAFETY (local): `slot < depth` ⇒ the slot's buffer starts at `bufs + slot*buffer_len` and spans
         // `buffer_len` bytes (new()'s precondition); `n <= buffer_len`, so each `src.add(i)` (`i < n`) is
         // in-bounds; `u8` is align-1; `dst[..n]` is a valid writable region of `n` bytes. Each byte is a
-        // `read_volatile`. (No-tearing / visibility of the device's payload write is the undischarged
-        // residual — see the module docs; this is NOT a soundness claim against concurrent device writes.)
+        // `read_volatile`. NO-TEARING: this payload read runs only AFTER `descriptor_done`'s Acquire load
+        // saw `DD` set, and the device wrote the whole payload BEFORE that `DD` (module docs / crossing-
+        // soundness.md §RX) — so there is no concurrent device write to this buffer during the read.
         unsafe {
             let src = self.bufs.add(slot * self.buffer_len);
             for (i, d) in dst.iter_mut().enumerate().take(n) {
@@ -173,6 +194,13 @@ impl RxRing for VolatileRxRing {
             let d = self.desc.add(slot) as *mut u64;
             ptr::write_volatile(d, pkt_addr); // read-format pkt_addr (physical)
             ptr::write_volatile(d.add(1), 0); // read-format hdr_addr
+            // RELEASE before the doorbell — the CPU side of the WRITE crossing (grounding/crossing-soundness
+            // .md §WRITE): the descriptor stores above must be globally visible BEFORE the device sees the
+            // RDT bump and fetches this descriptor. On x86 STORE-STORE is already ordered (SDM §8.2.2) and
+            // the UC-MMIO RDT write drains the store buffer; the fence is the portable/explicit form
+            // (compiler barrier on x86). Pairs (in hardware) with the device fetching the descriptor only
+            // after the doorbell.
+            fence(Ordering::Release);
             // RX RDT = the JUST-REFILLED slot (ixy `rx_batch`: `RDT = last_rx_index`) — NOT slot+1. As the
             // consumer advances in order, RDT tracks it monotonically, one slot behind, so RDT never meets
             // RDH (RDT==RDH reads as an empty ring). Setting slot+1 here sends RDT *backwards* the moment a
@@ -287,6 +315,11 @@ impl TxRing for VolatileTxRing {
                 ptr::addr_of_mut!((*self.desc.add(slot)).cmd_type_len),
                 (n as u32) | TXD_CMD_TYPE,
             );
+            // RELEASE before the doorbell — the CPU side of the WRITE crossing (grounding/crossing-soundness
+            // .md §WRITE): the buffer bytes + the descriptor stores above must be globally visible BEFORE the
+            // device sees the TDT bump and DMA-reads them to transmit. On x86 STORE-STORE is ordered (SDM
+            // §8.2.2) + the UC-MMIO TDT drains the store buffer; the fence is the portable/explicit form.
+            fence(Ordering::Release);
             // TDT points ONE PAST the last descriptor to transmit (next-to-fill): the device transmits
             // [TDH, TDT). Writing `slot` (not slot+1) leaves TDH==TDT for slot 0 — an empty ring the device
             // never fetches. (Wraps at `depth`.)

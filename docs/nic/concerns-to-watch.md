@@ -15,21 +15,21 @@
 ## The unsafe DMA / memory boundary
 
 The reactor crosses from device-co-owned memory — the NIC writes it concurrently, outside the language's
-model — into our owned memory (`architecture.md §3.1`). We have a *shape* for that crossing. We do not
-have a verified account of its soundness. Suspected hazards, each unproven:
+model — into our owned memory (`architecture.md §3.1`). This crossing now HAS a verified account:
+**`grounding/crossing-soundness.md`** (7b Slice 1, certified 2026-07-18) — a **positive, platform-scoped**,
+cited account of **both** directions (RX-read `DD`→payload; the write stores→doorbell; the TX buffer-reuse
+control-flow leg), realized in `dma.rs` as an acquire-on-the-atomic-`DD`-load + a release before the
+doorbell. The ordering / visibility / no-tearing hazards that stood here — externally-mutated memory vs. the
+compiler's stability assumption, the `DD`→payload ordering, the copy's tearing/aliasing — are **DISCHARGED
+there** (moved to the design doc per this file's rule). What remains open is only the **narrowed residual**:
 
-- **Externally-mutated memory vs. the language model.** The NIC mutates DMA memory with no instruction
-  in our code doing it. We suspect a naive access could let the compiler assume a stability that is not
-  there. Unanalyzed: whether our access is actually sound, or merely usually-works.
-
-- **Ordering between "frame ready" and "read the frame."** We suspect a visibility/ordering hazard
-  between observing the descriptor-done signal and reading the payload — that we could read before the
-  device's writes are fully and coherently visible. Unanalyzed: what guarantees we actually have versus
-  assume, and how that changes across platforms.
-
-- **The copy operation itself.** The operator's own question stands open: *is there any way the copy does
-  something subtly wrong?* — tearing, aliasing the DMA region as a safe reference, undefined behavior that
-  "looks fine." We have argued it informally; we have not shown it sound.
+- **The platform + language-model boundary (the irreducible residual).** The account is sound on x86-64 +
+  cache-coherent DMA + this 82599 over PCIe — not proven general; and Rust's abstract machine does **not**
+  model memory an external device mutates, so the `Acquire`/`Release` synchronize *in the hardware sense*
+  with the device (outside the language machine) — a **hardware-level cited argument, not a
+  language-machine proof**. This platform-scope + language-model boundary is why the crossing is
+  *platform-scoped-sound*, not *unconditionally sound*. It is stated, not papered, and it is what to
+  re-derive against any new platform/fabric/device.
 
 - **The size of the unsafe surface.** We assert the unsafe region is small and confined. We have not
   verified that nothing leaks a raw pointer or a device-backed reference out into safe code, where the
@@ -69,22 +69,28 @@ Slice 4 proved data transmission across the DAC (`41:00.0` → `63:00.0`, pure-d
 per-run nonce transmitted by 41 arrived at 63 **byte-equal**, out of pre-cleared buffers, through the real
 `copy_out`/`RxDrain` seam, DD set by the device, `RXDGPC` confirming the DMA-to-host (reproduced across
 runs; TX-first showed `RXDGPC=0` with RX unarmed, then `RXDGPC>=1` after arming). This closes
-**PATH-WORKS** only. The transmission pass **EXERCISED** the two residuals below; it did **not** discharge
-either.
+**PATH-WORKS** only. At the time, the transmission pass **EXERCISED** both residuals below without
+discharging either. Status now (7a operation + 7b account) is updated per residual:
 
-- **The no-IOMMU owned-DMA posture is EXERCISED at the first live RX-write (unattended, on production);
-  owned per §2 (policy-audited post-PoC); path-works != crossing-sound != contained.** The hard stop was
-  dropped by operator ruling, so the first RX per-buffer device-write ran unattended on the live host,
-  gated only by gate-2(i) + TX-first — **both CONTENT-BLIND on the RX buffer**. The byte-equal proof reads
-  the buffer AFTER the device already wrote it, so it is an end-to-end PATH proof, NOT a pre-write guard.
-  The §2 DMA-anywhere risk is therefore **concrete and realized in this run**, not abstract or future.
+- **The no-IOMMU owned-DMA posture is EXERCISED — and now at SUSTAINED SCALE (still owned, not contained).**
+  The hard stop was dropped by operator ruling, so the first RX per-buffer device-write ran unattended on
+  the live host, gated only by gate-2(i) + TX-first — **both CONTENT-BLIND on the RX buffer** (the byte-equal
+  proof reads the buffer AFTER the device wrote it: a PATH proof, not a pre-write guard). **7a operational
+  grounding:** the owned-DMA posture then ran at sustained scale on the live production host — steady-state
+  rings (128 round-trips over 2 ring wraps), K=32 concurrent multiplexed sessions, and the E6 measurement
+  storm (320 concurrent) — with the production NIC (`61:00.0`) never touched (compile-enforced `Allowed(Bdf)`
+  + gate-2 physaddr validation) and no incident. This grounds *what sustained operation exercised*; it is
+  **operational path-works, NOT a containment proof**. The §2 DMA-anywhere risk stays **owned, concrete, and
+  un-contained** — the policy-layer audit still owns the verdict (whether the parent threat model tolerates
+  un-contained firmware DMA on the trusted side). OPEN, on purpose.
 
-- **`dma.rs` crossing-soundness stays UNDISCHARGED (visibility / DD-ordering / no-tearing).** A frame
-  crossing intact proves the path works; it does **not** prove the crossing is *sound* — the
-  device-concurrency visibility, the DD→read memory ordering, and no-tearing hazards enumerated under "The
-  unsafe DMA / memory boundary" above — **nor** that it is *contained*. The run relied on x86 cache-coherent
-  DMA + TSO + the UC-MMIO-doorbell ordering WITHOUT explicit fences; that it worked is evidence of
-  path-works, not a memory-ordering soundness proof. Neither residual is discharged by the transmission pass.
+- **`dma.rs` crossing-soundness is now DISCHARGED (platform-scoped), 7b Slice 1.** The visibility /
+  `DD`-ordering / no-tearing hazards are a positive, cited account in `grounding/crossing-soundness.md`, and
+  the implicit-x86-TSO reliance is replaced by explicit ordering code (acquire-on-the-atomic-`DD`-load +
+  release-before-doorbell). What the Slice-4 run leaned on WITHOUT fences is now made explicit and cited;
+  only the **narrowed platform + language-model residual** (see "The unsafe DMA / memory boundary" above)
+  stays honest-open. This residual — distinct from the owned-DMA/containment one above — is the *sound-on-the-
+  stated-platform* boundary, not a soundness gap.
 
 ## How this went wrong in the past
 
