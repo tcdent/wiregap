@@ -418,9 +418,8 @@ tier 3, provisional) as its placement anchor.
 
 ## 9. Lifecycle
 
-No source specifies the proxy's lifecycle. This section separates what the sources *do*
-constrain from what is genuinely open — and names the open part as questions (ledger
-items L1–L3), never as invented answers.
+No source specifies the proxy's lifecycle. Three constraints are derivable from the sources;
+against them, L1 and L2 are now settled by design; L3 stays policy-adjacent and open.
 
 Three constraints are derivable (each labeled derived, with its citation):
 
@@ -436,43 +435,149 @@ Three constraints are derivable (each labeled derived, with its citation):
   artifacts plus the log; an interrupted transfer is a transient snapshot lost, not a
   corruption to reconcile.
 
-The open questions:
+### Startup — a fail-closed ladder (L1, settled — design)
 
-- **L1 — Startup ordering and readiness.** What must hold before the proxy serves each
-  channel (register loaded and validated, roots resolved, link up), and what "ready" looks
-  like to the operator.
-- **L2 — Shutdown and crash posture.** What happens to in-flight requests, transfers, and
-  sessions on stop or crash, and what the operator sees afterward. The derivable
-  constraints above bound the damage; they do not specify the behavior.
-- **L3 — Upgrade and change discipline.** The proxy's guarantee is that a human understood
-  it completely (`principles.md` §15). What re-triggers that sitting — a binary upgrade, a
-  route-rule extension, a config change — is a policy-adjacent question the sources do not
-  answer, and it shapes how change lands operationally.
+Startup is a sequence of fail-closed rungs; no rung is climbed until the one below holds,
+and no box byte is served until every rung a channel depends on is up:
+
+1. **Privileged bring-up** — the NIC pure-direct sequence (sysfs unbind, bus-master enable,
+   hugepage/BAR mapping; `nic/architecture.md` §2.1, `directpath` crate). Privileged, done
+   once, before any box byte can arrive; privilege is dropped at the end of this rung (§10,
+   L15).
+2. **Transport up** — rings armed, the reactor loop running, link up. Below this rung no box
+   byte can be received (`nic/architecture.md` §3).
+3. **Authority loaded and validated, per channel** — the route register parsed and
+   validated; the filesystem roots resolved and checked (quarantine root present and on its
+   inert mount, readable root resolved); the credential loaded if proxy-held (§6, §8). A
+   validation failure fails *that authority* closed and is surfaced by name — the same
+   block-in-the-open legibility the route gate uses (`cloud/approach.md` §3).
+4. **Channels open — all or none.** Every channel serves iff *all* configured authority
+   validated; a single failure holds the whole proxy closed (all-or-nothing readiness,
+   below). There is no partial-authority serving state (the derived constraint).
+
+**Readiness is whole-proxy; a broken authority holds everything closed.** The proxy is ready
+only when *every* configured channel's authority has validated; a single validation failure
+fails the whole proxy closed — it serves nothing — with the failed authority named so the
+operator sees exactly what to fix (§7, refusal-is-the-signal). Readiness is all-or-nothing,
+not per-channel: the proxy is either fully up or not serving. The failure is still named by
+channel — the operator learns *which* authority broke — but no channel serves while another
+is broken.
+
+This is a deliberate choice of safety over availability. A partial start — serving the healthy
+channels while holding a broken one — would buy uptime at the cost of a second serving state
+to reason about, and the proxy is not an availability system:
+
+> Broken is broken, we don't need to overthink it. This is high safety not high availability.
+> — *operator, ruling on L1*
+
+So a bad route register does not cost the cloud channel alone; it holds the whole proxy closed
+until the operator fixes it. There is no partial-service state — the simplest safe posture,
+and the one the operator ratified.
+
+### Shutdown and crash — crash-only-safe by construction (L2, settled — design)
+
+State minimalism (§6) makes the proxy **safe to kill at any instant**: durable state is
+exactly the operator's artifacts plus the append-only audit trail, and everything else —
+in-flight request/response buffers, file transfers, per-session transport state, DMA rings —
+is transient and uninterpreted. A crash loses only transient state and leaves nothing to
+reconcile:
+
+- **In-flight cloud requests** are dropped, not persisted or resumed. The box sees no
+  response and may retry; there is no trusted-side state to corrupt. A dropped request is a
+  lost request, not a fault.
+- **In-flight file transfers** leave at most a partial file in quarantine — inert by
+  construction (nothing executes, indexes, or auto-processes it; `filesystem.md` §2) and
+  behind the human promotion gate, so a partial harms nothing and is superseded by a retry
+  or ignored by the human. (Whether the write path makes completion atomic — write-to-temp
+  then rename, so a partial never appears under its final name — is a filesystem-review
+  mechanism, L6; the *safety* holds without it.)
+- **Transport sessions** need no shutdown handling: they open by emission and die by
+  silence, and the transport keeps no cross-epoch state, so on restart there is "nothing to
+  handle" (`nic/architecture.md` §8). Silence *is* the shutdown.
+
+Because there is no durable transient state to flush, **graceful shutdown and abrupt crash
+are the same safety class** — graceful shutdown is a courtesy (stop accepting, drain or drop
+in-flight, close the link), never a correctness requirement. The one durability care is the
+**audit trail**: it must be appended durably enough that a crash loses at most the in-flight
+decision, never a truncated or corrupted trail (the append-only sink's discipline is L13
+mechanics).
+
+**What the operator sees afterward:** on restart, a clean cold start back up the fail-closed
+ladder — authority re-validated, channels re-opened, the audit trail intact up to the crash.
+No reconciliation prompt and no recovery mode, because there is nothing to recover. The
+absence of a recovery path is the state discipline paying out.
+
+### L3 — Upgrade and change discipline (open, design + policy)
+
+The proxy's guarantee is that a human understood it completely (`principles.md` §15). What
+re-triggers that sitting — a binary upgrade, a route-rule extension, a config change — is a
+policy-adjacent question the sources do not answer, and it shapes how change lands
+operationally. Left open, routed design + policy.
 
 ## 10. Process shape
 
-One baseline is source-anchored; three forks are open (ledger items L4, L14, L15).
+One baseline is source-anchored; L14 and L15 are now settled by design; L4 stays the cloud
+subsystem's refinement within this shape.
 
 The anchor: the proxy is **a single custom application on a stock Linux host, the only
 listener on the interface** (`containment-by-construction.md` §3.3) — deliberately not a
 thin appliance. Beneath it, the committed NIC runtime is a **flat, single-threaded
-reactor** in userspace (`nic/architecture.md` §3). Those anchors bound the shape without
-settling it:
+reactor** in userspace (`nic/architecture.md` §3).
 
-- **L4 — Recognizer placement** *(source-open, `cloud/anthropic-api.md` §8)*. Whether the
-  Anthropic-request recognizer runs as a module bound to the proxy's transport layer or as
-  a separate isolated service the proxy delegates to. The source calls this "a real
-  boundary decision" — the recognizer reads attacker-authored JSON — and it interacts with
-  the reviewability budget (`principles.md` §15).
-- **L14 — Process composition.** Whether the cloud, filesystem, and terminal services and
-  the NIC reactor share the single process the CbC anchor describes, or split along
-  subsystem seams. The single-threaded commitment is the transport subsystem's, not stated
-  proxy-wide; nothing in the sources settles the composition.
-- **L15 — Privilege shape.** The pure-direct bring-up performs privileged operations
-  (sysfs unbind, bus-master enable, hugepage mapping — committed `directpath` crate;
-  `nic/architecture.md` §2.1), while the steady-state relay has no evident need of them.
-  Whether bring-up and steady-state split into separate privilege domains, or the process
-  drops privileges after bring-up, is unstated in the sources.
+### Process composition — one process by default (L14, settled — design)
+
+The default is **one process**, and the bar for splitting is a *named non-containment
+reason*:
+
+- **Splitting for containment is theater.** Putting the recognizer, or a subsystem service,
+  in its own process does not contain a compromise of it — a compromised gate originates the
+  forbidden call regardless, and the originator faithfully serves it. The only real boundary
+  below the application is the untrusted NIC/DMA, which already sits below the process (§3
+  tier 4). Process isolation buys no containment the taxonomy does not already account for.
+- **One process is the cheapest to review.** The guarantee is that a human holds the whole
+  thing (`principles.md` §15); every added process adds IPC, lifecycle coordination, and
+  review surface. Fewer processes, fewer seams to certify.
+
+Two reasons *can* justify a boundary, and neither is containment: **least privilege** (L15 —
+a privileged bring-up distinct from the unprivileged relay) and **review-surface
+organization** (L4 — whether the attacker-JSON recognizer is a module or an in-budget
+isolated service, the cloud subsystem's call). Absent a specific such reason, the composition
+is one process: the reactor, the three channel services, and the recognizers, single-threaded
+per the transport's committed shape.
+
+- **L4 — Recognizer placement** *(source-open, `cloud/anthropic-api.md` §8; routed to cloud
+  subsystem design)*. Whether the Anthropic-request recognizer is a module bound to the
+  transport layer or a separate isolated service the proxy delegates to. The source calls
+  this "a real boundary decision" — the recognizer reads attacker-authored JSON — but note
+  the framing above: if it *is* isolated, that is for review-surface organization, not
+  containment, and it stays inside the reviewability budget either way (`principles.md` §15).
+
+### Privilege shape — spend it at bring-up, drop it before box bytes (L15, settled — design + nic-team confirmation)
+
+Least privilege resolves cleanly against the bring-up/steady-state split the sources already
+name:
+
+- **Bring-up is privileged; steady-state is not.** The pure-direct bring-up needs privilege
+  (sysfs unbind, bus-master enable, hugepage/BAR mapping; `nic/architecture.md` §2.1,
+  `directpath` crate). The steady-state relay — the surface exposed to box bytes — drives the
+  NIC through *already-mapped* BARs and DMA buffers (MMIO and mapped memory, no privileged
+  syscall), writes to its filesystem roots (file permissions, not root), and opens outbound
+  upstream sockets (unprivileged). It has no evident need of privilege.
+- **The design: start privileged, bring up the NIC, then drop to an unprivileged uid with no
+  retained capabilities *before* the link serves box traffic.** The box-facing relay never
+  runs with the privilege bring-up required — least privilege by construction, a structural
+  floor rather than a runtime discipline. Privilege-drop is in-process, so this keeps L14's
+  single process (no separate bring-up process needed).
+- **Confirmed against the committed code (nic team, 2026-07-18).** The nic team verified that
+  the *only* syscalls in the crate are the bring-up mappings (BAR + hugepage DMA in `pci.rs` /
+  `mem.rs`); the steady-state modules make zero syscalls — MMIO through the already-mapped BAR,
+  the MWAITX park (ring-3), and an unprivileged clock read. The mappings persist across the
+  privilege drop and the device DMAs independently (bus-master enabled at bring-up), so the
+  box-facing relay runs fully unprivileged. There is no steady-state recovery path that re-does
+  a privileged op. *Future caveat, nothing to isolate today:* if a steady-state link-recovery
+  is ever added, most of it is unprivileged MMIO, but a full device reset (`CTRL.RST`) can
+  clear the config-space bus-master bit, and re-enabling it is a privileged config-space
+  write — that single op isolates to the tiny privileged helper if/when recovery lands.
 
 ## 11. Open questions — the ledger
 
@@ -484,8 +589,8 @@ resolved so the ledger numbering stays stable.
 
 | # | Open question | Surfaces at | Origin | Routed to |
 |---|---|---|---|---|
-| L1 | Startup ordering and readiness | §9 | this document (composition) | design |
-| L2 | Shutdown and crash posture | §9 | this document (composition) | design |
+| L1 | **RESOLVED (design + operator ruling, 2026-07-18)** — startup is a fail-closed ladder (privileged bring-up → transport up → all authority validated → channels open). Readiness is whole-proxy all-or-nothing: a single broken authority (e.g. an invalid register) holds the WHOLE proxy closed, the failure named by channel. Operator ruling: high safety, not high availability. | §9 | this document (composition) | resolved — design + operator; see §9 |
+| L2 | **RESOLVED (design, 2026-07-18)** — crash-only-safe by construction (state minimalism bounds the blast radius): in-flight requests/transfers/sessions are transient and dropped cleanly, restart is a clean cold start with no reconciliation; graceful shutdown = crash safety class; the audit trail is the one thing that must survive a crash intact. | §9 | this document (composition) | resolved — design; see §9 |
 | L3 | Upgrade and change discipline — what re-triggers the reviewability sitting | §9; `principles.md` §15 | this document (composition) | design + policy |
 | L4 | Anthropic recognizer placement (in-transport module vs isolated service) | §3 tier 1; §10 | `cloud/anthropic-api.md` §8 (source-open) | cloud subsystem design |
 | L5 | Exact recognized request shape (fields and tool shapes admitted, all else denied) | §3 tier 1 | `cloud/anthropic-api.md` §8 (source-open) | builders at spec-freeze; frozen as trusted surface |
@@ -497,8 +602,8 @@ resolved so the ledger numbering stays stable.
 | L11 | Linux kernel standing — excluded from the reviewable path yet the quarantine floor's substrate | §3 unplaced; §5 | this document (placement) | design + policy |
 | L12 | Configuration mechanics — format, location, load/validation, reload vs restart take-effect, whether the parser owes total-function discipline | §8 | this document (composition) | design |
 | L13 | Observability mechanics — log transport, storage, rotation, the safe viewing path, metrics/health; inherits "box content is never rendered on trusted ground" | §7 | this document (composition) | design |
-| L14 | Process composition — one process per the CbC anchor, or split along subsystem seams | §10 | this document (composition) | design |
-| L15 | Privilege shape — bring-up vs steady-state privilege domains | §10 | this document (composition) | design + nic team |
+| L14 | **RESOLVED (design, 2026-07-18)** — one process by default; splitting-for-containment is theater (a compromised gate originates regardless; the real boundary is the NIC/DMA below the process). A boundary is justified only by least privilege (L15) or review-surface organization (L4), never containment. | §10 | this document (composition) | resolved — design; see §10 |
+| L15 | **RESOLVED (design + nic-team confirmation, 2026-07-18)** — spend privilege at bring-up, drop to an unprivileged uid before the link serves box traffic; the box-facing relay runs unprivileged (least privilege by construction, in-process). Nic team verified against code: steady-state makes zero syscalls (mapped-BAR MMIO + MWAITX park + unprivileged clock), mappings persist across the drop, device DMAs independently. No steady-state recovery exists today; if one is added, a device-reset's bus-master re-enable is the one privileged op, isolated to a tiny helper then. | §10 | this document (composition) | resolved — design + nic team |
 
 Promotion tooling is deliberately absent from this ledger: it is out of scope for the
 proxy (`filesystem.md` §4), a boundary rather than an open question.
