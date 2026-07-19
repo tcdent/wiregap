@@ -161,6 +161,19 @@ seeing what the new thing does — the **promotion pattern** (§14) at the route
 proxy never makes that judgment itself; it refuses, surfaces the refusal legibly, and waits.
 This loop is the same for every route, capability-bearing or inert.
 
+**The register is Rust, not a config file.** The register and each route's rule are expressed as a
+**per-service Rust DSL** — compiled-in code the operator writes and reviews like any other part of
+the TCB — not a serialized config format (no YAML/JSON/TOML file loaded at runtime). This is a
+deliberate reviewability choice (operator direction, 2026-07-19): a serialized register would need
+a parser on the trusted side and a runtime load/validate step whose defect would alter the tier-1
+gate's input; expressing it as typed Rust removes that parser entirely, makes an invalid route or
+tool-identity a **compile error rather than a runtime check** (§12's structural mode applied to
+configuration), keeps the box structurally unable to author it (compiled in, never loaded from
+anywhere box-reachable — §14), and makes the register a reviewed artifact the operator holds in a
+sitting alongside the rest (§15). A register change is therefore an **edit, recompile, and
+re-review** — the promotion pattern (§14) at the source level, and the answer to what re-triggers
+the reviewability sitting for a register change.
+
 ---
 
 ## 7. A request is a trusted address and an untrusted payload
