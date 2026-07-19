@@ -116,8 +116,9 @@ the bespoke channel exists precisely because nothing off-the-shelf is non-interp
 - **State is minimal:** the quarantine root and the readable root (config). Transfers are
   transient and unattributed — a filesystem snapshot at a point in time, not held.
 
-*(File chunking and offset reassembly for large transfers are the substrate/protocol's concern;
-from this subsystem's view it writes verbatim bytes at an offset.)*
+*(File chunking and reassembly for large transfers are the substrate/protocol's concern; from this
+subsystem's view it appends verbatim bytes in order at the running cursor — the wire carries no
+offset (`proto/file.md` §1).)*
 
 ---
 
