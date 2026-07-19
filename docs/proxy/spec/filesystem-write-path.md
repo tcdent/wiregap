@@ -79,12 +79,14 @@ not explicitly admitted below denies. No retry-with-modification exists.
 3. Leaf: `fd ← openat2(cur, en, flags=O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, mode=0600,
    resolve=§1.1 mask)` — failure → Denied; `EEXIST` is the no-overwrite collision
    surfacing by design (probes P6/P7/P8).
-4. **One fd per transfer:** the fd is held for the transfer's lifetime; chunks land via
-   `pwrite(2)` at their offsets; close on completion or the file layer's own timeout
-   (layering per `nic/architecture.md` §8 — the file layer owns fd/offsets/timeout). The
-   leaf is **never reopened mid-transfer** — this is what makes `O_EXCL` compatible with
-   `filesystem.md` §4's write-at-offset reassembly, and it forecloses the
-   same-transfer-rewrite case mechanically (J-coll).
+4. **One fd per transfer:** the fd is held for the transfer's lifetime; chunks land
+   **sequentially at the proxy-tracked running cursor** — the wire carries no offset
+   (`docs/proto/file.md` §1: "verbatim bytes, appended in order at the running position";
+   parallel/offset writes are retired) — and the fd closes on completion (the transport
+   session ending, `file.md` §1) or the file layer's own timeout (layering per
+   `nic/architecture.md` §8 — the file layer owns fd/cursor/timeout). The leaf is
+   **never reopened mid-transfer** — this is what makes `O_EXCL` compatible with chunked
+   transfer, and it forecloses the same-transfer-rewrite case mechanically (J-coll).
 5. Every `Denied` is surfaced legibly. Leaf elements are safe segments (loggable by
    construction, `docs/proto/file.md`), so the denial may name the path with no
    neutralization pass.
