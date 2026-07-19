@@ -123,30 +123,40 @@ and *how its safety is assured*, never by where its code runs:
    reading — not for security logic.
 3. **Off-surface feature logic** — handles only already-safe bytes (the head's renderer, the
    quarantine writer, the cloud originator). A bug fails the *feature*, never containment.
-4. **Untrusted-contained** — components whose *trustworthiness is made immaterial* because their
-   reach is structurally bounded (assertions 4–5 applied to a device, not just to the box). The
-   box, bounded by structural egress-absence; **and the X520 NIC and its firmware,** bounded by the
-   IOMMU (which caps its DMA reach), the descriptor-validating driver (which caps the descriptor
-   content it can present), and the hardware CRC + retransmit (which catches corruption). We do not
-   ask whether the firmware is benign — an un-answerable question; we ask whether the containment
-   holds — a checkable one. **No scrutiny of the component; scrutiny of the containment instead.**
+4. **Untrusted-contained** — components whose *trustworthiness is made immaterial*: we depend on
+   them to *function*, never to *behave* (assertions 4–5 applied to a device, not just to the box).
+   The box, bounded by structural egress-absence; **and the X520 NIC and its firmware** — bulky
+   vendor code we cannot read. Its hostile reach splits two ways: the adversary-written
+   descriptor/buffer **content is contained** by the descriptor-validating driver (bound the
+   reported length, treat status as hostile, copy out early), and corruption is caught by hardware
+   CRC + retransmit — but its device **DMA reach is *owned*, not contained.** The subsystem runs
+   pure-direct with **no IOMMU**, so nothing hardware-bounds where the device can DMA; the
+   operator's ratified posture is to *own* that residual rather than route containment through the
+   kernel-configured IOMMU trust the spine excludes (`nic/architecture.md §2.1`). We ask, per
+   vector, whether it is *contained* or *owned* — a checkable question — never whether the firmware
+   is benign. **Scrutiny of the containment, and an honest account of what is owned — not of the
+   component.**
 
-What makes the untrusted-contained category sound is **structural hardware** — the IOMMU and the
-physical point-to-point link — not code. The safe surface *begins at the DMA handoff*: the driver
-reads the IOMMU-bounded buffers and the MMIO registers as if from an adversary, and everything from
-there up is small-and-ours or a design property. There is **no rung between them where we trust
-bulky code we cannot read** — the old "firmware, trusted by diligence" was exactly that rung, and
-it is gone.
+What makes the *contained* vector sound is the small-and-ours driver reading as if from an
+adversary — copy descriptor content out early, never deref an unchecked field; the one remaining
+**structural-hardware** floor is the physical point-to-point link (the device talks to exactly one
+peer), not an IOMMU. The safe surface *begins at that treat-as-hostile read*, and everything from
+there up is small-and-ours or a design property. There is **no rung where we trust bulky code we
+cannot read** — the old "firmware, trusted by diligence" was exactly that rung, and containing the
+content vector removes it. The DMA-reach vector is the one thing that resolves to *owned*, not to a
+floor.
 
-Honesty: this containment is **committed but not yet fully verified.** The open questions — the
-driver's robustness to *any* descriptor content, the IOMMU's airtightness against
-interrupt-remapping / ATS / peer-to-peer, and a config-space / provisioning surface scoped out to
-physical and supply-chain — are tracked in the NIC subsystem's concerns-to-watch, not assumed away.
+Honesty: this posture is **committed but not yet fully ratified.** The content-vector guard (a
+driver robust to *any* descriptor content) is verified by reading; the **DMA-reach vector is owned,
+not contained** — whether the threat model tolerates un-contained firmware DMA on the trusted side
+is the **policy layer's call, audited after the PoC**, owned-and-committed until then. That, plus a
+config-space / provisioning surface scoped to physical and supply-chain, is tracked in the NIC
+subsystem's concerns-to-watch — not assumed away.
 
 The terminal subsystem is the clearest illustration that the categories are about *capability over
 box bytes and assured containment*, not location: its highest-scrutiny elements are a protocol
 property and a head design invariant, its proxy code is plumbing, the firmware one hop below is
-untrusted-and-contained, and the operator's *own machine* runs box-reachable code (the head's
+untrusted (its content vector contained, its DMA-reach owned), and the operator's *own machine* runs box-reachable code (the head's
 parser) that must therefore meet the memory-safety bar. This taxonomy belongs, in full, in the
 app-composition view, where every subsystem's components are placed against it at once.
 
