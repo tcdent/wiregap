@@ -28,6 +28,17 @@ stack/scan/service attacks; the box's sole influence on the head is relayed payl
 content within the bounded protocol (`CITE(head: head/architecture.md`, threat-layer
 table`)`).
 
+**Non-box network-exposure (added by the operator's flexible-transport direction, §3):** when the
+transport spans an untrusted network (head remote, not local), the proxy↔head link is exposed to
+*non-box* network actors — a surface the box-exposure property above does not cover. It does **not**
+breach the spine: an injected frame reaches only the head's memory-safe parser and no-interpreter
+renderer (worst case a misdraw, R-1), and effect-containment holds regardless of who drives the
+link. The residue is operational: injected *input* would command the operator's agent, and the
+link is eavesdroppable — authority and confidentiality, neither a defended spine invariant
+(`principles.md` §6–§7). So **transport security (TLS + peer auth) on an untrusted-network hop is an
+operational choice within "any protocol that works"** — the head/operator's to make, not a proxy
+gate and not a spine requirement.
+
 ## 1. The decode/relay pin (the load-bearing clause) — `CITE(proto: library.md §7)` + `DEFINE`
 
 On this boundary the proxy decodes **L1/session routing and the binding verb only. It
@@ -76,11 +87,14 @@ acts on, which is net + file addressing on the *box* boundary, not here.)
   adapter.
 - **`library.md` §7's consumer table** — self-labeled illustrative; cited at that
   strength only. Owner: **proto**.
-- **The concrete proxy↔head transport framing** (what carries L1/L2 on this leg — the
-  settled facts are the *properties*: only-peer, terminate-and-re-originate, bounded
-  protocol; the concrete wire/framing is **not found settled in any source read for this
-  contract**). Carried as an open dependency, owner: **head** + proxy design — flagged
-  to the lead rather than asserted or invented here.
+- **The concrete proxy↔head transport framing** — the settled facts remain the *properties*
+  (only-peer, terminate-and-re-originate, bounded protocol). The concrete wire is now
+  **intentionally left flexible by operator direction (2026-07-19): the head connects over any
+  protocol that works both locally and over the network.** This is a positive choice, not an
+  unfilled gap — the *transport* (the envelope) is deliberately unpinned; the *protocol* it
+  carries (the bounded L1/L2 display/input frames) is unchanged. Owner: **head** + proxy design.
+  The one surface this flexibility adds — non-box network-exposure when the head is remote — is
+  named in §0.
 
 ## 4. Judgment calls (GB6) — none new
 
@@ -102,9 +116,11 @@ routed to its owner, not a fork this contract recommends on.
 - **R-3 — The illustrative consumer table.** The `file-data`-to-head leg is cited at
   illustrative strength; if the team's refinement against actual binaries changes it,
   this contract's §1 third bullet tracks the source, not the other way around.
-- **R-4 — Transport framing open** (§3 last marker). Bound: the settled properties
-  (only-peer, re-originate, bounded protocol) hold regardless of which concrete framing
-  lands; no clause here depends on the unsettled choice.
+- **R-4 — Transport framing intentionally flexible** (§3; operator direction 2026-07-19). The
+  settled properties (only-peer, re-originate, bounded protocol) hold regardless of which concrete
+  framing lands, and no clause depends on the choice — so "any protocol that works local +
+  network" is a safe resolution. The one surface it adds (non-box network-exposure when remote) is
+  named in §0 and is operational, not a spine invariant.
 
 ## 6. Currency pins (2026-07-18)
 
