@@ -35,9 +35,12 @@ breach the spine: an injected frame reaches only the head's memory-safe parser a
 renderer (worst case a misdraw, R-1), and effect-containment holds regardless of who drives the
 link. The residue is operational: injected *input* would command the operator's agent, and the
 link is eavesdroppable — authority and confidentiality, neither a defended spine invariant
-(`principles.md` §6–§7). So **transport security (TLS + peer auth) on an untrusted-network hop is an
-operational choice within "any protocol that works"** — the head/operator's to make, not a proxy
-gate and not a spine requirement.
+(`principles.md` §6–§7). So **the proxy relay carries no access control and no peer-identity gate of
+any kind** (operator direction, 2026-07-19): peer authentication, like transport security (TLS),
+lives **outside the library** — external infrastructure the operator provisions on the
+untrusted-network hop, the same off-surface posture policy ruled for TLS (`architecture.md` §11
+L10). Both are the head/operator's to provide; neither is a proxy gate nor a spine requirement, and
+the relay keeps no identity logic in its trusted surface.
 
 ## 1. The decode/relay pin (the load-bearing clause) — `CITE(proto: library.md §7)` + `DEFINE`
 
