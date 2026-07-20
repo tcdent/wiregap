@@ -1,0 +1,25 @@
+[package]
+name = "proxy"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# The security-invariant core (Sprint 5). Reuses proto's committed primitives — scan_safe,
+# SafeSegment(Stack), NetAddress, Scheme, Reassembler — as a real dependency; it never rebuilds
+# them. Feature-scoped to file+net (the proxy never compiles the terminal/control grammar —
+# proto's own surface-minimization). directpath/reactor/transport deps arrive later with the
+# transport seam (out of Sprint-5 scope).
+[dependencies]
+proto = { path = "../proto", default-features = false, features = ["file", "net"] }
+
+# The one confined-unsafe dependency: raw openat2/mkdirat syscalls for U1's open-discipline
+# (RQ7 → Option A, design 2026-07-19: box-reachable code carries confined IN-HOUSE unsafe,
+# never a third-party wrapper — reviewability is the guarantee, not a zero-unsafe-token count).
+# `unsafe` is confined to the one `open_discipline` module (crate root is deny(unsafe_code)).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# trybuild drives the U5 compile-fail (C1) gate — a malformed route/identity, and the struct-literal
+# bypass, must each FAIL to compile against a pinned .stderr. Proto's own tests/trybuild.rs pattern.
+[dev-dependencies]
+trybuild = "1"

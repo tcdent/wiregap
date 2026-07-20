@@ -1,0 +1,18 @@
+error[E0080]: evaluation panicked: malformed route: not in the image of assemble (https:// + safe domain + safe path)
+ --> tests/ui/malformed_route.rs:3:39
+  |
+3 |     const _BAD: proxy::vocab::Route = proxy::vocab::Route::new("http://evil.example/x");
+  |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `main::_BAD` failed inside this call
+  |
+note: inside `Route::new`
+ --> $RUST/core/src/panic.rs
+  |
+  = note: the failure occurred here
+  |
+ ::: src/vocab.rs
+  |
+  | /         assert!(
+  | |             is_canonical_route(canonical),
+  | |             "malformed route: not in the image of assemble (https:// + safe domain + safe path)",
+  | |         );
+  | |_________- in this macro invocation

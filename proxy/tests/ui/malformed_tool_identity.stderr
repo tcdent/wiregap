@@ -1,0 +1,18 @@
+error[E0080]: evaluation panicked: malformed tool identity: expected a non-empty [A-Za-z0-9_] token
+ --> tests/ui/malformed_tool_identity.rs:3:46
+  |
+3 |     const _BAD: proxy::vocab::ToolIdentity = proxy::vocab::ToolIdentity::new("has space");
+  |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `main::_BAD` failed inside this call
+  |
+note: inside `ToolIdentity::new`
+ --> $RUST/core/src/panic.rs
+  |
+  = note: the failure occurred here
+  |
+ ::: src/vocab.rs
+  |
+  | /         assert!(
+  | |             is_tool_identity(identity),
+  | |             "malformed tool identity: expected a non-empty [A-Za-z0-9_] token",
+  | |         );
+  | |_________- in this macro invocation

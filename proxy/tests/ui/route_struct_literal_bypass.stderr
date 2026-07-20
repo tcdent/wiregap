@@ -1,0 +1,16 @@
+error[E0603]: tuple struct constructor `Route` is private
+ --> tests/ui/route_struct_literal_bypass.rs:4:33
+  |
+4 |     let _bypass = proxy::vocab::Route("http://not validated");
+  |                                 ^^^^^ private tuple struct constructor
+  |
+ ::: src/vocab.rs
+  |
+  | pub struct Route(&'static str);
+  |                  ------------ a constructor is private if any of the fields is private
+  |
+note: the tuple struct constructor `Route` is defined here
+ --> src/vocab.rs
+  |
+  | pub struct Route(&'static str);
+  | ^^^^^^^^^^^^^^^^
