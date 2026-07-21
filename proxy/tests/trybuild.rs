@@ -8,4 +8,6 @@ fn ui() {
     t.compile_fail("tests/ui/malformed_route.rs");
     t.compile_fail("tests/ui/malformed_tool_identity.rs");
     t.compile_fail("tests/ui/route_struct_literal_bypass.rs");
+    // Sprint 6 S1: SafeSegmentStack has no bypass constructor (leaf_validate_prescanned soundness).
+    t.compile_fail("tests/ui/safesegmentstack_no_bypass_constructor.rs");
 }

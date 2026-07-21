@@ -10,7 +10,14 @@ publish = false
 # proto's own surface-minimization). directpath/reactor/transport deps arrive later with the
 # transport seam (out of Sprint-5 scope).
 [dependencies]
-proto = { path = "../proto", default-features = false, features = ["file", "net"] }
+# Sprint 6 (dispatch): the demux routes ALL verb blocks (control/terminal/file/net), so proto's
+# full feature set is linked (Sprint 5's file+net was the tier-1-core-only surface).
+proto = { path = "../proto", features = ["control", "terminal", "file", "net"] }
+# The transport seam Sprint 5 deferred — now wired. `transport` for SessionId/SessionTable/Delivery,
+# `reactor` for the driving loop (pump_all). `directpath` (the real NIC) stays a fill-in; the relays
+# and dispatch are tested against a fake wire (the transport crate's own test pattern).
+transport = { path = "../transport" }
+reactor = { path = "../reactor" }
 
 # The one confined-unsafe dependency: raw openat2/mkdirat syscalls for U1's open-discipline
 # (RQ7 → Option A, design 2026-07-19: box-reachable code carries confined IN-HOUSE unsafe,

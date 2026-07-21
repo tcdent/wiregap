@@ -43,8 +43,25 @@ pub fn leaf_validate(dest: &[u8]) -> Result<SafeSegmentStack, LeafDenial> {
     // proto's own segment_alphabet.rs, cited not re-swept here).
     let stack = scan_safe(dest).map_err(LeafDenial::Scan)?;
 
-    // The one new arm: the array-level upper bound. `stack.len()` is a defined `usize` for any
-    // scanned stack; `> MAX_ELEMENTS` is a total comparison.
+    // The array-level upper bound is the one new arm — shared with the prescanned entry so both
+    // call-sites run one count-bound implementation (Sprint 6 S1: single-scan-site architecture).
+    leaf_validate_prescanned(&stack)?;
+    Ok(stack)
+}
+
+/// The **count-bound-only** leaf check, over an **already-scanned** [`SafeSegmentStack`]. The entry
+/// the dispatch layer uses after `proto::FileWrite`'s decode-time `scan_safe`, avoiding a second
+/// scan (Sprint 6 S1; Sprint 5's forward-looking double-scan note).
+///
+/// **Soundness of skipping the scan here (the type-construction audit):** a [`SafeSegmentStack`] can
+/// be obtained *only* through `proto::scan_safe` — its interior `Vec` is a private field with no
+/// other constructor (no `pub` field, `new`, `From`, `Default`, or `Deserialize`; verified in
+/// `proto/src/segment.rs`, and re-asserted by the trybuild bypass case). So a value of this type is
+/// **provably already floor-validated** (alphabet, ≥1-alnum, traversal-unsayable, ≥1-element), and
+/// this entry drops **no** floor — it adds only the array-level upper bound the scan does not carry.
+/// The ≥1-element lower bound is *unrepresentable* here (an empty stack cannot be constructed), so
+/// it is inherited from the type, not re-checked.
+pub fn leaf_validate_prescanned(stack: &SafeSegmentStack) -> Result<(), LeafDenial> {
     let count = stack.len();
     if count > MAX_ELEMENTS {
         return Err(LeafDenial::TooManyElements {
@@ -52,6 +69,5 @@ pub fn leaf_validate(dest: &[u8]) -> Result<SafeSegmentStack, LeafDenial> {
             max: MAX_ELEMENTS,
         });
     }
-
-    Ok(stack)
+    Ok(())
 }

@@ -31,6 +31,15 @@ pub mod route;
 
 pub mod anthropic;
 
+pub mod dispatch;
+
+pub mod cloud_relay;
+
+pub mod terminal_relay;
+
+#[cfg(unix)]
+pub mod fs_read;
+
 pub mod leaf;
 
 #[cfg(unix)]

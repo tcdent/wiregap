@@ -108,3 +108,46 @@ fn admit_returns_the_real_scanned_stack() {
     assert_eq!(stack.segments()[1].as_str(), "sub_dir");
     assert_eq!(stack.segments()[2].as_str(), "file.txt");
 }
+
+// ─── Sprint 6 S1: the tier-1 leaf_validate_prescanned re-cert (three pieces) ─────────────────
+// (1) CB1 coherence is `cargo test` compiling-then-running (the run is the current source's).
+// (2) count-bound enumeration DIRECTLY on SafeSegmentStack input.
+// (3) the type-construction audit — SafeSegmentStack only via scan_safe — proving no floor is
+//     dropped by skipping the scan (also asserted as a trybuild compile-fail, tests/ui/).
+
+use proxy::leaf::leaf_validate_prescanned;
+
+/// (2) The count boundary swept directly over `SafeSegmentStack` inputs (built via `scan_safe`, the
+/// only constructor). Oracle: admit iff `k <= MAX_ELEMENTS` — from the construction, independent of
+/// the code. `k=0` is *unrepresentable* at this entry (no empty stack exists), so the ≥1 lower bound
+/// is inherited from the type, not re-checked — the honest-boundary discipline, at the type level.
+#[test]
+fn prescanned_count_bound_over_safesegmentstack_input() {
+    for k in 1..=(MAX_ELEMENTS + 2) {
+        let stack = proto::scan_safe(dest_with_segments(k).as_slice()).expect("k>=1 scans");
+        let got = leaf_validate_prescanned(&stack);
+        if k <= MAX_ELEMENTS {
+            assert_eq!(got, Ok(()), "k={k} in [1,MAX] must admit");
+        } else {
+            assert_eq!(
+                got,
+                Err(LeafDenial::TooManyElements { count: k, max: MAX_ELEMENTS }),
+                "k={k}>MAX must deny TooManyElements with the exact count",
+            );
+        }
+    }
+}
+
+/// (2+3) The two entry points AGREE: for the same destination bytes, `leaf_validate(&[u8])` (scan +
+/// count) and `leaf_validate_prescanned(&scan_safe(bytes))` reach the same verdict — proving the
+/// refactor is behavior-preserving and the count-bound impl is shared, not duplicated.
+#[test]
+fn both_entry_points_agree() {
+    for k in [1usize, 2, MAX_ELEMENTS, MAX_ELEMENTS + 1] {
+        let dest = dest_with_segments(k);
+        let full = leaf_validate(&dest).map(|_| ());
+        let stack = proto::scan_safe(&dest).expect("scans");
+        let pre = leaf_validate_prescanned(&stack);
+        assert_eq!(full, pre, "the two entry points must agree at k={k}");
+    }
+}
