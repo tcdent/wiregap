@@ -1,9 +1,9 @@
 # Data path and the event model
 
 > The per-frame hot path (RX/TX rings and descriptors), the hardware behaviors the reliability story
-> rests on, and the interrupt-driven idle-wakeup that is the event primitive the whole event-driven
-> application rides on. This is the surface that interprets the descriptor rings the firmware
-> populates from the wire, so it is understood completely here.
+> rests on, and the event-driven idle-wakeup — a `MONITORX`/`MWAITX` park on the NIC's own `DD` writeback
+> (§4) — that the whole event-driven application rides on. This is the surface that interprets the
+> descriptor rings the firmware populates from the wire, so it is understood completely here.
 >
 > Grounded in `reference/ixy` (`ixgbe.c` rx/tx batch, `interrupts.c`, `libixy-vfio.c`) and the
 > datasheet (§4.6.7/8 RX/TX init, §8.2.3.7.1 `FCTRL`).
@@ -69,27 +69,31 @@ DCB/VTd", `:397`), ring base/length, `TXDCTL` writeback thresholds (DPDK default
   may retransmit a frame until acknowledged, so **we free on ACK arrival**, not TX-completion — the
   buffer lifetime is longer. A genuine divergence from ixy's reclamation model.
 
-## 4. The event model — interrupt → eventfd → epoll (the load-bearing primitive)
+## 4. The event model — the NIC's `DD` writeback, parked on via `MONITORX`/`MWAITX` (the load-bearing primitive)
 
-The idle-wakeup interrupt is **not an optimization we declined** — it is the event primitive the
-entire event-driven application rides on for free. Understood completely:
+The idle-wakeup is **not** an interrupt and **not** a poll — it is the NIC's **own per-frame event**, in
+memory we already read, that the CPU parks on directly. On every received frame the NIC writes back the RX
+descriptor (`DD` bit set) by DMA into the ring — a device write to memory we own. So the idle-wait needs no
+kernel mechanism and no separate signal: we watch the very descriptor the NIC is about to write.
 
-- **Arming**: one MSI-X vector → `eventfd(0,0)` → `VFIO_DEVICE_SET_IRQS` with
-  `DATA_EVENTFD|ACTION_TRIGGER` (`libixy-vfio.c:95`); the eventfd joins an epoll instance (`:210`).
-  Device-side, `IVAR`/`GPIE`/`EIMS` map the queue's RX cause to the vector (`ixgbe.c:158`).
-- **Waiting**: `vfio_epoll_wait` (`:181`) blocks on epoll; on wake it `read()`s the eventfd to clear
-  the latch. **The `timeout` (ms) argument is exactly where the retransmit deadline composes into the
-  idle-wait** — "block on the eventfd *or* the retransmit deadline, one loop, two exit reasons"
-  (`transport-stack.md §2.6`) is directly realizable as `epoll_wait(..., deadline_ms)`.
-- **Minimal slice we keep** ≈ 60 LOC: `vfio_enable_msix` (21) + `vfio_epoll_ctl` (8) +
-  `vfio_epoll_wait` (17) in the VFIO layer, plus the device-side `IVAR`/`EIMS` arming.
+- **Arming**: `MONITORX` (userspace, ring-3) on the next RX descriptor's cache line — the line the NIC's
+  `DD` writeback will hit. No MSI-X, no eventfd, no VFIO: the event is the DMA the NIC already performs.
+- **Waiting**: `MWAITX` with a TSC deadline **halts the CPU** until (a) the NIC's `DD` write lands on the
+  monitored line — a frame arrived — or (b) the deadline expires — a retransmit is due. That is exactly the
+  idle-wait's two exit reasons ("block on the frame *or* the retransmit deadline, one loop, two reasons",
+  `transport-stack.md §2.6`), in one instruction: `MWAITX(deadline)`.
+- **Minimal slice we keep** ≈ the `MONITORX`/`MWAITX` park (`directpath/src/mwaitx.rs`) plus reading the
+  `DD` bit — no VFIO layer, no eventfd/epoll plumbing. The idle-wait is a **check-before-wait**
+  (`MONITORX`-recheck-`MWAITX`: read `DD`, arm, re-read, wait) on our own descriptor memory.
 
-**Our control flow inverts ixy's.** ixy calls `vfio_epoll_wait` at the *top* of `rx_batch` (`:667`)
-— it **blocks first, then polls** — and toggles poll/interrupt via an adaptive moving-average rate
-estimator (`interrupts.c:27`, ~20 LOC). Our design is the inverse: **busy-poll while there is work,
-block on the eventfd only when the ring is empty**, with **no** adaptive mode-switching. So the
-~60-LOC slice is a **re-derivation** from ixy's primitives, not a copy; the entire adaptive policy and
-the `instr_counter`-throttled toggling (`:715–734`) are dropped.
+**Our control flow.** Busy-poll (busy-drain) while there is work, then park via `MWAITX` when the ring is
+empty — never block-first, never adaptive mode-switching. `MWAITX`'s intrinsic max-wait bounds the park, so
+a truly-missed write degrades to *latency* (the next re-poll catches it), never a hang.
+
+*(This supersedes an earlier draft that described an MSI-X → eventfd → epoll VFIO idle-wait. That model
+went with the VFIO/kernel-tooling approach the subsystem no longer uses: the pure-direct path delivers no
+interrupt, and the NIC's own `DD` writeback — the signal the reactor already reads — is the minimal event
+to park on. Grounded in `grounding/kernel-bypass-and-dma.md §4`.)*
 
 ## 5. One ring is the floor and the smaller total surface
 
@@ -109,5 +113,7 @@ codepath cleverer. This confirms the explore docs' single-ring lean (`transport-
 3. **Per-descriptor cleanup affordability** at our rates (vs ixy's batching) — would let us drop the
    batching complexity and its stranding wrinkle.
 4. **DMA buffer-pool sizing** — measure real held-buffer counts, do not copy a default.
-5. **Idle-wakeup loop**: confirm the poll-then-block loop and that the retransmit deadline composes
-   into the same `epoll_wait` (`transport-stack.md §4.2`).
+5. **Idle-wakeup loop**: confirm the busy-drain + `MWAITX`-park loop on the `DD` line, and that the
+   retransmit deadline composes into the `MWAITX` wait — the make-or-break being that the device's `DD`
+   write reliably **wakes** the park (a CPU-capability + coherency question proven on silicon;
+   `grounding/kernel-bypass-and-dma.md §5`).

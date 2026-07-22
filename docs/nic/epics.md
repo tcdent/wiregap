@@ -62,18 +62,19 @@ memory at the earliest point; events carry the copy, never a ring pointer. This 
 right. Per-descriptor cleanup; ACK-bound buffer reclamation; CRC/`DROP_EN` reliance.
 *Authority: `grounding/data-path-and-events.md §1–3`, `architecture.md §3.1`, `concerns-to-watch.md`.*
 
-**E4 — The event reactor.** The single-threaded heartbeat: one MSI-X → eventfd → epoll **idle-wakeup**;
-**poll-then-block** (busy-poll while there is work, block on the eventfd when the ring is empty); the
-retransmit deadline composed into the same `epoll_wait`; one epoll over the NIC eventfd + retransmit
-deadlines + the application's source fds; single-producer, no locks. *Authority: `architecture.md §3, §5`;
-`grounding/data-path-and-events.md §4`.*
+**E4 — The event reactor.** The single-threaded heartbeat: an event-driven **idle-wakeup** that parks the
+CPU via `MONITORX`/`MWAITX` on the NIC's own `DD` writeback (no MSI-X, no eventfd, no kernel bridge);
+**busy-drain-then-park** (busy-poll while there is work, `MWAITX`-park on the `DD` line when the ring is
+empty); the retransmit deadline composed into the same `MWAITX` wait; single-producer, no locks.
+*Authority: `architecture.md §3, §5`; `grounding/data-path-and-events.md §4`.*
 
 **E5 — The session protocol.** The UART+ACK+ID transport: frame = `[session ID][payload]`; bare ACKs
 distinguished by direction; **strict stop-and-wait**; ~10 ms retransmit interval + ~1–5 s give-up
 (silent internal reclaim, no event); **multiplexing-by-instantiation** (a session is an instance of the
 one protocol; the reactor interleaves them); session lifecycle — open-by-emission, **no close signal**,
-**no cross-epoch state**, dormant ≠ dead; session IDs box-allocated, 64-bit monotonic, unique within an
-epoch. No flag byte beyond what is needed, no adaptive RTO, no session/epoch tracking.
+**no cross-epoch state**, dormant ≠ dead; session IDs **originator-allocated from a partitioned space**
+(box for requests, proxy for responses — disjoint by construction; both endpoints originate,
+`architecture.md §4`), 64-bit monotonic per side, unique within an epoch. No flag byte beyond what is needed, no adaptive RTO, no session/epoch tracking.
 *Authority: `architecture.md §4, §6, §7, §8`.*
 
 **E6 — Validation (mostly interleaved) + a final integration pass.** Bench validation is **not** a

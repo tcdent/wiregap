@@ -39,8 +39,11 @@ exploration and do **not** define them.
 - **session** — one of our multiplexed connections: the transport's primary managed entity, and a fresh
   **instance** of the one transport protocol. (Earlier drafts called this a "stream"/"connection"/
   "instance"; "session" is canonical.)
-- **session ID** — the identifier of a session: box-allocated, 64-bit monotonic counter, unique **within
-  an epoch**, reset on reboot. It is the frame's only key (demux only, zero security weight).
+- **session ID** — the identifier of a session: **allocated by the endpoint that originates it** (the box
+  for requests, the proxy for responses), a 64-bit monotonic counter drawn from an **originator-partitioned**
+  space so the two allocators never collide, unique **within an epoch**, reset on reboot. It is the frame's
+  only key (demux only, zero security weight — the originator partition is collision-avoidance, not an
+  auth token).
 - **application layer** — what rides *on top of* a session: one of a handful of implementations of the
   protocol (PTY, file, request). Selected by the session's **binding**; not the transport's concern.
 
@@ -118,34 +121,37 @@ kernel-trust dependency the spine never wanted.
 
 ## 3. The runtime architecture — a flat, single-threaded reactor
 
-One thread owns the wire, both rings, all session state, and one bounded-poll loop. The loop:
+One thread owns the wire, both rings, all session state, and one event-driven loop. The loop:
 
 ```
 poll the RX ring (busy-poll drain)         → for each frame: demux by session ID → its session reacts inline
 drain pending output to the TX ring        → the reactor is the sole TX-ring writer
-when idle: bounded poll (capped sleep)     → re-poll after a short sleep; a frame arrives, or a retransmit deadline passes
+when idle: park on the RX DD line (MWAITX)  → the CPU halts until the NIC's DD writeback (a frame) or a retransmit deadline
 ```
 
-- **One bounded-poll loop drives everything**: it drains the NIC's RX ring, checks the earliest
-  retransmit deadline, and services the application in-process. There is **no `epoll` and no eventfd** on
-  the pure-direct path (`grounding/kernel-bypass-and-dma.md §4`) — no MSI-X interrupt is delivered to a
-  userspace directly-owned device. When there is work the loop busy-drains with zero waits; when idle it
-  re-polls after a capped short sleep. Every readiness is still an event; the loop just discovers it by
-  polling rather than by a kernel wakeup.
+- **One event-driven loop drives everything**: it drains the NIC's RX ring, checks the earliest
+  retransmit deadline, and services the application in-process. There is **no `epoll`, no eventfd, and no
+  MSI-X interrupt** on the pure-direct path (`grounding/kernel-bypass-and-dma.md §4`) — none is available to
+  a userspace directly-owned device, and none is needed. When there is work the loop busy-drains with zero
+  waits; when idle it **parks the CPU via `MONITORX`/`MWAITX` on the next RX descriptor's cache line** — the
+  NIC's own `DD` writeback (its per-frame DMA into the ring) wakes it, or the retransmit deadline does. It
+  is event-driven with no kernel wakeup and no poll: the CPU genuinely halts until the NIC writes the memory
+  we are watching.
 - **The packet is the event.** A frame arrives, it is keyed by the session ID in its header, it
   bubbles straight to that session, which reacts. Nothing stages it, pulls it later, or
   paces it. There are **no intermediary buffers** — the decoupled "rings → staging → worker-pool →
   backpressure-pacing" pattern of conventional stacks (thousands of lines) does not exist here.
 - **Busy-poll is the drain, not the architecture.** The system is event-driven, not busy-spin-driven;
-  the busy-poll only empties the ring while frames are present, then the loop idles on a bounded poll (a
-  capped sleep before re-polling), rather than a busy spin.
+  the busy-poll only empties the ring while frames are present, then the loop **parks the CPU** on the RX
+  `DD` line (`MONITORX`/`MWAITX`) until the NIC's next writeback — not a spin, not a sleep.
 - **Single producer, no locks.** Because the reactor is the only thing that touches either ring,
   there are no locks and no races on ring or session state. This resolves the open fork in
   `transport-stack.md §4.4 item 14` — single-producer into the one TX ring.
 - **Why single-threaded**, on the three lenses: *simplicity* (no locks/races), *understandability*
-  (the whole event flow is one readable loop), *firmware surface* (one RX / one TX ring, polled — no
-  MSI-X, no eventfd; multi-threading would push back toward multiqueue/RSS/multiple vectors, the
-  surface we reject; see `grounding/data-path-and-events.md §5`).
+  (the whole event flow is one readable loop), *firmware surface* (one RX / one TX ring — no MSI-X, no
+  eventfd; the idle-wake is a CPU `MWAITX` park on the DD line, not a device interrupt; multi-threading
+  would push back toward multiqueue/RSS/multiple vectors, the surface we reject; see
+  `grounding/data-path-and-events.md §5`).
 - **The flatness invariant:** event handlers are fast and non-blocking — true *by construction* for
   the transport's own work (frame a chunk, advance the session, write the ring). Genuinely heavy
   application work, if any, lives above the line and arranges its own affairs; it never pushes a
@@ -200,7 +206,11 @@ There is **one** transport protocol code set. A **session** is one multiplexed c
 layer**: one of a handful of implementations (PTY, file, request) that gives the session's bytes their
 purpose, selected by the **binding** the session declares (a field it carries, *not* a transport
 branch). Multiplexing *is* instantiation: a new connection is a new session, not a new protocol.
-Consequences:
+**Both endpoints run this one code set and both originate sessions** — the box opens **request** sessions
+(box→proxy), the proxy opens **response** sessions (proxy→box), as independent unidirectional messages
+(`proto/model.md §9`); the reactor on each side is symmetric, and origination is the *only* reply
+mechanism (a response is a new session, never data sent back on the request session — §6 tells data from
+ACK by role, so a session's data stays one-directional). Consequences:
 
 - **Transport dispatch has zero protocol-type branching.** A frame arrives → the reactor looks up its
   session by session ID (a table) → hands it to that session — the same code, every time. "What
@@ -221,11 +231,12 @@ Two kinds of "event" exist, and conflating them is where complexity comes from, 
 distinct:
 
 - **The idle-wakeup — one, local, idle-only.** On the pure-direct path no interrupt is delivered to our
-  userspace process, so the idle-wakeup is a **bounded poll**, not an MSI-X vector: when the ring is empty
-  the loop re-polls after a capped short sleep rather than parking on an interrupt. It is still
-  *per-ring, not per-session*, it never crosses the wire, and it matters *only when blocked idle* — during
-  active traffic the loop busy-drains and does zero sleeping. The two-kinds-of-event split below is
-  unchanged; only this primitive reconciled, from MSI-X to bounded poll
+  userspace process, so the idle-wakeup is an **event-driven `MONITORX`/`MWAITX` park on the NIC's own
+  `DD` writeback** — not an MSI-X vector and not a poll: when the ring is empty the CPU **halts** on the
+  next RX descriptor's cache line, and the NIC's `DD` DMA (or the retransmit deadline) wakes it. It is
+  still *per-ring, not per-session*, it never crosses the wire, and it matters *only when blocked idle* —
+  during active traffic the loop busy-drains and never parks. The two-kinds-of-event split below is
+  unchanged; only this primitive reconciled, from MSI-X to the DD-monitor `MWAITX` park
   (`grounding/kernel-bypass-and-dma.md §4`).
 - **Application-layer events — many, software, derived.** "Session N has data," "session N was ACKed":
   the reactor manufactures these by demuxing frames after the fact. They are not interrupts and not
@@ -233,8 +244,8 @@ distinct:
 
 So: **"how do interrupts work across the wire?" — they don't.** The wire carries only data frames
 keyed by session ID. There is no control message, nothing out-of-band, nothing to route or inspect.
-Backpressure is the *absence* of an ACK. The one local idle-wakeup — now a bounded poll, not an interrupt
-— is just "there's work"; every per-session event is derived locally from the data. Refusing to put any signal on the wire is
+Backpressure is the *absence* of an ACK. The one local idle-wakeup — an event-driven `MWAITX` park on the
+DD line, not an interrupt — is just "there's work"; every per-session event is derived locally from the data. Refusing to put any signal on the wire is
 what keeps both the protocol and the firmware surface tiny.
 
 ## 6. The protocol — UART + ACK + ID
@@ -297,10 +308,11 @@ Sizing rationale:
   (K = concurrent sessions, each capped at one in flight — why the ring is sized to K). The *time* to
   drain that depth is the **real per-frame processing** throughput — ~25 µs/frame measured — so ≈ `K ×
   25 µs`. At the current ring cap **K ≤ 64** that is **~2.29 ms** (measured at K=60), **4.4× under** the
-  10 ms window. (An earlier bounded-poll defect briefly inflated this: the idle sleep was pacing a present
-  backlog — one delivery per ~112 µs poll cycle — pushing the drain to ~11.3 ms at K=32 and reaching the
-  window; the remedy below made the sleep idle-only and removed it. The original "a few hundred µs" here
-  assumed sub-µs per-frame processing; the real figure is ~25 µs/frame.)
+  10 ms window. (An earlier defect — in the bounded-poll era, before the DD-monitor `MWAITX` wakeup —
+  briefly inflated this: the idle *sleep* paced a present backlog, one delivery per ~112 µs poll cycle,
+  pushing the drain to ~11.3 ms at K=32 and reaching the window. The busy-drain remedy below resolved it,
+  and the idle-wait is now the event-driven `MWAITX` park — no sleep at all. The original "a few hundred µs"
+  here assumed sub-µs per-frame processing; the real figure is ~25 µs/frame.)
 - **~10 ms** is ~4× the measured worst-of-burst at the K ≤ 64 cap (2.29 ms) and ~100–1000× the wire RTT —
   well under human perception, so a genuine-loss retransmit is invisible. The band of good values is wide;
   stay **under ~tens of ms** so a genuine loss never becomes a *visible* hang — which is also why dialing
@@ -312,15 +324,15 @@ Sizing rationale:
 
 **The 7a finding, and the remedy (designer's call).** No spurious retransmit fired — the reactor **drains
 the RX ring and processes arrived ACKs before it checks any deadline** (§6; §7 below), so an arrived ACK is
-always seen before its timer — but the latency-to-window *margin* is exhausted, and at larger K, a coarser
-poll, or a busier core the drain would cross the window and fire spuriously. The remedy is **not** to dial
-the window up alone: the drain latency scales ~linearly with K, so covering a large-K storm would push the
-window past the human-perception bound (tens of ms), the one edge this sizing must stay under. Instead,
-fix the root cause — **the bounded-poll sleep is an idle-only primitive and must not pace a present
-backlog.** When the reactor has work (RX frames or pending deliveries) it busy-drains with zero sleeps; the
-capped sleep applies *only* when there is genuinely nothing to do. That restores the ≈ hundreds-of-µs
-worst case and a comfortable, human-invisible window margin. The per-delivery back-pressure remains for
-*steady-state* pacing — its real purpose — decoupled from the idle sleep. The window stays generous at
+always seen before its timer — but the latency-to-window *margin* is exhausted, and at larger K or a
+busier core the drain would cross the window and fire spuriously. The remedy is **not** to dial the window
+up alone: the drain latency scales ~linearly with K, so covering a large-K storm would push the window
+past the human-perception bound (tens of ms), the one edge this sizing must stay under. Instead, fix the
+root cause — **the idle-wait is an idle-only primitive and must not pace a present backlog.** When the
+reactor has work (RX frames or pending deliveries) it busy-drains with zero waits; the idle-wait — the
+event-driven `MWAITX` park on the DD line — applies *only* when there is genuinely nothing to do. That
+restores the ≈ hundreds-of-µs worst case and a comfortable, human-invisible window margin. The per-delivery
+back-pressure remains for *steady-state* pacing — its real purpose — decoupled from the idle-wait. The window stays generous at
 **~10 ms**, now **confirmed on the bench**: with the busy-drain landed, the worst-of-burst is **2.29 ms at
 K=60**, 4.4× under the window, zero spurious retransmits, all gates pass — so §7 is validated across the
 current operating range, **K ≤ 64** (the ring cap; K is a ring-sized parameter). Growing K past the cap is
@@ -352,8 +364,9 @@ the wire. Lifecycle is what *falls out* of frames arriving or not arriving, plus
 minding its own resources. Keeping it this thin is what keeps the layer minimal; every consumer builds
 its own lifecycle on top with its own logic.
 
-**A new session is just a frame on a new session ID.** The box opens by emission — the first frame on a
-fresh ID. The transport, seeing an ID it holds no session for, instantiates and delivers the frame
+**A new session is just a frame on a new session ID.** Either endpoint opens by emission — the first frame
+on a fresh ID: the box opens **request** sessions (box→proxy data), the proxy opens **response** sessions
+(proxy→box data), symmetric independent unidirectional messages (`proto/model.md §9`). The transport, seeing an ID it holds no session for, instantiates and delivers the frame
 upward; the consumer, seeing an ID it has not bound, attaches whatever it needs (a pane, a file sink).
 "Opened" is not announced; it is *noticed*, the same way on both sides. The binding (PTY / file /
 request) rides in that first frame's payload and is interpreted above; the transport routes bytes and
@@ -376,8 +389,12 @@ of cross-epoch state is the mechanism;** we add nothing to "handle restart," bec
 handle. (A reused ID is at most a cosmetic pane reuse; routing carries zero security weight. This
 supersedes `transport-stack.md §2.5`, which keyed proxy state to the box's lifetime — what we now call
 an epoch — and dropped it on restart; that keying is removed, and the transport holds no cross-epoch
-state at all.) Session IDs: the box is the sole allocator; 64-bit monotonic counter; unique **within an
-epoch**, reset on reboot.
+state at all.) Session IDs: **each endpoint allocates the sessions it originates** (the box its requests, the proxy its
+responses) from an **originator-partitioned** 64-bit space (the top bit encoding the originator is the
+clean form) — so an ID is unique **within an epoch across both originators** and the two allocators cannot
+collide by construction. Each side is a monotonic counter; the box's resets on its reboot (the epoch
+boundary), the proxy's persists across box epochs and its unacked sessions to a rebooted box fall out via
+give-up (§7).
 
 **Dormant ≠ dead** — the give-up fires only on an *outstanding* unacked frame, never on idleness, so a
 quiet session with nothing in flight is never reclaimed; a dormant pane persists and "revives" simply by
@@ -407,7 +424,7 @@ What remains is silicon measurement, not design.
 - **Bench-gated (reserved as open research; see each `grounding/` note's §"open" list):** the minimal
   link-restart form and whether LESM is enabled (`grounding/device-bring-up-and-link.md §5`);
   single-ring throughput and the reactor keeping up on one core; the retransmit window vs. the
-  bounded-poll backlog-drain latency under load (§7 — the 7a finding and the busy-drain remedy); DMA
+  backlog-drain latency under load (§7 — validated at K≤64, event-driven MWAITX idle-wait); DMA
   buffer-pool sizing against ACK-hold (`grounding/data-path-and-events.md §6`); and the pure-direct
   bring-up items (`grounding/kernel-bypass-and-dma.md §5`).
 
