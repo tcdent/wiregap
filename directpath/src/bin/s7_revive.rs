@@ -13,13 +13,13 @@
 //! Dormant ≠ dead, live: the dormant session accepted a new send and the peer revived the same session.
 //! The transport + guard/copy-boundary are byte-frozen (this is a harness). Run: `sudo ./s7_revive`.
 
-use directpath::datapath::{self, Layout};
-use directpath::ethframe::{EthSink, decap};
-use directpath::gate::{Allowed, Bdf, Decision, gate};
-use directpath::gate2::validate_physaddr;
-use directpath::link::{LinkRestart, apply_restart, link_state, reset_and_init};
-use directpath::mem::{self, Hugepage};
-use directpath::pci::{self, Bar0};
+use directpath::internals::datapath::{self, Layout};
+use directpath::internals::ethframe::{EthSink, decap};
+use directpath::internals::gate::{Allowed, Bdf, Decision, gate};
+use directpath::internals::gate2::validate_physaddr;
+use directpath::internals::link::{LinkRestart, apply_restart, link_state, reset_and_init};
+use directpath::internals::mem::{self, Hugepage};
+use directpath::internals::pci::{self, Bar0};
 use driver::{RxPath, RxRing, TxPath, VolatileRxRing, VolatileTxRing};
 use std::io::{self, Read};
 use std::time::{Duration, Instant as StdInstant};

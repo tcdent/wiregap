@@ -139,8 +139,8 @@ fn real_reactor_consumes_and_back_pressures_through_the_adapter() {
     assert!(r.step(), "frame 1 processed");
     assert!(r.back_pressured(), "a delivery is in flight → back-pressure engaged");
     assert!(!r.step(), "frame 2 is HELD in the lookahead while a delivery is in flight");
-    assert_eq!(r.take_delivery().as_deref(), Some(b"a".as_slice()), "frame 1's payload delivered");
+    assert_eq!(r.take_delivery().map(|(_, p)| p).as_deref(), Some(b"a".as_slice()), "frame 1's payload delivered");
     assert!(!r.back_pressured());
     assert!(r.step(), "frame 2 flows once back-pressure releases");
-    assert_eq!(r.take_delivery().as_deref(), Some(b"b".as_slice()), "frame 2's payload delivered, in order");
+    assert_eq!(r.take_delivery().map(|(_, p)| p).as_deref(), Some(b"b".as_slice()), "frame 2's payload delivered, in order");
 }

@@ -7,6 +7,12 @@ publish = false
 # The pure-direct control module (ixy pci.c/memory.c shape) — Sprint 6. A userspace process on running
 # Linux that takes the bench NIC and drives it directly. This crate's PRIMARY safety leg is the pure
 # `gate` (below): every state-changing op (unbind/BME/mmap/DMA, Part B) routes through it. std (userspace).
+# The `bench` feature gates the internals HATCH + the bench harness bins. It is NOT a default feature and is
+# unreachable from the proxy/TCB build graph — the shipped surface is exactly the thin facade, with the
+# hardware-module internals (and the harness) COMPILE-ABSENT unless bench is explicitly enabled.
+[features]
+bench = []
+
 [dependencies]
 libc = "0.2"
 # Isolated verification/measurement tooling for the bench HARNESSES only (self-hashing run provenance, core
@@ -21,3 +27,36 @@ reactor = { path = "../reactor" }
 transport = { path = "../transport" }
 
 [dev-dependencies]
+
+# Every harness bin is bench-only (required-features): the default (TCB/proxy) build skips them + the
+# internals hatch is cfg'd out, so `cargo build` ships only the thin facade. `--features bench` builds them.
+[[bin]]
+name = "s8_slice2"
+required-features = ["bench"]
+[[bin]]
+name = "s8_slice1_ddwake"
+required-features = ["bench"]
+[[bin]]
+name = "s7_slice1"
+required-features = ["bench"]
+[[bin]]
+name = "s7_slice2"
+required-features = ["bench"]
+[[bin]]
+name = "s7_slice3"
+required-features = ["bench"]
+[[bin]]
+name = "s7_measure"
+required-features = ["bench"]
+[[bin]]
+name = "s7_revive"
+required-features = ["bench"]
+[[bin]]
+name = "partb"
+required-features = ["bench"]
+[[bin]]
+name = "slice2"
+required-features = ["bench"]
+[[bin]]
+name = "slice4"
+required-features = ["bench"]

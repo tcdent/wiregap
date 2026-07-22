@@ -7,7 +7,7 @@ use core::cell::Cell;
 use core::time::Duration;
 use std::collections::VecDeque;
 use reactor::{arm_from_deadline, can_pull_rx, Arm, Host, Reactor, RxSource, WakeReason};
-use transport::{Instant, SessionTable, TransmitSink};
+use transport::{decode_frame, Instant, SendError, SessionId, SessionTable, TransmitSink};
 
 // ---- deadline composition (the three edge-facts) ----------------------------------------------
 
@@ -150,7 +150,7 @@ fn deadline_park_then_timer_wake_drives_retransmit() {
 
     // Idle (no RX, deadline in the future) → drain nothing, then park; the fake timer wake advances the
     // clock to the deadline.
-    assert_eq!(r.pump_all(|_| {}), 0, "nothing to drain while idle");
+    assert_eq!(r.pump_all(|_, _| {}), 0, "nothing to drain while idle");
     let reason = r.park();
     assert_eq!(reason, Some(WakeReason::Timer), "woke by the one-shot timer");
     assert_eq!(r.parks(), 1, "it actually parked");
@@ -168,13 +168,13 @@ fn park_forever_when_no_deadline_and_wakes_on_nic_msix() {
         StubRx::new([]),
         CaptureSink::default(),
     );
-    assert_eq!(r.pump_all(|_| {}), 0, "nothing to drain while idle");
+    assert_eq!(r.pump_all(|_, _| {}), 0, "nothing to drain while idle");
     let reason = r.park();
     assert_eq!(reason, Some(WakeReason::NicMsix), "no deadline → parked forever, woken by NIC MSI-X");
     assert_eq!(r.parks(), 1);
 }
 
-// ---- the burst-safe drive: pump_all (salvaged from directpath::drive::drain) -------------------
+// ---- the burst-safe drive: pump_all (the reactor's own busy-drain) -----------------------------
 
 #[test]
 fn pump_all_busy_drains_a_backlog_with_zero_parks() {
@@ -187,7 +187,7 @@ fn pump_all_busy_drains_a_backlog_with_zero_parks() {
         Reactor::new(SessionTable::new(), FakeHost::new([]), StubRx::new(frames), CaptureSink::default());
 
     let mut consumed = 0;
-    let work = r.pump_all(|_| consumed += 1);
+    let work = r.pump_all(|_, _| consumed += 1);
 
     assert_eq!(consumed, K, "all K frames delivered in ONE busy-drain");
     assert_eq!(work, K, "K work units (one step per delivery)");
@@ -220,4 +220,82 @@ fn drive_one_then_park_per_delivery_is_the_defect() {
     }
     assert_eq!(consumed, K);
     assert_eq!(r.parks(), K as u32, "the DEFECT: one park PER delivery (contrast pump_all's zero)");
+}
+
+// ---- the quiescence observability accessor (ADDED, Sprint-9 Slice-2 facade transition) ----------
+
+#[test]
+fn quiescent_reflects_pending_and_in_flight() {
+    // The one-directional-burst pacing signal `quiescent()` — no held delivery AND no sender in flight.
+    // Expected values are derived from the reactor's real pending/next_deadline behavior, not hand-computed.
+    let mut r = Reactor::new(
+        SessionTable::new(),
+        FakeHost::new([]),
+        StubRx::new([inbound(7, b"data")]),
+        CaptureSink::default(),
+    );
+    assert!(r.quiescent(), "fresh: no session, no held delivery → quiescent");
+    assert!(r.step(), "process the inbound receiver frame → a delivery is held");
+    assert!(!r.quiescent(), "a held delivery → NOT quiescent (back-pressure engaged)");
+    assert!(r.take_delivery().is_some());
+    assert!(r.quiescent(), "delivery consumed, no sender in flight → quiescent again");
+
+    // An originated (unacked) sender arms a retransmit deadline → NOT quiescent until it is ACKed.
+    r.originate(b"payload");
+    assert!(!r.quiescent(), "an in-flight unacked sender (armed deadline) → NOT quiescent");
+}
+
+// ---- per-delivery session demux (ADDED, Sprint-9 Slice-2 Delivered(SessionId, payload) ruling) ---------
+
+#[test]
+fn delivers_each_session_id_with_its_payload() {
+    // Two concurrent inbound sessions must each be delivered keyed to its OWN transport-computed SessionId
+    // (the multiplexed-demux the earlier `Delivery { payload, .. }` drop could not express). Expected values
+    // are read from the real (session, payload) pairs the reactor produces, not hand-computed.
+    let mut r = Reactor::new(
+        SessionTable::new(),
+        FakeHost::new([]),
+        StubRx::new([inbound(10, b"alpha"), inbound(20, b"bravo")]),
+        CaptureSink::default(),
+    );
+    let mut got: Vec<(SessionId, Vec<u8>)> = Vec::new();
+    let work = r.pump_all(|session, payload| got.push((session, payload)));
+
+    assert_eq!(work, 2, "both inbound frames drained");
+    assert_eq!(got.len(), 2, "both sessions delivered");
+    assert_eq!(got[0], (SessionId(10), b"alpha".to_vec()), "first delivery keyed to session 10");
+    assert_eq!(got[1], (SessionId(20), b"bravo".to_vec()), "second delivery keyed to session 20");
+}
+
+// ---- multi-frame session continuation (ADDED, Sprint-9 open/send split) -------------------------
+
+#[test]
+fn multi_frame_stream_continues_on_one_session() {
+    // open() (originate) emits frame 1; a continuation while frame 1 is in flight is WouldBlock
+    // (stop-and-wait, ≤1); after the ACK, send_on_session(id, ..) streams frame 2 on the SAME session.
+    // Expected values are read from the real emitted frames (both decode to the one session id + payloads),
+    // not hand-computed. (Same-session continuation is collision-safe under the shared allocator — one
+    // originator; the both-originate model needs the Task-15 originator-partition, not built.)
+    let mut r = Reactor::new(
+        SessionTable::new(),
+        FakeHost::new([]),
+        StubRx::new([inbound(0, b"")]), // the bare ACK for session 0 (the first-opened session)
+        CaptureSink::default(),
+    );
+    let id = r.originate(b"frame-1");
+    assert_eq!(id, SessionId(0), "first opened session id");
+    assert_eq!(
+        r.send_on_session(id, b"frame-2"),
+        Err(SendError::WouldBlock),
+        "a continuation while frame 1 is in flight is refused (stop-and-wait)"
+    );
+    assert!(r.step(), "the ACK for session 0 is processed → frame 1 released");
+    assert_eq!(r.send_on_session(id, b"frame-2"), Ok(()), "with frame 1 ACKed, the continuation streams");
+
+    let emitted = &r.sink().emitted;
+    assert_eq!(emitted.len(), 2, "two data frames emitted: frame 1 + the continuation");
+    let f1 = decode_frame(&emitted[0]).expect("frame 1 decodes");
+    let f2 = decode_frame(&emitted[1]).expect("frame 2 decodes");
+    assert_eq!((f1.session, f1.payload), (SessionId(0), b"frame-1".as_slice()), "frame 1 on session 0");
+    assert_eq!((f2.session, f2.payload), (SessionId(0), b"frame-2".as_slice()), "frame 2 on the SAME session 0");
 }

@@ -9,8 +9,8 @@
 //! Every op takes the `Allowed` token minted by `gate()`; the production BDF is never a target (it fails
 //! the gate). Observed→expected throughout; self-pinning banner for re-derivation.
 
-use directpath::gate::{gate, Bdf, Decision};
-use directpath::{mem, pci};
+use directpath::internals::gate::{gate, Bdf, Decision};
+use directpath::internals::{mem, pci};
 use std::fs;
 use std::os::unix::fs::FileExt;
 use std::process::ExitCode;

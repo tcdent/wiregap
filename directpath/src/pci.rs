@@ -76,9 +76,13 @@ impl Bar0 {
         // host RAM.
         unsafe { std::ptr::write_volatile(self.ptr.add(offset) as *mut u32, value) }
     }
+    // Bench-only: the harness prints the mapped BAR0 length; the shipped path derives offsets from the
+    // typed accessors, never the raw length. (`is_empty` is the required clippy companion of `len`.)
+    #[cfg(feature = "bench")]
     pub fn len(&self) -> usize {
         self.len
     }
+    #[cfg(feature = "bench")]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -117,4 +121,37 @@ pub fn map_resource0(t: &Allowed) -> io::Result<Bar0> {
         return Err(io::Error::last_os_error());
     }
     Ok(Bar0 { ptr: ptr as *mut u8, len })
+}
+
+#[cfg(test)]
+mod integration_tests {
+//! Fold #2 (re-fixed) — the BAR0 dword-access bound is overflow-safe AND rejects len<4. Host-proven
+//! non-vacuously (the previous `saturating_sub(4)` regressed len<4 to an OOB read).
+
+use super::dword_in_bounds;
+
+#[test]
+fn dword_bound_accepts_only_wholly_in_range() {
+    // Real BAR0 (512 KiB) — a valid register offset.
+    assert!(dword_in_bounds(0x0, 0x80000));
+    assert!(dword_in_bounds(0x042a4, 0x80000)); // LINKS
+    assert!(dword_in_bounds(0x7fffc, 0x80000), "last valid dword (offset+4 == len)");
+    assert!(!dword_in_bounds(0x7fffd, 0x80000), "offset+4 > len → out");
+    assert!(!dword_in_bounds(0x80000, 0x80000), "offset == len → out");
+}
+
+#[test]
+fn dword_bound_rejects_len_below_4_no_oob() {
+    // The regression the re-fix closes: for len in 0..3, saturating_sub(4)==0 let offset 0 through.
+    for len in 0..4usize {
+        assert!(!dword_in_bounds(0, len), "len={len} (<4) must reject a 4-byte access at offset 0");
+    }
+    assert!(dword_in_bounds(0, 4), "len==4 admits exactly one dword at offset 0");
+}
+
+#[test]
+fn dword_bound_is_overflow_safe() {
+    assert!(!dword_in_bounds(usize::MAX, 0x80000), "offset+4 overflows → reject, not wrap");
+    assert!(!dword_in_bounds(usize::MAX - 3, usize::MAX), "near-max offset overflows → reject");
+}
 }

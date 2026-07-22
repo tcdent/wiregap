@@ -12,12 +12,12 @@
 //!
 //! Run: `sudo ./slice4` (unbind / BAR mmap / DMA / pagemap need root).
 
-use directpath::datapath::{self, Layout};
-use directpath::gate::{Allowed, Bdf, Decision, gate};
-use directpath::gate2::validate_physaddr;
-use directpath::link::{LinkRestart, apply_restart, link_state, reset_and_init};
-use directpath::mem::{self, Hugepage};
-use directpath::pci::{self, Bar0};
+use directpath::internals::datapath::{self, Layout};
+use directpath::internals::gate::{Allowed, Bdf, Decision, gate};
+use directpath::internals::gate2::validate_physaddr;
+use directpath::internals::link::{LinkRestart, apply_restart, link_state, reset_and_init};
+use directpath::internals::mem::{self, Hugepage};
+use directpath::internals::pci::{self, Bar0};
 use driver::{RxPath, RxRing, TxRing};
 use std::io::{self, Read};
 use std::time::{Duration, Instant};

@@ -4,22 +4,22 @@
 //! `41:00.0 ↔ 63:00.0`, pure-direct, no IOMMU. 41 originates a session (unique-nonce payload); 63's
 //! reactor RX-demuxes it, the session reacts inline (delivers the payload up + returns a bare ACK); 41's
 //! reactor receives + accepts the ACK. The frozen reactor algorithm + transport + guard/copy-boundary
-//! drive it; only the backing is new: the event-driven `Host` ([`directpath::ddwaithost`]) and the Ethernet
-//! encap/decap ([`directpath::ethframe`]) behind the reactor's seams.
+//! drive it; only the backing is new: the event-driven `Host` (`directpath::internals::ddwaithost`) and the
+//! Ethernet encap/decap (`directpath::internals::ethframe`) behind the reactor's seams.
 //!
 //! Safety spine (unchanged): every state-change takes an `Allowed(Bdf)` token minted only by the gate for
 //! the bench cards; production `61:00.0` is never touched; one Gate-2-validated 2 MiB hugepage backs both
 //! cards as offsets. Reversible: both cards rebound to ixgbe at the end. Run: `sudo ./s7_slice1`.
 
-use directpath::datapath::{self, Layout};
-use directpath::ethframe::{EthSink, EthSource};
-use directpath::gate::{Allowed, Bdf, Decision, gate};
-use directpath::gate2::validate_physaddr;
-use directpath::link::{LinkRestart, apply_restart, link_state, reset_and_init};
-use directpath::mem::{self, Hugepage};
-use directpath::pci::{self, Bar0};
-use directpath::ddwaithost::DdWaitHost;
-use directpath::mwaitx::rdtsc;
+use directpath::internals::datapath::{self, Layout};
+use directpath::internals::ethframe::{EthSink, EthSource};
+use directpath::internals::gate::{Allowed, Bdf, Decision, gate};
+use directpath::internals::gate2::validate_physaddr;
+use directpath::internals::link::{LinkRestart, apply_restart, link_state, reset_and_init};
+use directpath::internals::mem::{self, Hugepage};
+use directpath::internals::pci::{self, Bar0};
+use directpath::internals::ddwaithost::DdWaitHost;
+use directpath::internals::mwaitx::rdtsc;
 use driver::{RxPath, RxRing, TxPath, VolatileRxRing, VolatileTxRing};
 use reactor::{Reactor, RxDrainAsSource};
 use std::io::{self, Read};
@@ -211,7 +211,7 @@ fn round_trip(tok41: &Allowed, tok63: &Allowed) -> io::Result<()> {
     let start = Instant::now();
     let delivered = loop {
         let mut got = None;
-        reactor_63.pump_all(|p| got = Some(p)); // busy-drain (no park while frames present, §3)
+        reactor_63.pump_all(|_s, p| got = Some(p)); // busy-drain (no park while frames present, §3)
         if let Some(p) = got {
             break p;
         }

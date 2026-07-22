@@ -12,23 +12,26 @@
 //! [`reactor::RxDrain`]), the **TX path** ([`TxPath`], implementing `transport::TransmitSink`) with the
 //! reclamation split + infallible drop-on-full `emit`, and the **confined real-volatile DMA rings**
 //! ([`VolatileRxRing`]/[`VolatileTxRing`] in [`dma`]) — thin volatile reads, zero guard logic, each
-//! `unsafe` block locally sound; their **crossing soundness stays an open, bench-gated hazard**
-//! (`concerns-to-watch.md`), exercised only on the prototype cards. The no-NIC E4 integration
+//! `unsafe` block locally sound; their **crossing soundness has a 7b-verified account**
+//! (`grounding/crossing-soundness.md`): the device-write→our-memory ordering (RX-read `DD`-acquire;
+//! TX-write release-before-the-doorbell) is a reasoning artifact certified against the 82599 datasheet +
+//! PCIe/SDM — **platform-scoped-sound**, with the remaining residuals tracked in `concerns-to-watch.md`.
+//! The rings run on the real bench 82599 (Sprints 6–8); the no-NIC E4 integration
 //! (`tests/e4_integration.rs`) drives the real reactor + the sim rings + the transport.
 //!
 //! ## `unsafe` confinement (deny + allow, the Sprint-2 pattern)
 //!
 //! The crate root is `#![deny(unsafe_code)]`; the one [`dma`] module re-`#![allow(unsafe_code)]` for the
-//! Slice-4 real-volatile ring. In Slice 1 the sim ring ([`sim`]) is **safe Rust** and `dma` is an empty
-//! placeholder — the confinement boundary is established now; the unsafe arrives in Slice 4.
+//! real-volatile rings, while the sim ring ([`sim`]) stays **safe Rust** — the `unsafe` is compile-confined
+//! to `dma` (deny at the root, allow only there).
 //!
 //! ## The seam is drawn ABOVE the guards
 //!
 //! [`RxRing`] exposes the **raw, untrusted** device-written fields *up* (`reported_len`, `status`) to
 //! the shared guard logic in [`RxPath`]; the only *down*-call is a **bounded-length** copy
 //! ([`RxRing::copy_out`], handed `min(reported, BUF)`). So an over-read is unsayable even in the real
-//! impl, and the guards are hostile-testable in software via [`sim::SimRxRing`]. The real ring (Slice 4)
-//! will be a thin volatile read with **zero** guard logic.
+//! impl, and the guards are hostile-testable in software via [`sim::SimRxRing`]. The real ring ([`dma`])
+//! is a thin volatile read with **zero** guard logic.
 
 mod dma;
 mod rx;

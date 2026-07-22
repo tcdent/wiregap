@@ -76,7 +76,7 @@ pub enum LinkRestart {
     None,
     /// `AUTOC.Restart_AN` — restart auto-negotiation.
     RestartAn,
-    /// The pipeline reset — write AUTOC with LMS[2] toggled + Restart_AN, then the original LMS.
+    /// The pipeline reset — write AUTOC with `LMS[2]` toggled + Restart_AN, then the original LMS.
     ResetPipeline,
 }
 
@@ -102,6 +102,9 @@ pub fn apply_restart(bar: &Bar0, form: LinkRestart) {
 pub struct LinkState {
     pub up: bool,
     pub speed_10g: bool,
+    /// The raw LINKS register — a debug/introspection field the bench harness prints; populated in all
+    /// builds, read only by the harness.
+    #[allow(dead_code)]
     pub links_raw: u32,
 }
 

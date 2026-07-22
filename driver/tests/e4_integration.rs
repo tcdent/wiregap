@@ -51,7 +51,7 @@ fn full_stack_inbound_frame_delivers_up_and_acks_out() {
 
     // The inbound frame bubbled to its session and was delivered up (the fresh reactor holds the payload;
     // the consumer takes it, releasing back-pressure).
-    assert_eq!(reactor.take_delivery().as_deref(), Some(b"hi".as_slice()), "payload delivered up");
+    assert_eq!(reactor.take_delivery().map(|(_, p)| p).as_deref(), Some(b"hi".as_slice()), "payload delivered up");
 
     // The receiver's bare ACK went out through the driver's TX seam: the 8-byte big-endian session id,
     // empty payload — `[00 00 00 00 00 00 00 05]`.

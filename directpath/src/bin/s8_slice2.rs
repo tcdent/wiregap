@@ -1,130 +1,68 @@
 #![deny(unsafe_code)]
 
-//! **Sprint 8 Slice 2 — the event-driven DdWaitHost wired into the reactor** over the live DAC
-//! `41:00.0 ↔ 63:00.0`, pure-direct, no IOMMU. The reactor now parks on the proven MWAITX-on-DD wake
-//! mechanism ([`directpath::ddwaithost::DdWaitHost`], Slice 1) instead of the bounded-poll sleep — the
-//! reactor CORE + the `Host` seam are unchanged; only the backing Host impl swaps.
+//! **Sprint 9 Slice 2 — the SHIPPED facade, two-instance conservation re-run** over the live DAC
+//! `41:00.0 ↔ 63:00.0`, pure-direct, no IOMMU. This is the primary outcome-conservation re-run for the
+//! facade transition: it drives the shipped [`directpath::Subsystem`] `construct` / `run` / `send` on BOTH
+//! ends (box-role on 41, proxy-role on 63, each `run()` in its own thread — the box↔proxy topology), so the
+//! numbers bind to the exact facade bytes, NOT a parallel harness loop.
 //!
-//! Two measurements against the reviewer's Slice-2 gate:
-//! - **Idle-wakeup latency:** stop-and-wait round-trip RTT, event-driven, vs the s7 bounded-poll baseline
-//!   (~50–260 µs; mean RTT ~261 µs). The wire is ~µs, so event-driven should drop toward it.
-//! - **Adjacent-line drain UNDER LOAD + re-arm across a ring-wrap:** K concurrent sessions burst onto the
-//!   RX ring so multiple frames land on one 64-byte descriptor line and the busy-drain reclaims them in one
-//!   pass, across >1 full ring-wrap (the RX-RDT re-arm zone) — byte-equal, no loss, 0 spurious retransmit.
+//! ONE-DIRECTIONAL workload (the faithful conservation of the original storm traffic — peak in-flight = K):
+//! the box originates, the proxy receives + auto-ACKs + collects. (The transport itself supports
+//! both-originate; this harness drives one direction to preserve the storm's gate invariants.) Phase 1
+//! measures the send→ACK RTT by pacing on `Ctx::is_quiescent` (a bench-only completion bool); phase 2 is the
+//! one-directional K-burst storm (peak in-flight = K). The facade `run()` hands the handler an OWNED `Vec` per delivery
+//! (the copy-boundary), never an ACK. The Sprint-9 Fork-1 conserved ledger:
+//! - CONSERVED — send→ACK RTT + throughput (via is_quiescent), idle-wakeup (every actual NIC park→wake,
+//!   measured INSIDE `run()`: the sub-tick make-or-break floor + the median band), and the correctness
+//!   outcomes (byte-equal delivery, device RXMPC0=0 / GPRC). The two-thread box↔proxy topology runs faster
+//!   than the original single-thread loopback, so RTT/idle-wakeup values are lower (same metric kind).
+//! - The R2 delivery-side dispatch sentinel gives the callback indirection a number (proxy-side).
 //!
 //! Safety: gate-minted `Allowed` for 41/63 only; production `61:00.0` never touched; reversible.
-//! Run: `sudo ./s8_slice2`.
+//! Run (built with `--features bench`): `sudo ./s8_slice2`.
 
-use directpath::datapath::{self, Layout};
-use directpath::ddwaithost::DdWaitHost;
-use directpath::ethframe::{EthSink, EthSource};
-use directpath::gate::{gate, Allowed, Bdf, Decision};
-use directpath::gate2::validate_physaddr;
-use directpath::link::{apply_restart, link_state, reset_and_init, LinkRestart};
-use directpath::mem::{self, Hugepage};
-use directpath::mwaitx::rdtsc;
-use directpath::pci::{self, Bar0};
-use driver::{RxPath, RxRing, TxPath, VolatileRxRing, VolatileTxRing};
-use reactor::{Reactor, RxDrainAsSource};
+use directpath::harness::{err, payload_of, pct, read_nonce, well_formed};
+use directpath::internals::gate::Bdf;
+use directpath::{Ctx, Event, Subsystem};
 use std::collections::BTreeSet;
-use std::io::{self, Read};
-use std::time::{Duration, Instant};
-use transport::SessionTable;
+use std::io;
+use std::ops::ControlFlow;
+use std::time::Instant;
 
 const BENCH_41: &str = "0000:41:00.0";
 const BENCH_63: &str = "0000:63:00.0";
-const NONCE_LEN: usize = 8;
-const PAYLOAD_LEN: usize = 24;
 const RTT_N: usize = 200;
 const STORM_K: usize = 32;
-const STORM_ROUNDS: usize = 4; // 32*4 = 128 frames = 2 full ring-wraps (depth 64)
-const POLL_BASELINE_US: f64 = 261.0; // s7 bounded-poll mean RTT (historical baseline)
+const STORM_ROUNDS: usize = 4; // 32*4 = 128 frames = 2 full ring-wraps (depth 64), each way
+const BOX_CORE: usize = 4;
+const PROXY_CORE: usize = 6;
+/// Per-drive inactivity guard: if no progress for this long, a hardware stall is surfaced as an error
+/// (checked on the Idle tick) instead of hanging `run()` forever.
+const STALL: std::time::Duration = std::time::Duration::from_secs(10);
 
-type LiveSink = EthSink<TxPath<VolatileTxRing>>;
-type LiveSource = EthSource<RxDrainAsSource<RxPath<VolatileRxRing>>>;
-type LiveReactor = Reactor<DdWaitHost, LiveSource, LiveSink>;
-
-fn err(m: impl Into<String>) -> io::Error {
-    io::Error::other(m.into())
+/// What the box thread reports back after its two phases.
+struct BoxReport {
+    rtts_us: Vec<f64>,
+    tp_elapsed_s: f64,
+    idle_wakeup_us: Vec<f64>,
+    dispatch_us: Vec<f64>,
 }
 
-fn read_config(bdf: &Bdf) -> io::Result<Vec<u8>> {
-    let mut f = std::fs::File::open(format!("/sys/bus/pci/devices/{}/config", bdf.sysfs()))?;
-    let mut buf = vec![0u8; 0x40];
-    f.read_exact(&mut buf)?;
-    Ok(buf)
-}
-
-fn gate_bench(bdf: Bdf, allow: &[Bdf]) -> io::Result<Allowed> {
-    let cfg = read_config(&bdf)?;
-    match gate(bdf, allow, &cfg) {
-        Decision::Allow(t) => Ok(t),
-        Decision::Refuse(r) => Err(err(format!("gate REFUSED {}: {r:?}", bdf.sysfs()))),
-    }
-}
-
-fn bring_up_link(bar: &Bar0, name: &str) -> io::Result<()> {
-    if !reset_and_init(bar).ok() {
-        return Err(err(format!("{name}: reset/init incomplete")));
-    }
-    for form in [LinkRestart::None, LinkRestart::RestartAn, LinkRestart::ResetPipeline] {
-        apply_restart(bar, form);
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(4) {
-            let ls = link_state(bar);
-            if ls.up && ls.speed_10g {
-                println!("  {name}: link UP 10G ({form:?})");
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-    Err(err(format!("{name}: link did not come up 10G")))
-}
-
-/// Bring up one card's TX+RX and wire the DdWaitHost-driven reactor.
-fn build_reactor(bar: &Bar0, layout: &Layout, own_mac: [u8; 6], peer_mac: [u8; 6], tsc_hz: f64, name: &str) -> io::Result<LiveReactor> {
-    if !datapath::init_tx(bar, layout) {
-        return Err(err(format!("{name}: TXDCTL.ENABLE did not read back")));
-    }
-    datapath::init_rx(bar, layout);
-    datapath::clear_rx_buffers(layout);
-    let tx_ring = datapath::build_tx_ring(bar, layout);
-    let mut rx_ring = datapath::build_rx_ring(bar, layout);
-    if !datapath::start_rx(bar, layout) {
-        return Err(err(format!("{name}: RXDCTL.ENABLE did not read back")));
-    }
-    for slot in 0..datapath::DEPTH {
-        rx_ring.refill(slot); // arm ALL depth slots (steady-state re-arm; the wrap path)
-    }
-    let sink = EthSink::new(TxPath::new(tx_ring), peer_mac, own_mac);
-    let source = EthSource::new(RxDrainAsSource::new(RxPath::new(rx_ring)));
-    let host = DdWaitHost::new(layout.rx_desc_base_va(), datapath::rx_tail_ptr(bar), datapath::DEPTH, tsc_hz, 5.0);
-    println!("  {name}: TX+RX armed, reactor wired on DdWaitHost (event-driven MWAITX-on-DD)");
-    Ok(Reactor::new(SessionTable::new(), host, source, sink))
-}
-
-fn read_nonce() -> io::Result<[u8; NONCE_LEN]> {
-    let mut f = std::fs::File::open("/dev/urandom")?;
-    let mut n = [0u8; NONCE_LEN];
-    f.read_exact(&mut n)?;
-    Ok(n)
-}
-
-fn payload_of(nonce: &[u8; NONCE_LEN]) -> Vec<u8> {
-    let mut p = Vec::with_capacity(PAYLOAD_LEN);
-    p.extend_from_slice(nonce);
-    p.extend_from_slice(&[0x5A; PAYLOAD_LEN - NONCE_LEN]);
-    p
-}
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join("")
+/// What the proxy thread reports back.
+struct ProxyReport {
+    delivered: BTreeSet<Vec<u8>>,
+    total_deliveries: usize,
+    foreign: bool,
+    rxmpc0: u32,
+    gprc: u32,
+    malformed: u32,
+    idle_wakeup_us: Vec<f64>,
+    dispatch_us: Vec<f64>,
 }
 
 fn main() {
     match run() {
-        Ok(()) => println!("\n=== SLICE 2: EVENT-DRIVEN REACTOR PROVEN ==="),
+        Ok(()) => println!("\n=== SLICE 2: SHIPPED-FACADE TWO-INSTANCE CONSERVATION PROVEN ==="),
         Err(e) => {
             eprintln!("\n=== SLICE 2 FAILED: {e} ===");
             std::process::exit(1);
@@ -133,177 +71,278 @@ fn main() {
 }
 
 fn run() -> io::Result<()> {
-    // Self-declared provenance: the bin-sha is this RUNNING binary's /proc/self/exe hash, so every number
-    // below binds to the exact delivered bytes (no shell-computed-hash drift).
+    // Self-declared provenance: binds every number below to THIS running binary's bytes (the shipped facade).
     println!("{}\n", benchtools::Provenance::capture().header("s8_slice2"));
-    benchtools::affinity::pin(4)?;
-    // TSC calibration (invariant/nonstop TSC) for the DdWaitHost deadline conversion.
-    let a = rdtsc();
-    std::thread::sleep(Duration::from_millis(200));
-    let tsc_hz = (rdtsc() - a) as f64 / 0.2;
-    println!("TSC = {:.3} GHz", tsc_hz / 1e9);
 
     let bdf41 = Bdf::parse(BENCH_41).ok_or_else(|| err("bad BDF 41"))?;
     let bdf63 = Bdf::parse(BENCH_63).ok_or_else(|| err("bad BDF 63"))?;
     let allow = [bdf41, bdf63];
-    let tok41 = gate_bench(bdf41, &allow)?;
-    let tok63 = gate_bench(bdf63, &allow)?;
-    println!("gate: ALLOW {} and {}", bdf41.sysfs(), bdf63.sysfs());
-    let drv41 = pci::current_driver(&tok41).unwrap_or_else(|| "ixgbe".into());
-    let drv63 = pci::current_driver(&tok63).unwrap_or_else(|| "ixgbe".into());
-    pci::unbind(&tok41)?;
-    pci::unbind(&tok63)?;
 
-    let result = drive(&tok41, &tok63, tsc_hz);
+    // Pre-generate all payloads OUTSIDE the timed region (urandom off the hot path).
+    let rtt_payloads: Vec<Vec<u8>> =
+        (0..RTT_N).map(|_| read_nonce().map(|n| payload_of(&n))).collect::<io::Result<_>>()?;
+    let storm_payloads: Vec<Vec<u8>> = (0..STORM_K * STORM_ROUNDS)
+        .map(|_| read_nonce().map(|n| payload_of(&n)))
+        .collect::<io::Result<_>>()?;
+    let storm_sent: BTreeSet<Vec<u8>> = storm_payloads.iter().cloned().collect();
+    let grand_total = RTT_N + STORM_K * STORM_ROUNDS;
 
-    let r41 = pci::rebind(&tok41, &drv41);
-    let r63 = pci::rebind(&tok63, &drv63);
-    println!("rebind {}: {:?}; rebind {}: {:?}", bdf41.sysfs(), r41.is_ok(), bdf63.sysfs(), r63.is_ok());
-    result?;
-    r41?;
-    r63?;
-    Ok(())
+    let (box_r, proxy_r) = directpath::harness::two_facade(
+        bdf41,
+        bdf63,
+        &allow,
+        BOX_CORE,
+        PROXY_CORE,
+        // ---- BOX (41): one-directional throughout. Phase 1 send→ACK RTT (paced on quiescence), then the
+        // phase 2 burst storm; the box originates, the proxy only receives + auto-ACKs (sole allocator). ----
+        move |mut sys: Subsystem| -> io::Result<BoxReport> {
+            // === PHASE 1: N send→ACK round-trips. RTT = send → quiescent (the ACK arrived, next_deadline
+            // None). One-directional: the box receives only (hidden) ACKs, never a delivery. ===
+            let mut rtts_us: Vec<f64> = Vec::with_capacity(RTT_N);
+            let mut done = 0usize;
+            let mut unexpected = false;
+            let mut stalled = false;
+            let mut last_ack = Instant::now();
+            let tp0 = Instant::now();
+            let mut sent_at = Instant::now();
+            sys.open(&rtt_payloads[0]);
+            sys.run(|ctx: &mut Ctx, ev: Event| match ev {
+                Event::Delivered(..) => {
+                    unexpected = true; // a delivery on the box would mean the proxy originated (defect)
+                    ControlFlow::Break(())
+                }
+                Event::Idle => {
+                    if ctx.is_quiescent() {
+                        // The current send has been ACKed → record the round-trip and fire the next.
+                        rtts_us.push(sent_at.elapsed().as_nanos() as f64 / 1000.0);
+                        last_ack = Instant::now();
+                        done += 1;
+                        if done >= RTT_N {
+                            ControlFlow::Break(())
+                        } else {
+                            sent_at = Instant::now();
+                            ctx.open(&rtt_payloads[done]);
+                            ControlFlow::Continue(())
+                        }
+                    } else if last_ack.elapsed() > STALL {
+                        stalled = true;
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                }
+            });
+            let tp_elapsed_s = tp0.elapsed().as_secs_f64();
+            if stalled {
+                eprintln!(
+                    "[box] STALL diag: GPTC(tx)={} GPRC(rx)={} RXMPC0={}",
+                    sys.counter(directpath::internals::datapath::GPTC),
+                    sys.counter(directpath::internals::datapath::GPRC),
+                    sys.counter(directpath::internals::datapath::RXMPC0)
+                );
+                return Err(err(format!("phase 1 STALLED after {done}/{RTT_N} round-trips (no ACK — frame not flowing)")));
+            }
+            if unexpected {
+                return Err(err("phase 1: box received a delivery (proxy must not originate — sole allocator)"));
+            }
+
+            // === PHASE 2: STORM_ROUNDS bursts of K ONE-DIRECTIONAL sessions (adjacent-line drain + re-arm).
+            // One-directional (peak in-flight = K <= ring depth) is the faithful storm: an echo would put
+            // ~2K in flight (ACK + echo per request) and overrun. The box is a silent sender here — it
+            // paces rounds on the Idle tick, bursting the next round once the current is fully ACKed. ===
+            let mut unexpected = false;
+            let mut stalled2 = false;
+            let mut last_round = Instant::now();
+            for p in &storm_payloads[0..STORM_K] {
+                sys.open(p); // prime round 0's K requests → K frames burst onto the proxy's ring
+            }
+            let mut round = 1usize;
+            sys.run(|ctx: &mut Ctx, ev: Event| match ev {
+                // One-directional: the box sees only (hidden) ACKs; a delivery here would be a defect.
+                Event::Delivered(..) => {
+                    unexpected = true;
+                    ControlFlow::Break(())
+                }
+                Event::Idle => {
+                    if !ctx.is_quiescent() {
+                        if last_round.elapsed() > STALL {
+                            stalled2 = true;
+                            return ControlFlow::Break(());
+                        }
+                        return ControlFlow::Continue(()); // current round still has frames in flight
+                    }
+                    last_round = Instant::now(); // a round completed (fully ACKed) — progress
+                    if round < STORM_ROUNDS {
+                        let base = round * STORM_K;
+                        for p in &storm_payloads[base..base + STORM_K] {
+                            ctx.open(p);
+                        }
+                        round += 1;
+                        ControlFlow::Continue(())
+                    } else {
+                        ControlFlow::Break(()) // all rounds sent AND fully ACKed
+                    }
+                }
+            });
+            if stalled2 {
+                return Err(err(format!("phase 2 STALLED at round {round}/{STORM_ROUNDS} (a burst never fully ACKed)")));
+            }
+            if unexpected {
+                return Err(err("phase 2: box received an unexpected delivery (storm must be one-directional)"));
+            }
+
+            Ok(BoxReport {
+                rtts_us,
+                tp_elapsed_s,
+                idle_wakeup_us: sys.idle_wakeups_us().to_vec(),
+                dispatch_us: sys.dispatch_us().to_vec(),
+            })
+        },
+        // ---- PROXY (63): receive + auto-ACK + collect the delivered set (never originates) ----
+        move |mut sys: Subsystem| -> io::Result<ProxyReport> {
+            let mut delivered: BTreeSet<Vec<u8>> = BTreeSet::new();
+            let mut total = 0usize;
+            let mut foreign = false;
+            let mut pstalled = false;
+            let mut last = Instant::now();
+            sys.run(|_ctx: &mut Ctx, ev: Event| {
+                let req = match ev {
+                    Event::Delivered(_, p) => {
+                        last = Instant::now();
+                        p
+                    }
+                    Event::Idle => {
+                        if last.elapsed() > STALL {
+                            pstalled = true;
+                            return ControlFlow::Break(());
+                        }
+                        return ControlFlow::Continue(());
+                    }
+                };
+                total += 1;
+                if !well_formed(&req) {
+                    foreign = true;
+                    return ControlFlow::Break(());
+                }
+                delivered.insert(req); // the transport auto-ACKs; we only collect
+                if total >= grand_total {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            });
+            if pstalled {
+                eprintln!(
+                    "[proxy] STALL diag: GPRC(rx)={} RXMPC0={} GPTC(tx)={}",
+                    sys.counter(directpath::internals::datapath::GPRC),
+                    sys.counter(directpath::internals::datapath::RXMPC0),
+                    sys.counter(directpath::internals::datapath::GPTC)
+                );
+                return Err(err(format!("proxy STALLED after {total} deliveries (box not sending / frames lost)")));
+            }
+            Ok(ProxyReport {
+                delivered,
+                total_deliveries: total,
+                foreign,
+                rxmpc0: sys.counter(directpath::internals::datapath::RXMPC0),
+                gprc: sys.counter(directpath::internals::datapath::GPRC),
+                malformed: sys.malformed(),
+                idle_wakeup_us: sys.idle_wakeups_us().to_vec(),
+                dispatch_us: sys.dispatch_us().to_vec(),
+            })
+        },
+    )?;
+
+    report(&box_r, &proxy_r, &storm_sent, grand_total)
 }
 
-fn drive(tok41: &Allowed, tok63: &Allowed, tsc_hz: f64) -> io::Result<()> {
-    pci::enable_bus_master(tok41)?;
-    pci::enable_bus_master(tok63)?;
-    let bar41 = pci::map_resource0(tok41)?;
-    let bar63 = pci::map_resource0(tok63)?;
-    bring_up_link(&bar41, "41")?;
-    bring_up_link(&bar63, "63")?;
-    let mac41 = datapath::read_mac(&bar41);
-    let mac63 = datapath::read_mac(&bar63);
-    println!("MAC 41 = {}  MAC 63 = {}", hex(&mac41), hex(&mac63));
-
-    let hp: Hugepage = mem::alloc()?;
-    let split = Layout::used_bytes();
-    validate_physaddr(hp.va(), hp.phys(), hp.size() as u64)
-        .map_err(|e| err(format!("Gate 2 REFUSED the hugepage: {e:?}")))?;
-    let layout_41 = Layout::new(hp.va(), hp.phys());
-    let layout_63 = Layout::new(hp.va() + split as u64, hp.phys() + split as u64);
-    datapath::preinit_desc_rings(&layout_41);
-    datapath::preinit_desc_rings(&layout_63);
-
-    let mut r41 = build_reactor(&bar41, &layout_41, mac41, mac63, tsc_hz, "41")?;
-    let mut r63 = build_reactor(&bar63, &layout_63, mac63, mac41, tsc_hz, "63")?;
-    let _ = datapath::read_counter(&bar63, datapath::RXDGPC);
-
-    // === PHASE 1: idle-wakeup latency (event-driven stop-and-wait RTT) vs the poll baseline ===
-    println!("\n--- PHASE 1: idle-wakeup latency, {RTT_N} event-driven stop-and-wait round-trips ---");
-    let mut rtts_us: Vec<f64> = Vec::with_capacity(RTT_N);
-    let mut park_us: Vec<f64> = Vec::new(); // direct idle-wakeup latency: park -> DD-store wake
-    for _ in 0..RTT_N {
-        let nonce = read_nonce()?;
-        let payload = payload_of(&nonce);
-        let t0 = Instant::now();
-        r41.originate(&payload);
-        // 63: event-driven wait for the data, deliver + ACK (the reactor parks on DdWaitHost when idle).
-        let mut got: Option<Vec<u8>> = None;
-        let start = Instant::now();
-        while got.is_none() {
-            r63.pump_all(|p| got = Some(p));
-            if got.is_some() {
-                break;
-            }
-            let p0 = Instant::now();
-            r63.park(); // DdWaitHost::block — event-driven wait on the DD store
-            park_us.push(p0.elapsed().as_nanos() as f64 / 1000.0);
-            if start.elapsed() > Duration::from_secs(2) {
-                return Err(err("63 did not deliver (phase 1)"));
-            }
-        }
-        if got.as_deref() != Some(payload.as_slice()) {
-            return Err(err("phase 1: payload mismatch"));
-        }
-        // 41: event-driven wait for the returning ACK.
-        let start = Instant::now();
-        loop {
-            if r41.pump_all(|_| {}) > 0 {
-                break; // the ACK was processed
-            }
-            r41.park();
-            if start.elapsed() > Duration::from_millis(100) {
-                return Err(err("41 did not receive the ACK (phase 1)"));
-            }
-        }
-        rtts_us.push(t0.elapsed().as_nanos() as f64 / 1000.0);
+fn report(
+    box_r: &BoxReport,
+    proxy_r: &ProxyReport,
+    storm_sent: &BTreeSet<Vec<u8>>,
+    grand_total: usize,
+) -> io::Result<()> {
+    // ---- CORRECTNESS (conserved) ----
+    println!("--- CORRECTNESS (conserved): byte-equal delivery + device counters ---");
+    if proxy_r.foreign {
+        return Err(err("proxy received a malformed/foreign payload (corruption or demux mis-route)"));
     }
-    rtts_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mean = rtts_us.iter().sum::<f64>() / rtts_us.len() as f64;
-    let med = rtts_us[rtts_us.len() / 2];
+    if proxy_r.malformed != 0 {
+        return Err(err(format!("proxy malformed={} (corruption)", proxy_r.malformed)));
+    }
+    if proxy_r.total_deliveries != grand_total {
+        return Err(err(format!(
+            "proxy delivered {} app frames, expected {grand_total} (loss or spurious re-delivery)",
+            proxy_r.total_deliveries
+        )));
+    }
+    if !storm_sent.is_subset(&proxy_r.delivered) {
+        return Err(err("storm sent-set NOT fully delivered byte-equal (loss/corruption)"));
+    }
+    if proxy_r.rxmpc0 != 0 {
+        return Err(err(format!("proxy RXMPC0={} (RX overrun under load)", proxy_r.rxmpc0)));
+    }
     println!(
-        "  event-driven RTT: mean {mean:.1}us, median {med:.1}us, min {:.1}us, max {:.1}us  (N={RTT_N})",
-        rtts_us[0],
-        rtts_us[rtts_us.len() - 1]
+        "  {grand_total}/{grand_total} app frames delivered byte-equal (storm set complete); proxy RXMPC0={}, GPRC={}",
+        proxy_r.rxmpc0, proxy_r.gprc
     );
-    println!(
-        "  vs s7 bounded-poll baseline ~{POLL_BASELINE_US:.0}us  ->  {:.1}x lower RTT (event-driven removed the ~112us poll sleep; the ~{med:.0}us floor is the round-trip PROCESSING: transport demux + copy-boundary + ACK + 2 wire hops)",
-        POLL_BASELINE_US / mean
-    );
-    if !park_us.is_empty() {
-        park_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let pmean = park_us.iter().sum::<f64>() / park_us.len() as f64;
+
+    // ---- IDLE-WAKEUP (conserved): sub-tick floor + median band ----
+    println!("\n--- IDLE-WAKEUP latency, measured INSIDE run() (conserved) ---");
+    for (who, w) in [("proxy(63)", &proxy_r.idle_wakeup_us), ("box(41)", &box_r.idle_wakeup_us)] {
+        let mut s = w.clone();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        if s.is_empty() {
+            println!("  {who}: no NIC-driven parks recorded");
+            continue;
+        }
+        let worst = s[s.len() - 1];
+        let sub_tick = worst < 1000.0; // < 1ms: the make-or-break floor (330x gap to the ~4ms OS tick)
         println!(
-            "  DIRECT idle-wakeup latency (63 park -> DD-store wake, {} parks): mean {pmean:.1}us, median {:.1}us, min {:.1}us, max {:.1}us",
-            park_us.len(),
-            park_us[park_us.len() / 2],
-            park_us[0],
-            park_us[park_us.len() - 1]
+            "  {who}: n={} median {:.1}us p90 {:.1}us max {:.1}us  [sub-tick floor (<1ms): {}]",
+            s.len(),
+            pct(&s, 0.5),
+            pct(&s, 0.9),
+            worst,
+            if sub_tick { "HOLDS" } else { "VIOLATED" }
+        );
+        if !sub_tick {
+            return Err(err(format!("{who}: a wake was NOT sub-tick (max {worst:.1}us >= 1ms) — floor VIOLATED")));
+        }
+    }
+
+    // ---- R2 delivery-side dispatch sentinel (NEW baseline; gives the callback indirection a number) ----
+    println!("\n--- R2 delivery-side dispatch sentinel: drain-start → all-delivered-to-handler (NEW baseline) ---");
+    for (who, d) in [("proxy(63)", &proxy_r.dispatch_us), ("box(41)", &box_r.dispatch_us)] {
+        let mut s = d.clone();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        if s.is_empty() {
+            println!("  {who}: no delivering passes");
+            continue;
+        }
+        println!(
+            "  {who}: n={} median {:.2}us p90 {:.2}us worst-of-burst {:.2}us  (handler-inclusive; see note)",
+            s.len(),
+            pct(&s, 0.5),
+            pct(&s, 0.9),
+            s[s.len() - 1]
         );
     }
 
-    // === PHASE 2: adjacent-line drain UNDER LOAD + re-arm across >1 ring-wrap ===
-    println!("\n--- PHASE 2: {STORM_K} concurrent sessions x {STORM_ROUNDS} rounds ({} frames = {} ring-wraps) ---",
-        STORM_K * STORM_ROUNDS, STORM_K * STORM_ROUNDS / datapath::DEPTH);
-    let mut total_delivered = 0usize;
-    let mut total_dups = 0usize;
-    for round in 0..STORM_ROUNDS {
-        let nonces: Vec<[u8; NONCE_LEN]> = (0..STORM_K).map(|_| read_nonce()).collect::<io::Result<_>>()?;
-        let sent: BTreeSet<Vec<u8>> = nonces.iter().map(payload_of).collect();
-        for n in &nonces {
-            r41.originate(&payload_of(n));
-        }
-        // Burst is in flight: busy-drain both (pump_all reclaims all DD-ready on a line in one pass — the
-        // adjacent-line drain under load). Park in the gaps (DdWaitHost event-driven).
-        let mut delivered: BTreeSet<Vec<u8>> = BTreeSet::new();
-        let mut deliv_count = 0usize;
-        let mut acks = 0usize;
-        let start = Instant::now();
-        while delivered.len() < STORM_K || acks < STORM_K {
-            r63.pump_all(|p| {
-                deliv_count += 1;
-                delivered.insert(p);
-            });
-            acks += r41.pump_all(|_| {});
-            // still waiting on stragglers → event-driven park (whichever side is behind)
-            if delivered.len() < STORM_K {
-                r63.park();
-            } else if acks < STORM_K {
-                r41.park();
-            }
-            if start.elapsed() > Duration::from_secs(5) {
-                return Err(err(format!("round {round}: incomplete ({}/{STORM_K})", delivered.len())));
-            }
-        }
-        if delivered != sent {
-            return Err(err(format!("round {round}: delivered set != sent (loss or corruption)")));
-        }
-        total_delivered += delivered.len();
-        total_dups += deliv_count - STORM_K;
-    }
-    let rxmpc = datapath::read_counter(&bar63, datapath::RXMPC0);
-    println!("  delivered {total_delivered}/{} byte-equal (unique sets complete, no loss); retransmit-dups={total_dups}; 63 RXMPC0={rxmpc}",
-        STORM_K * STORM_ROUNDS);
-    if rxmpc != 0 {
-        return Err(err(format!("RXMPC0={rxmpc} (RX drops under load — adjacent-line/re-arm defect)")));
-    }
-    if total_dups != 0 {
-        return Err(err(format!("{total_dups} spurious retransmit-duplicates (event-driven wake missed a frame)")));
-    }
-    println!("  => adjacent-line drain under load + re-arm across {} wraps: byte-equal, 0 loss, 0 spurious retransmit.",
-        STORM_K * STORM_ROUNDS / datapath::DEPTH);
+    // ---- send→ACK RTT + throughput (CONSERVED metric via is_quiescent, one-directional; the two-thread
+    // box↔proxy topology runs faster than the original single-thread loopback, so the value differs) ----
+    println!("\n--- send→ACK RTT + throughput (CONSERVED metric; two-thread topology faster than 1-thread loopback) ---");
+    let mut rtts = box_r.rtts_us.clone();
+    rtts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mean = rtts.iter().sum::<f64>() / rtts.len() as f64;
+    let msgs_s = RTT_N as f64 / box_r.tp_elapsed_s;
+    println!(
+        "  send→ACK RTT: mean {mean:.1}us median {:.1}us min {:.1}us max {:.1}us (N={RTT_N})  (vs loopback ~138.8us)",
+        pct(&rtts, 0.5),
+        rtts[0],
+        rtts[rtts.len() - 1]
+    );
+    println!("  throughput = {msgs_s:.0} msg/s  (send→ACK; vs the loopback ~7165 msg/s)");
 
-    datapath::quiesce(&bar63);
     Ok(())
 }

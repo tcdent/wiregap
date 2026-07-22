@@ -1,10 +1,10 @@
-//! The bare-metal event reactor — the **ratified behavior built fresh**, `no_std`, NOT a port of the
+//! The single-threaded event reactor — the **ratified behavior built fresh**, `no_std`, NOT a port of the
 //! std/epoll reactor. It drives the reused `transport` (unchanged) over a **minimal two-method seam**
 //! ([`Host`]: `now` + `block`) and a frame source ([`RxSource`]) + sink (`transport::TransmitSink`). The
 //! ratified behavior, re-expressed:
 //!
-//! - **poll-then-block ordering** — [`Reactor::step`] serves one unit of work; the driver drains
-//!   (`while step() {}`) and only then [`Reactor::park`]s. Zero parks while there is work.
+//! - **busy-drain-then-block ordering** — [`Reactor::step`] serves one unit of work; the driver busy-drains
+//!   all ready work ([`Reactor::pump_all`]) and only then [`Reactor::park`]s. Zero parks while there is work.
 //! - **deadline composition** — [`arm_from_deadline`]: the *three edge-facts only*, re-typed to the
 //!   one-shot timer arm (`Option<Duration>`), NOT the epoll `i32`-ms shape.
 //! - **sole-sink-holder** — the reactor uniquely owns the `TransmitSink`; the transport emits only
@@ -14,20 +14,22 @@
 //!   app-fd `EPOLLONESHOT`.
 //!
 //! The loop is **pure** (unsafe-free, generic over the seam), so the decision logic is host-tested
-//! (`tests/reactor.rs`); the substrate side (LAPIC one-shot timer / `hlt` / MSI-X, the Slice-1..3
-//! substrate) is confined entirely in the [`Host`] *impl* (`main.rs`, bare-metal only).
+//! (`tests/reactor.rs`); the substrate side (the wait mechanism) is confined entirely in the [`Host`]
+//! *impl* — the live one is the pure-direct `DdWaitHost` (in `directpath`): **MONITORX/MWAITX on the RX
+//! descriptor `DD` line** (event-driven, no kernel interrupt), NOT a bare-metal LAPIC/`hlt`/MSI-X substrate.
 
 use alloc::vec::Vec;
 use core::time::Duration;
-use transport::{Delivery, Instant, SessionId, SessionTable, TransmitSink};
+use transport::{Delivery, Instant, SendError, SessionId, SessionTable, TransmitSink};
 
 /// Why the reactor woke from a park — the **woke-by class** (the clean re-expression of the committed
 /// eventfd/token classes; app-fds are gone).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WakeReason {
-    /// The NIC's MSI-X interrupt (its RX/TX-completion wakeup; a self-IPI stands in this slice).
+    /// A NIC-driven wake — the RX descriptor `DD` store the live `DdWaitHost` monitors (MONITORX/MWAITX);
+    /// the woke-by-NIC class (the name is retained from the eventfd/MSI-X era).
     NicMsix,
-    /// The LAPIC one-shot timer (a retransmit deadline elapsed).
+    /// The deadline timer elapsed (a retransmit deadline; the `DdWaitHost`'s bounded MWAITX/TSC wait).
     Timer,
 }
 
@@ -59,17 +61,19 @@ pub const fn can_pull_rx(frame_available: bool, delivery_in_flight: bool) -> boo
     frame_available && !delivery_in_flight
 }
 
-/// The minimal NIC-shaped substrate seam: a monotonic clock + a park-until-wakeup-or-deadline. The
-/// bare-metal impl (LAPIC/`hlt`/MSI-X) lives behind this; a fake impl drives the host tests.
+/// The minimal NIC-shaped substrate seam: a monotonic clock + a park-until-wakeup-or-deadline. The live
+/// pure-direct impl (`DdWaitHost`: MONITORX/MWAITX on the RX descriptor `DD` line) lives behind this; a
+/// fake impl drives the host tests.
 pub trait Host {
     /// Monotonic now.
     fn now(&self) -> Instant;
-    /// Park until a wakeup (NIC MSI-X) or, when `timeout` is `Some`, the one-shot timer fires — whichever
-    /// first. Returns which woke it. Must not lose a wakeup that arrived just before the call.
+    /// Park until a NIC wake (the DD store, [`WakeReason::NicMsix`]) or, when `timeout` is `Some`, the
+    /// one-shot timer fires — whichever first. Returns which woke it. Must not lose a wakeup that arrived
+    /// just before the call.
     fn block(&mut self, timeout: Option<Duration>) -> WakeReason;
 }
 
-/// A source of inbound frames (the driver's RX drain in production; a stub in this slice). The returned
+/// A source of inbound frames (the driver's RX drain in production; a stub in the host tests). The returned
 /// slice is borrowed from the source's own buffer; the reactor copies it out at the boundary.
 pub trait RxSource {
     /// Whether a frame is available — a non-consuming check (the real driver reads the ring DD bit), so
@@ -86,9 +90,9 @@ pub struct Reactor<H, R, S> {
     host: H,
     rx: R,
     sink: S,
-    /// The one in-flight delivery to the consumer (copied out of the RX buffer — the copy boundary).
-    /// While `Some`, RX is back-pressured.
-    pending: Option<Vec<u8>>,
+    /// The one in-flight delivery to the consumer: the transport-computed `SessionId` it is keyed to plus
+    /// the payload copied out of the RX buffer (the copy boundary). While `Some`, RX is back-pressured.
+    pending: Option<(SessionId, Vec<u8>)>,
     parks: u32,
     malformed: u32,
 }
@@ -104,6 +108,15 @@ impl<H: Host, R: RxSource, S: TransmitSink> Reactor<H, R, S> {
         self.transport.open(payload, now, &mut self.sink)
     }
 
+    /// Continue an existing session `id` with another frame (multi-frame streaming) through the sole sink.
+    /// Additive wrapper over the transport's existing `send`; `SendError::NotSender` rejects an `id` this
+    /// endpoint did not open, so this can only stream on a session it originated — never data on a received
+    /// one. (`WouldBlock` if a frame is already in flight on `id`: stop-and-wait, ≤1.)
+    pub fn send_on_session(&mut self, id: SessionId, payload: &[u8]) -> Result<(), SendError> {
+        let now = self.host.now();
+        self.transport.send(id, payload, now, &mut self.sink)
+    }
+
     /// Do one unit of work. Returns `true` if it did work (an inbound frame processed, or a due
     /// retransmit driven), `false` if idle (the caller should [`park`](Self::park)).
     pub fn step(&mut self) -> bool {
@@ -114,7 +127,7 @@ impl<H: Host, R: RxSource, S: TransmitSink> Reactor<H, R, S> {
             // Reborrow the frame and process it. (Distinct fields → distinct borrows.)
             let frame = self.rx.next_frame().expect("rx_available was true");
             match self.transport.on_inbound(frame, &mut self.sink) {
-                Ok(Some(Delivery { payload, .. })) => self.pending = Some(payload.to_vec()),
+                Ok(Some(Delivery { session, payload })) => self.pending = Some((session, payload.to_vec())),
                 Ok(None) => {} // an ACK: released in-flight, nothing up
                 Err(_) => self.malformed += 1, // short frame: dropped, loop continues (totality)
             }
@@ -160,19 +173,19 @@ impl<H: Host, R: RxSource, S: TransmitSink> Reactor<H, R, S> {
     /// once *per delivery* — pacing a K-burst against the §7 retransmit window (the reactor's
     /// `drive_one_then_park_per_delivery_is_the_defect` test pins that defect as a contrast to this
     /// method's zero).
-    pub fn pump_all(&mut self, mut consume: impl FnMut(Vec<u8>)) -> usize {
+    pub fn pump_all(&mut self, mut consume: impl FnMut(SessionId, Vec<u8>)) -> usize {
         let mut work = 0;
         while self.step() {
             work += 1;
-            if let Some(delivery) = self.take_delivery() {
-                consume(delivery);
+            if let Some((session, payload)) = self.take_delivery() {
+                consume(session, payload);
             }
         }
         work
     }
 
-    /// The consumer takes the in-flight delivery (releasing back-pressure).
-    pub fn take_delivery(&mut self) -> Option<Vec<u8>> {
+    /// The consumer takes the in-flight delivery — the `(SessionId, payload)` pair — releasing back-pressure.
+    pub fn take_delivery(&mut self) -> Option<(SessionId, Vec<u8>)> {
         self.pending.take()
     }
 
@@ -192,8 +205,15 @@ impl<H: Host, R: RxSource, S: TransmitSink> Reactor<H, R, S> {
         self.pending.is_some()
     }
 
-    /// Read-only access to the substrate seam (e.g. the `hlt` count) and the sole sink (e.g. the emit
-    /// count), for the integration's observed report.
+    /// Whether the reactor is quiescent: no delivery held **and** no sender has a frame in flight (no armed
+    /// retransmit deadline). After a burst of originations, this becomes true once every one has been ACKed
+    /// — the signal a driver uses on an idle tick to pace the next burst.
+    pub fn quiescent(&self) -> bool {
+        self.pending.is_none() && self.transport.next_deadline().is_none()
+    }
+
+    /// Read-only access to the substrate seam (the `Host` impl, e.g. the `DdWaitHost`) and the sole sink
+    /// (e.g. the emit count), for the integration's observed report.
     pub fn host(&self) -> &H {
         &self.host
     }

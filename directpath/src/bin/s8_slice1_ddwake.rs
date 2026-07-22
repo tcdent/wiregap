@@ -18,13 +18,13 @@
 //! 184-196). Safety: gate-minted `Allowed` for bench cards only; production `61:00.0` never touched;
 //! reversible (rebind). Run: `sudo modprobe msr && sudo ./s8_slice1_ddwake`.
 
-use directpath::datapath::{self, Layout};
-use directpath::ethframe::EthSink;
-use directpath::gate::{gate, Allowed, Bdf, Decision};
-use directpath::gate2::validate_physaddr;
-use directpath::link::{apply_restart, link_state, reset_and_init, LinkRestart};
-use directpath::mem::{self, Hugepage};
-use directpath::pci::{self, Bar0};
+use directpath::internals::datapath::{self, Layout};
+use directpath::internals::ethframe::EthSink;
+use directpath::internals::gate::{gate, Allowed, Bdf, Decision};
+use directpath::internals::gate2::validate_physaddr;
+use directpath::internals::link::{apply_restart, link_state, reset_and_init, LinkRestart};
+use directpath::internals::mem::{self, Hugepage};
+use directpath::internals::pci::{self, Bar0};
 use driver::{RxRing, TxPath, VolatileRxRing};
 use std::io::{self, Read};
 use std::os::unix::fs::FileExt;
@@ -89,7 +89,7 @@ fn rdtsc() -> u64 {
     }
 }
 
-/// APERF (active-clock cycles; freezes in a C-state) via /dev/cpu/<core>/msr. `None` if unavailable.
+/// APERF (active-clock cycles; freezes in a C-state) via `/dev/cpu/<core>/msr`. `None` if unavailable.
 fn read_aperf(msr: &std::fs::File) -> Option<u64> {
     let mut b = [0u8; 8];
     msr.read_at(&mut b, APERF_MSR).ok().map(|_| u64::from_le_bytes(b))

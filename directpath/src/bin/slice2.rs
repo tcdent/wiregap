@@ -6,9 +6,9 @@
 //! reset_pipeline, least that links), records the escalation evidence, confirms 10G SFI link-up on both,
 //! then rebinds (restores). Defaults-first: AUTOC2/EEPROM link mode left unwritten.
 
-use directpath::gate::{gate, Allowed, Bdf, Decision};
-use directpath::link::{apply_restart, link_state, reset_and_init, LinkRestart, LinkState};
-use directpath::pci::{self, Bar0};
+use directpath::internals::gate::{gate, Allowed, Bdf, Decision};
+use directpath::internals::link::{apply_restart, link_state, reset_and_init, LinkRestart, LinkState};
+use directpath::internals::pci::{self, Bar0};
 use std::fs;
 use std::os::unix::fs::FileExt;
 use std::process::ExitCode;

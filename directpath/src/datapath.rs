@@ -44,7 +44,9 @@ impl Layout {
     pub fn new(va: u64, phys: u64) -> Self {
         Self { va, phys }
     }
-    /// Total bytes the carve uses — must be `<= hugepage size` (asserted by the caller).
+    /// Total bytes the carve uses — must be `<= hugepage size` (asserted by the caller). Bench-only: the
+    /// shipped facade gives each subsystem its own hugepage (no split); the harness splits one page in two.
+    #[cfg(feature = "bench")]
     pub fn used_bytes() -> usize {
         RX_BUF_OFF + DEPTH * BUFFER_LEN
     }
@@ -129,18 +131,30 @@ const CTRL_EXT_NS_DIS: u32 = 0x0001_0000;
 const RXPBSIZE_128KB: u32 = 0x0002_0000;
 const TXPBSIZE_40KB: u32 = 0x0000_A000;
 const RTTDCS_ARBDIS: u32 = 0x40;
+// Register-map completeness: the RAH address-valid bit, read by the bench `mac_valid` check (kept in all
+// builds as part of the documented register map, so unused in the TCB build).
+#[allow(dead_code)]
 const RAH_AV: u32 = 0x8000_0000;
 
 // ---- statistics counter offsets (read-to-clear / RO; harmless MMIO reads) ----------------------
-
+// Bench-only: read exclusively through the bench instrumentation (`read_counter`). The shipped TCB path
+// reads no device statistics, so these are `cfg(bench)`-absent from it.
+#[cfg(feature = "bench")]
 pub const GPTC: usize = 0x04080; // Good Packets Transmitted
+#[cfg(feature = "bench")]
 pub const GPRC: usize = 0x04074; // Good Packets Received (L2-filtered)
+#[cfg(feature = "bench")]
 pub const TPR: usize = 0x040D0; // Total Packets Received (regardless of filter/RXEN)
+#[cfg(feature = "bench")]
 pub const TORL: usize = 0x040C0; // Total Octets Received low
+#[cfg(feature = "bench")]
 pub const TORH: usize = 0x040C4; // Total Octets Received high
+#[cfg(feature = "bench")]
 pub const RXDGPC: usize = 0x02F50; // DMA Good Rx Packet — posted to host memory (0 ⇒ no host write)
+#[cfg(feature = "bench")]
 pub const RXMPC0: usize = 0x03FA0; // Rx Missed Packets (buffer 0): arrived-but-not-posted drop
 
+#[cfg(feature = "bench")]
 pub fn read_counter(bar: &Bar0, off: usize) -> u32 {
     bar.read32(off)
 }
@@ -169,6 +183,7 @@ pub fn read_mac(bar: &Bar0) -> [u8; 6] {
 }
 
 /// Whether RAH0's Address-Valid bit is set (the factory MAC is present/valid).
+#[cfg(feature = "bench")]
 pub fn mac_valid(bar: &Bar0) -> bool {
     bar.read32(RAH0) & RAH_AV != 0
 }
@@ -218,6 +233,7 @@ pub fn clear_rx_buffers(layout: &Layout) {
 
 /// Read back the RX packet buffers — used to prove they are all-zero before the device writes (the
 /// un-fakeable pre-clear proof).
+#[cfg(feature = "bench")]
 pub fn rx_buffers_all_zero(layout: &Layout) -> bool {
     // SAFETY: read of our own hugepage RX-buffer region (DEPTH*BUFFER_LEN bytes at a known offset).
     let region =
@@ -280,6 +296,7 @@ pub fn build_tx_ring(bar: &Bar0, layout: &Layout) -> VolatileTxRing {
 
 /// Set/clear the global receiver enable (RXCTRL.RXEN). Split out so the TX-first phase can run with RXEN
 /// **clear** (the one-time empirical confirm that TPR still ticks on wire receipt).
+#[cfg(feature = "bench")]
 pub fn set_rxen(bar: &Bar0, on: bool) {
     if on {
         set_flags(bar, RXCTRL, RXCTRL_RXEN);
@@ -336,6 +353,7 @@ pub fn build_rx_ring(bar: &Bar0, layout: &Layout) -> VolatileRxRing {
 }
 
 /// Diagnostic: dump the TX queue state + descriptor 0's command/status words. Reads GPTC (clears it).
+#[cfg(feature = "bench")]
 pub fn dump_tx_state(bar: &Bar0, layout: &Layout) {
     // SAFETY: read of our own hugepage TX-desc region — cmd_type_len at u32 index 2, status at index 3.
     let (cmd, sta) = unsafe {
@@ -353,6 +371,7 @@ pub fn dump_tx_state(bar: &Bar0, layout: &Layout) {
 }
 
 /// Diagnostic: dump the RX queue state + descriptor 0's status/length. Reads RXDGPC/GPRC/RXMPC (clears).
+#[cfg(feature = "bench")]
 pub fn dump_rx_state(bar: &Bar0, layout: &Layout) {
     // SAFETY: read of our own hugepage RX-desc region — status_error at u32 index 2, length in index 3 low.
     let (se, len) = unsafe {

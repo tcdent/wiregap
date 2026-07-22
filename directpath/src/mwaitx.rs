@@ -12,7 +12,7 @@
 ///
 /// # Safety
 /// `addr` must be a readable linear address in write-back memory (a live descriptor line here); requires a
-/// WAITPKG-less AMD CPU with MONITORX (CPUID Fn8000_0001_ECX[29]) — else `#UD`.
+/// WAITPKG-less AMD CPU with MONITORX (`CPUID Fn8000_0001_ECX[29]`) — else `#UD`.
 #[inline]
 pub unsafe fn monitorx(addr: u64) {
     unsafe {
@@ -32,7 +32,7 @@ pub unsafe fn monitorx(addr: u64) {
 ///
 /// # Safety
 /// Must follow a [`monitorx`] arming; `ebx` must be finite (a zero/absent timer with no store risks an
-/// indefinite wait); requires MONITORX/MWAITX support (CPUID Fn8000_0001_ECX[29]) — else `#UD`.
+/// indefinite wait); requires MONITORX/MWAITX support (`CPUID Fn8000_0001_ECX[29]`) — else `#UD`.
 #[inline]
 pub unsafe fn mwaitx(ecx: u32, ebx: u32) {
     unsafe {
