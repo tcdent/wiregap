@@ -24,7 +24,7 @@ use driver::{RxPath, RxRing, TxPath, VolatileRxRing, VolatileTxRing};
 use reactor::{Reactor, RxDrainAsSource};
 use std::io::{self, Read};
 use std::time::{Duration, Instant};
-use transport::SessionTable;
+use transport::{Originator, SessionTable};
 
 const BENCH_41: &str = "0000:41:00.0";
 const BENCH_63: &str = "0000:63:00.0";
@@ -97,7 +97,7 @@ fn build_reactor(bar: &Bar0, layout: &Layout, own_mac: [u8; 6], peer_mac: [u8; 6
     let source = EthSource::new(RxDrainAsSource::new(RxPath::new(rx_ring)));
     let host = DdWaitHost::new(layout.rx_desc_base_va(), datapath::rx_tail_ptr(bar), datapath::DEPTH, tsc_hz, 5.0);
     println!("  {name}: TX+RX armed, reactor wired (event-driven DdWaitHost + Ethernet encap)");
-    Ok(Reactor::new(SessionTable::new(), host, source, sink))
+    Ok(Reactor::new(SessionTable::new(Originator::Low), host, source, sink))
 }
 
 /// Calibrate the invariant TSC rate for the DdWaitHost deadline conversion.

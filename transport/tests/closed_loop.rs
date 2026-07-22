@@ -17,7 +17,7 @@
 //! a stale ACK (every distinct payload is eventually delivered).
 
 use core::time::Duration;
-use transport::{Instant, SendError, SessionId, SessionTable, TransmitSink};
+use transport::{Instant, Originator, SendError, SessionId, SessionTable, TransmitSink};
 
 /// A one-direction fake wire: records every emitted frame verbatim, in order.
 #[derive(Default)]
@@ -45,6 +45,8 @@ struct Loop {
     now: Instant,
     /// Payloads delivered up at the proxy (session, bytes) — duplicates allowed (no alternating bit).
     deliveries: Vec<(SessionId, Vec<u8>)>,
+    /// Payloads delivered up at the BOX — i.e. data the proxy ORIGINATED (both-originate, Task 15).
+    box_deliveries: Vec<(SessionId, Vec<u8>)>,
     /// When true, proxy→box frames (ACKs) are dropped on the wire (injected ACK loss).
     drop_acks: bool,
     /// Count of data frames delivered box→proxy (including retransmits).
@@ -56,21 +58,29 @@ struct Loop {
 impl Loop {
     fn new(interval: Duration, give_up: Duration) -> Self {
         Self {
-            boxs: SessionTable::with_timing(interval, give_up),
-            proxy: SessionTable::with_timing(interval, give_up),
+            // Originator-partitioned halves (Task 15): the box draws the low half, the proxy the high half,
+            // so both minting "from 0" cannot collide.
+            boxs: SessionTable::with_timing(Originator::Low, interval, give_up),
+            proxy: SessionTable::with_timing(Originator::High, interval, give_up),
             box_out: Wire::default(),
             proxy_out: Wire::default(),
             now: Instant(0),
             deliveries: Vec::new(),
+            box_deliveries: Vec::new(),
             drop_acks: false,
             data_to_proxy: 0,
             acks_to_box: 0,
         }
     }
 
-    /// The box opens a session by emission (allocate + send the first frame).
+    /// The box opens a session by emission (allocate + send the first frame) — from the low half.
     fn open(&mut self, payload: &[u8]) -> SessionId {
         self.boxs.open(payload, self.now, &mut self.box_out)
+    }
+
+    /// The proxy opens a session by emission — from the high half (both-originate, Task 15).
+    fn proxy_open(&mut self, payload: &[u8]) -> SessionId {
+        self.proxy.open(payload, self.now, &mut self.proxy_out)
     }
 
     fn advance(&mut self, d: Duration) {
@@ -81,21 +91,26 @@ impl Loop {
     /// ACKed by the proxy; proxy→box ACKs are delivered to the box (releasing its in-flight frame),
     /// unless `drop_acks`.
     fn exchange(&mut self) {
-        // Box → proxy (data). The proxy delivers up and emits a bare ACK into proxy_out.
+        // Box → proxy. By ROLE (§6, table membership): a frame on a proxy SENDER session is an ACK (nothing
+        // up); otherwise it is data the box originated — the proxy delivers it up + bare-ACKs.
         for f in self.box_out.drain() {
-            self.data_to_proxy += 1;
             if let Some(d) = self.proxy.on_inbound(&f, &mut self.proxy_out).unwrap() {
+                self.data_to_proxy += 1;
                 self.deliveries.push((d.session, d.payload.to_vec()));
             }
         }
-        // Proxy → box (bare ACKs), with optional loss. A frame on the box's sender session is an ACK.
+        // Proxy → box (with optional loss). By ROLE: a frame on a box SENDER session is an ACK (nothing up,
+        // counted); otherwise it is data the proxy ORIGINATED (its high-half session) — the box delivers it
+        // up + bare-ACKs. The role is decided purely by table membership; the partition guarantees a
+        // proxy-opened id is never in the box's sender table (both-originate, Task 15).
         for f in self.proxy_out.drain() {
             if self.drop_acks {
                 continue; // injected ACK loss
             }
-            self.acks_to_box += 1;
-            let up = self.boxs.on_inbound(&f, &mut self.box_out).unwrap();
-            assert!(up.is_none(), "a frame on the box's sender session is an ACK (nothing up)");
+            match self.boxs.on_inbound(&f, &mut self.box_out).unwrap() {
+                Some(d) => self.box_deliveries.push((d.session, d.payload.to_vec())),
+                None => self.acks_to_box += 1,
+            }
         }
     }
 
@@ -289,4 +304,50 @@ fn second_send_back_pressured_until_ack_then_succeeds() {
     l.run_to_quiescence(20);
     assert!(l.deliveries.iter().any(|(_, p)| p == b"first"));
     assert!(l.deliveries.iter().any(|(_, p)| p == b"second"));
+}
+
+// ---- Task 15: originator-partition — BOTH endpoints originate without collision (ADDED) ----------
+
+#[test]
+fn both_originate_disjoint_no_both_from_zero_collision() {
+    // The Fork-1 scenario, now safe BY CONSTRUCTION: the box AND the proxy each open a session "from 0",
+    // but the box draws the LOW half and the proxy the HIGH half, so the two ids are DISJOINT. Expected ids
+    // follow from the mask encoding (Low base 0, High base 1<<63).
+    let mut l = tiny();
+    let box_id = l.open(b"request"); // box, low half
+    let proxy_id = l.proxy_open(b"response"); // proxy, high half
+    assert_eq!(box_id, SessionId(0), "box opens from the low half (id 0)");
+    assert_eq!(proxy_id, SessionId(1 << 63), "proxy opens from the high half (id 1<<63)");
+    assert_ne!(box_id, proxy_id, "box id-0 and proxy id-0 no longer collide (disjoint halves)");
+
+    l.run_to_quiescence(20);
+    // Both directions delivered exactly their own payload — no cross-mux, no collision, both released.
+    assert!(
+        l.deliveries.iter().any(|(s, p)| *s == box_id && p == b"request"),
+        "the box's request is delivered to the proxy"
+    );
+    assert!(
+        l.box_deliveries.iter().any(|(s, p)| *s == proxy_id && p == b"response"),
+        "the proxy's response is delivered to the box — its high-half session, NOT read as the box's ACK"
+    );
+    assert!(
+        l.boxs.next_deadline().is_none() && l.proxy.next_deadline().is_none(),
+        "both sides quiescent — every session round-tripped + released"
+    );
+}
+
+#[test]
+fn role_logic_peer_opened_id_delivered_not_ack_read() {
+    // ROLE by table membership (§6): a proxy-originated frame arriving at the box is DATA (delivered), not
+    // an ACK — the box has no SENDER for that high-half id. If the two shared an id space, the box would
+    // read it as its own ACK (the Fork-1 stall, nothing delivered); the partition makes that impossible.
+    let mut l = tiny();
+    let proxy_id = l.proxy_open(b"hello-box");
+    l.step(); // proxy → box: the box delivers it up + bare-ACKs
+    assert!(
+        l.box_deliveries.iter().any(|(s, p)| *s == proxy_id && p == b"hello-box"),
+        "a peer-opened id is delivered as DATA (role decided by table membership, not read as an ACK)"
+    );
+    l.run_to_quiescence(20);
+    assert!(l.proxy.next_deadline().is_none(), "the box ACKed the proxy's session → released");
 }

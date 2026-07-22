@@ -36,7 +36,7 @@ mod seam;
 mod sender;
 mod table;
 
-pub use allocator::IdAllocator;
+pub use allocator::{IdAllocator, Originator};
 pub use frame::{Frame, FrameError, SESSION_ID_LEN, SessionId, decode_frame, encode_frame};
 pub use seam::{Clock, Instant, TransmitSink};
 pub use sender::{DEFAULT_GIVE_UP_AFTER, DEFAULT_RETRANSMIT_INTERVAL, SendError};

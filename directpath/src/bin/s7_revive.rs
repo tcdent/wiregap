@@ -23,7 +23,7 @@ use directpath::internals::pci::{self, Bar0};
 use driver::{RxPath, RxRing, TxPath, VolatileRxRing, VolatileTxRing};
 use std::io::{self, Read};
 use std::time::{Duration, Instant as StdInstant};
-use transport::{Instant, SessionId, SessionTable};
+use transport::{Instant, Originator, SessionId, SessionTable};
 
 const BENCH_41: &str = "0000:41:00.0";
 const BENCH_63: &str = "0000:63:00.0";
@@ -104,7 +104,7 @@ fn build_endpoint(bar: &Bar0, layout: &Layout, own_mac: [u8; 6], peer_mac: [u8; 
         rx_ring.refill(slot);
     }
     println!("  {name}: TX+RX armed (transport-direct endpoint)");
-    Ok(Endpoint { table: SessionTable::new(), sink: EthSink::new(TxPath::new(tx), peer_mac, own_mac), rx: RxPath::new(rx_ring) })
+    Ok(Endpoint { table: SessionTable::new(Originator::Low), sink: EthSink::new(TxPath::new(tx), peer_mac, own_mac), rx: RxPath::new(rx_ring) })
 }
 
 /// Poll the raw RX path for one frame within `dur`, returning the decap'd L1 frame (owned).

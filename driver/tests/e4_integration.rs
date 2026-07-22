@@ -15,7 +15,7 @@ use core::time::Duration;
 use driver::sim::{SimRxRing, SimTxRing};
 use driver::{RXD_STAT_EOP, RxPath, TxPath};
 use reactor::{Host, Reactor, RxDrainAsSource, WakeReason};
-use transport::{Instant, SessionId, SessionTable, encode_frame};
+use transport::{Instant, Originator, SessionId, SessionTable, encode_frame};
 
 const BUF: usize = 2048;
 
@@ -43,7 +43,7 @@ fn full_stack_inbound_frame_delivers_up_and_acks_out() {
     // (transport::TransmitSink). The reactor owns all three plus the transport.
     let rx = RxDrainAsSource::new(RxPath::new(sim_rx));
     let tx = TxPath::new(SimTxRing::new(4, BUF));
-    let mut reactor = Reactor::new(SessionTable::new(), ImmediateHost, rx, tx);
+    let mut reactor = Reactor::new(SessionTable::new(Originator::Low), ImmediateHost, rx, tx);
 
     // One unit of work: the inbound frame is pulled through the adapter, demuxed by the transport,
     // delivered up (held in the reactor's pending slot), and the bare ACK emitted through the TX seam.

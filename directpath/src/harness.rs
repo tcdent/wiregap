@@ -6,7 +6,7 @@
 //! concurrently, and join. Any per-harness phase coordination (e.g. the proxy disabling its receiver for a
 //! give-up) rides on channels the role closures capture — the scaffold stays minimal.
 
-use crate::Subsystem;
+use crate::{Endpoint, Subsystem};
 use crate::gate::Bdf;
 use std::io::{self, Read};
 use std::sync::mpsc;
@@ -80,7 +80,7 @@ where
     thread::scope(|s| -> io::Result<(RA, RB)> {
         let ha = s.spawn(move || -> io::Result<RA> {
             benchtools::affinity::pin(core_a)?;
-            let sys = Subsystem::construct(a, &allow_a, |own| {
+            let sys = Subsystem::construct(a, &allow_a, Endpoint::Box, |own| {
                 a_tx.send(own).expect("publish a mac");
                 b_rx.recv().expect("recv b mac")
             })?;
@@ -88,7 +88,7 @@ where
         });
         let hb = s.spawn(move || -> io::Result<RB> {
             benchtools::affinity::pin(core_b)?;
-            let sys = Subsystem::construct(b, &allow_b, |own| {
+            let sys = Subsystem::construct(b, &allow_b, Endpoint::Proxy, |own| {
                 b_tx.send(own).expect("publish b mac");
                 a_rx.recv().expect("recv a mac")
             })?;

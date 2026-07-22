@@ -26,7 +26,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::time::Duration;
 
-use crate::allocator::IdAllocator;
+use crate::allocator::{IdAllocator, Originator};
 use crate::frame::{Frame, FrameError, SessionId, decode_frame, encode_frame};
 use crate::seam::{Instant, TransmitSink};
 use crate::sender::{DEFAULT_GIVE_UP_AFTER, DEFAULT_RETRANSMIT_INTERVAL, SendError, Sender, Tick};
@@ -62,16 +62,19 @@ pub struct SessionTable {
 }
 
 impl SessionTable {
-    /// A fresh table for a new epoch, with the provisional production timing (§7, dialable).
-    pub fn new() -> Self {
-        Self::with_timing(DEFAULT_RETRANSMIT_INTERVAL, DEFAULT_GIVE_UP_AFTER)
+    /// A fresh table for a new epoch, with the provisional production timing (§7, dialable). `originator`
+    /// selects this endpoint's half of the session-id space (see [`Originator`]) — REQUIRED; there is no
+    /// side-less table (that would be the collision-prone shared allocator).
+    pub fn new(originator: Originator) -> Self {
+        Self::with_timing(originator, DEFAULT_RETRANSMIT_INTERVAL, DEFAULT_GIVE_UP_AFTER)
     }
 
     /// A fresh table with explicit sender timing (for dialing the §7 knobs, and for deterministic tests).
-    pub fn with_timing(retransmit_interval: Duration, give_up_after: Duration) -> Self {
+    /// `originator` selects this endpoint's half of the id space (see [`Originator`]).
+    pub fn with_timing(originator: Originator, retransmit_interval: Duration, give_up_after: Duration) -> Self {
         Self {
             sessions: BTreeMap::new(),
-            allocator: IdAllocator::new(),
+            allocator: IdAllocator::new(originator),
             retransmit_interval,
             give_up_after,
         }
@@ -187,11 +190,8 @@ impl SessionTable {
     }
 }
 
-impl Default for SessionTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// No `Default` for `SessionTable` — the originator half is REQUIRED (a side-less table would be the
+// collision-prone shared allocator, Task 15). Construct with `new(originator)` / `with_timing(originator, …)`.
 
 /// Emit a **bare ACK** — the session id with an empty payload, exactly [`crate::SESSION_ID_LEN`] bytes
 /// (§6) — via the transmit sink. Byte-identical to an empty-payload data frame; role/direction
@@ -230,7 +230,7 @@ mod tests {
 
     /// Tiny exact timing for deterministic virtual-clock assertions: interval 10 ns, give-up 100 ns.
     fn table() -> SessionTable {
-        SessionTable::with_timing(Duration::from_nanos(10), Duration::from_nanos(100))
+        SessionTable::with_timing(Originator::Low, Duration::from_nanos(10), Duration::from_nanos(100))
     }
 
     // ---- S2 behaviors (unchanged; receiver path) ----------------------------------------------

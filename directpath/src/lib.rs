@@ -128,7 +128,7 @@ use reactor::{Reactor, RxDrainAsSource};
 use std::io;
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
-use transport::SessionTable;
+use transport::{Originator, SessionTable};
 
 /// The wired live reactor (event-driven `DdWaitHost`, Ethernet encap/decap over the confined driver rings).
 type LiveReactor =
@@ -145,31 +145,35 @@ fn err(m: impl Into<String>) -> io::Error {
 /// streams further frames on a session THIS endpoint opened (multi-frame, `architecture.md` §4/§6/§8).
 /// [`SendError::NotSender`] refuses `send` on a session you *received* — a session's DATA is one-directional.
 ///
-/// **Collision-safety (grounded in the current transport, not the model.md ideal):** the session-id
-/// allocator is a single monotonic counter from 0, so origination is collision-safe for a SINGLE originator
-/// per link (its own ids never self-collide). `model.md` §9's both-endpoints-originate reply model (the
-/// proxy replies by *opening* a response session) additionally needs the originator-partitioned id space
-/// (top-bit = originator; Task 15, designer-ruled 2026-07-21, BACKLOG — not built), so it is COMING, not
-/// current: over today's shared allocator both endpoints minting from 0 collide (the Fork-1 silicon stall).
-/// This API is ready for that model; drop this caveat when the partition lands.
+/// **Both endpoints originate** (`model.md` §9): the box opens *request* sessions, the proxy opens
+/// *response* sessions — independent unidirectional messages. Origination is the reply mechanism — a handler
+/// replies by [`open`](Self::open)-ing a NEW session, never by sending data back on a received one
+/// ([`SendError::NotSender`]). Collision-free BY CONSTRUCTION: the session-id space is originator-partitioned
+/// (Task 15) — [`Endpoint::Box`] draws the low half, [`Endpoint::Proxy`] the high half, so both minting from
+/// 0 never collide.
 ///
 /// ```no_run
-/// use directpath::{Bdf, Ctx, Event, Subsystem};
+/// use directpath::{Bdf, Ctx, Endpoint, Event, Subsystem};
 /// use std::ops::ControlFlow;
 ///
 /// # fn main() -> std::io::Result<()> {
 /// let local = Bdf::parse("0000:41:00.0").expect("valid BDF");
 /// let peer = Bdf::parse("0000:63:00.0").expect("valid BDF");
-/// let mut sys = Subsystem::construct(local, &[local, peer], |_own_mac| [0x02, 0, 0, 0, 0, 0x63])?;
+/// let mut sys = Subsystem::construct(local, &[local, peer], Endpoint::Box, |_own_mac| [0x02, 0, 0, 0, 0, 0x63])?;
 ///
 /// // Open a session (frame 1), then stream a further frame on it once the prior frame has ACKed
 /// // (stop-and-wait; `send` returns `WouldBlock` while a frame is still in flight on that session).
 /// let sid = sys.open(b"frame 1");
 /// let _ = sys.send(sid, b"frame 2");
 ///
-/// // Serve incoming deliveries, each keyed to its session id.
-/// sys.run(|_ctx: &mut Ctx, ev: Event| match ev {
-///     Event::Delivered(session, payload) => { let _ = (session, payload); ControlFlow::Continue(()) }
+/// // Serve incoming; a handler replies by OPENING a new session (origination is the reply mechanism,
+/// // collision-free via the originator partition).
+/// sys.run(|ctx: &mut Ctx, ev: Event| match ev {
+///     Event::Delivered(session, payload) => {
+///         let _ = (session, &payload);
+///         ctx.open(b"response"); // reply = a NEW session
+///         ControlFlow::Continue(())
+///     }
 ///     Event::Idle => ControlFlow::Break(()), // e.g. stop when idle (illustrative)
 /// });
 /// # Ok(())
@@ -215,6 +219,27 @@ pub enum Event {
     Idle,
 }
 
+/// Which endpoint this subsystem is — the application role, mapped to a half of the originator-partitioned
+/// session-id space so both ends originate without collision (Task 15): `Box` → the low half, `Proxy` → the
+/// high half. Passed to [`Subsystem::construct`]; the transport itself stays role-neutral (it sees only the
+/// [`Originator`] half).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Endpoint {
+    /// The box: originates request sessions from the low half.
+    Box,
+    /// The proxy: originates response sessions from the high half.
+    Proxy,
+}
+
+impl Endpoint {
+    fn originator(self) -> Originator {
+        match self {
+            Endpoint::Box => Originator::Low,
+            Endpoint::Proxy => Originator::High,
+        }
+    }
+}
+
 /// The reply handle passed to the [`run`](Subsystem::run) handler: it wraps origination so a delivery can be
 /// answered without the caller ever holding the reactor (the loop stays owned by [`Subsystem`]).
 pub struct Ctx<'a> {
@@ -247,13 +272,16 @@ impl Ctx<'_> {
 
 impl Subsystem {
     /// Construct the subsystem over `local` (the bench card to own). `allowlist` is the gate's set of
-    /// permitted BDFs (production devices refused). `resolve_peer` is handed this card's own MAC (read after
-    /// link-up) and returns the peer MAC to send to — production passes `|_| CONFIGURED_PEER_MAC`; a
-    /// two-ended harness exchanges own↔peer over a channel. Assembles gate → pci → mem/pagemap → link →
-    /// datapath rings → reactor + `DdWaitHost`.
+    /// permitted BDFs (production devices refused). `endpoint` selects this side's half of the
+    /// originator-partitioned session-id space ([`Endpoint::Box`] → low, [`Endpoint::Proxy`] → high), so both
+    /// ends originate without collision. `resolve_peer` is handed this card's own MAC (read after link-up)
+    /// and returns the peer MAC to send to — production passes `|_| CONFIGURED_PEER_MAC`; a two-ended harness
+    /// exchanges own↔peer over a channel. Assembles gate → pci → mem/pagemap → link → datapath rings →
+    /// reactor + `DdWaitHost`.
     pub fn construct(
         local: Bdf,
         allowlist: &[Bdf],
+        endpoint: Endpoint,
         resolve_peer: impl FnOnce([u8; 6]) -> [u8; 6],
     ) -> io::Result<Self> {
         // 1. Gate: the un-forgeable token.
@@ -307,7 +335,7 @@ impl Subsystem {
         let host = DdWaitHost::new(layout.rx_desc_base_va(), datapath::rx_tail_ptr(&bar), datapath::DEPTH, tsc_hz, 5.0);
         let sink = EthSink::new(TxPath::new(tx_ring), peer_mac, own_mac);
         let source = EthSource::new(RxDrainAsSource::new(RxPath::new(rx_ring)));
-        let reactor = Reactor::new(SessionTable::new(), host, source, sink);
+        let reactor = Reactor::new(SessionTable::new(endpoint.originator()), host, source, sink);
 
         Ok(Self {
             reactor,

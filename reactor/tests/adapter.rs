@@ -9,7 +9,7 @@ use reactor::{Reactor, RxDrain, RxDrainAsSource, RxSource, WakeReason};
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::rc::Rc;
-use transport::{Instant, SessionTable, TransmitSink};
+use transport::{Instant, Originator, SessionTable, TransmitSink};
 
 // ---- a fake RxDrain (owned frames) that counts its pulls -------------------------------------
 
@@ -134,7 +134,7 @@ fn real_reactor_consumes_and_back_pressures_through_the_adapter() {
     // correctly (no drop, no double-pull) end-to-end.
     let (drain, _pulls) = StubDrain::new([Some(inbound(1, b"a")), Some(inbound(2, b"b"))]);
     let src = RxDrainAsSource::new(drain);
-    let mut r = Reactor::new(SessionTable::new(), NoWakeHost, src, CaptureSink::default());
+    let mut r = Reactor::new(SessionTable::new(Originator::Low), NoWakeHost, src, CaptureSink::default());
 
     assert!(r.step(), "frame 1 processed");
     assert!(r.back_pressured(), "a delivery is in flight → back-pressure engaged");

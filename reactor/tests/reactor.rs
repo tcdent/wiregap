@@ -7,7 +7,7 @@ use core::cell::Cell;
 use core::time::Duration;
 use std::collections::VecDeque;
 use reactor::{arm_from_deadline, can_pull_rx, Arm, Host, Reactor, RxSource, WakeReason};
-use transport::{decode_frame, Instant, SendError, SessionId, SessionTable, TransmitSink};
+use transport::{decode_frame, Instant, Originator, SendError, SessionId, SessionTable, TransmitSink};
 
 // ---- deadline composition (the three edge-facts) ----------------------------------------------
 
@@ -102,7 +102,7 @@ fn inbound(session: u64, payload: &[u8]) -> Vec<u8> {
 fn zero_parks_while_there_is_work() {
     // A burst of inbound frames: step() keeps finding work, so the reactor never parks.
     let frames = (0..5u64).map(|i| inbound(100 + i, b"hello")).collect::<Vec<_>>();
-    let mut r = Reactor::new(SessionTable::new(), FakeHost::new([]), StubRx::new(frames), CaptureSink::default());
+    let mut r = Reactor::new(SessionTable::new(Originator::Low), FakeHost::new([]), StubRx::new(frames), CaptureSink::default());
 
     let mut processed = 0;
     // Drain the burst, consuming each delivery so back-pressure never latches.
@@ -118,7 +118,7 @@ fn zero_parks_while_there_is_work() {
 #[test]
 fn one_in_flight_rx_back_pressure() {
     let mut r = Reactor::new(
-        SessionTable::new(),
+        SessionTable::new(Originator::Low),
         FakeHost::new([]),
         StubRx::new([inbound(1, b"a"), inbound(2, b"b")]),
         CaptureSink::default(),
@@ -141,7 +141,7 @@ fn deadline_park_then_timer_wake_drives_retransmit() {
     // Originate a session: the sender emits once and arms a retransmit deadline. Idle → park until the
     // timer → the timer wake advances the clock past the deadline → the next drain re-emits (retransmit).
     let mut r = Reactor::new(
-        SessionTable::new(),
+        SessionTable::new(Originator::Low),
         FakeHost::new([WakeReason::Timer]),
         StubRx::new([]),
         CaptureSink::default(),
@@ -163,7 +163,7 @@ fn deadline_park_then_timer_wake_drives_retransmit() {
 fn park_forever_when_no_deadline_and_wakes_on_nic_msix() {
     // No sessions, no RX → no deadline → ParkForever; a NIC-MSI-X wake returns the woke-by class.
     let mut r = Reactor::new(
-        SessionTable::new(),
+        SessionTable::new(Originator::Low),
         FakeHost::new([WakeReason::NicMsix]),
         StubRx::new([]),
         CaptureSink::default(),
@@ -184,7 +184,7 @@ fn pump_all_busy_drains_a_backlog_with_zero_parks() {
     const K: usize = 32;
     let frames = (0..K).map(|i| inbound(1000 + i as u64, &[i as u8; 8])).collect::<Vec<_>>();
     let mut r =
-        Reactor::new(SessionTable::new(), FakeHost::new([]), StubRx::new(frames), CaptureSink::default());
+        Reactor::new(SessionTable::new(Originator::Low), FakeHost::new([]), StubRx::new(frames), CaptureSink::default());
 
     let mut consumed = 0;
     let work = r.pump_all(|_, _| consumed += 1);
@@ -208,7 +208,7 @@ fn drive_one_then_park_per_delivery_is_the_defect() {
     const K: usize = 8;
     let frames = (0..K).map(|i| inbound(2000 + i as u64, &[i as u8; 8])).collect::<Vec<_>>();
     let mut r =
-        Reactor::new(SessionTable::new(), FakeHost::new([]), StubRx::new(frames), CaptureSink::default());
+        Reactor::new(SessionTable::new(Originator::Low), FakeHost::new([]), StubRx::new(frames), CaptureSink::default());
 
     let mut consumed = 0;
     for _ in 0..K {
@@ -229,7 +229,7 @@ fn quiescent_reflects_pending_and_in_flight() {
     // The one-directional-burst pacing signal `quiescent()` — no held delivery AND no sender in flight.
     // Expected values are derived from the reactor's real pending/next_deadline behavior, not hand-computed.
     let mut r = Reactor::new(
-        SessionTable::new(),
+        SessionTable::new(Originator::Low),
         FakeHost::new([]),
         StubRx::new([inbound(7, b"data")]),
         CaptureSink::default(),
@@ -253,7 +253,7 @@ fn delivers_each_session_id_with_its_payload() {
     // (the multiplexed-demux the earlier `Delivery { payload, .. }` drop could not express). Expected values
     // are read from the real (session, payload) pairs the reactor produces, not hand-computed.
     let mut r = Reactor::new(
-        SessionTable::new(),
+        SessionTable::new(Originator::Low),
         FakeHost::new([]),
         StubRx::new([inbound(10, b"alpha"), inbound(20, b"bravo")]),
         CaptureSink::default(),
@@ -277,7 +277,7 @@ fn multi_frame_stream_continues_on_one_session() {
     // not hand-computed. (Same-session continuation is collision-safe under the shared allocator — one
     // originator; the both-originate model needs the Task-15 originator-partition, not built.)
     let mut r = Reactor::new(
-        SessionTable::new(),
+        SessionTable::new(Originator::Low),
         FakeHost::new([]),
         StubRx::new([inbound(0, b"")]), // the bare ACK for session 0 (the first-opened session)
         CaptureSink::default(),
