@@ -134,8 +134,8 @@ fixed width, the `0x1F` scan, or the hardware frame — **never from a count the
 > *Rationale.* A box-supplied length is a second source of truth that can disagree with the bytes; a
 > segment stack is *already* scanned byte-by-byte, so the split falls out of that scan for free, and
 > `0x1F` is unambiguous by construction because the alphabet excludes it — a
-> delimiter never meets unvalidated content. A verbatim blob is bounded only by the transport (frame,
-> session close), the one boundary the box cannot forge into a misparse: it bounds *its own* data, and
+> delimiter never meets unvalidated content. A verbatim blob is bounded only by the transport (a frame
+> boundary, or the session ending), the one boundary the box cannot forge into a misparse: it bounds *its own* data, and
 > a truncated blob is denied downstream. This **supersedes the fixed-256 leaf record and the
 > `split_at_checked` carve** — there are no length-prefixed fields left anywhere. The scan accepts one
 > of two alphabets — **safe** (restricted, loggable) or **unsafe** (permissive, real names,
@@ -343,14 +343,15 @@ Both errors share one body, in the standard shape — a fixed header plus a rest
 The head **causes**; it does not call. A head→box verb is **fire-and-forget intent**; nothing it
 sends awaits a paired reply. The box acts and, where the act produces a session, **emits**; the head
 learns a session exists by *observing the emission* and builds its model from what arrives. There is
-no handshake and no correlation token in the simple case.
+no handshake and no correlation token.
 
 Emission is change-driven and decoupled from viewing: an idle session emits nothing, and frames flow
 whether or not a human is looking, so the head already holds the state to paint any session the
 instant it is viewed. There is no subscribe message.
 
-> *Rationale.* `net-request` is the one exception that is genuinely request/response — correlated by
-> the session id, both directions on one session (net.md).
+> *Rationale.* Net is no exception: the box emits the request and the proxy emits the response as
+> **independent unidirectional messages** — no paired reply, no protocol-level correlation. Pairing a
+> response to its request is the transport's, not the protocol's (net.md).
 >
 > *"The head sends a request for a PTY. The box creates or occupies a socket. A packet suddenly shows
 > up with that socket ID, and it is up to the head's application to enumerate the sessions it is

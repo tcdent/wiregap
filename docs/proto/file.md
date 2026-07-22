@@ -34,7 +34,8 @@ its own root, so `/` and `..` are unsayable and **traversal is structural, not c
 The box pushes bytes onto trusted ground. The session is occupied for write, declaring a **destination**
 — a **safe** segment stack under the quarantine root (the box chooses a conforming name; it is logged).
 What follows is `file-chunk` messages: **verbatim bytes, appended in order** at the running position.
-Completion is the session close.
+Completion is the transport session ending — the box ceasing to emit on it; there is no protocol close
+signal.
 
 > *Rationale.* Files are serial, so the write cursor is implicit — no offset, no field to validate, no
 > confinement argument. The proxy moves bytes to the cursor; the only structured input is the safe

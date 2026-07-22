@@ -37,9 +37,8 @@ bytes — losslessly, totally, and the same way for everyone. One crate, consume
 
 | layer | responsibility | in the crate? |
 |---|---|---|
-| transport | delivery, ACK, ordering, session multiplexing, the ring | no (below) |
-| copy boundary | owned frame bytes appear | the crate's input edge |
-| frame envelope | session id + flag byte (continuation) + the L2 message | byte layout: see §8 (Open) |
+| transport | delivery, ACK, ordering, session multiplexing, framing + the continuation flag, the ring | no (below) |
+| copy boundary | owned L2-message bytes appear (the transport's frame header already stripped) | the crate's input edge |
 | L2 message | `[verb u32][body]` — one flat dispatch (law 1) | **yes** |
 | body decoders | the three: fixed records, verbatim tail, segment-stack scan (§6 of model.md) | **yes** |
 | typed messages | the verb catalog as Rust types | **yes** |
@@ -132,29 +131,43 @@ Each consumer compiles only its slice (feature-gated — granularity is a §8 de
 validation loop always exercises the whole. Illustrative, for the team to refine against the actual
 binaries:
 
-| consumer | decodes | encodes | relays (envelope only) |
+| consumer | decodes | encodes | relays (routing only) |
 |---|---|---|---|
 | **proxy** | `net-address` (match+log), `net-payload` (reassemble→recognize), file addressing (confine) | `net-response`/`error`, `file-data`/`error`, `list-entry` | display, input, between box and head |
 | **head** | display, `pane-state`, `file-data`, `list-entry`, errors | `key`/`mouse`/`paste`/`focus`, `resize`, `viewport`, `request-file`, `list`, `open-session` | — |
 | **box** | input, `create-pty`, `resize`, `viewport`, `request-file`, `list`, `file-data`, `net-response` | display, `pane-state`, `file-*`, `net-address`/`payload` | — |
 
-> The **box is the widest consumer** (it speaks nearly the whole protocol); the **proxy parses the
-> envelope of everything to route, but deep-parses only what it acts on** (net + file addressing) and
-> relays the rest inert; the **head is terminal-only** — it never sees file or net internals.
+> The **box is the widest consumer** (it speaks nearly the whole protocol); the **proxy receives
+> demuxed L2 messages from its transport** and **deep-parses only what it acts on** (net + file
+> addressing), relaying the rest inert; the **head is terminal-only** — it never sees file or net
+> internals.
 
 ## 8. Open decisions — for the team and escalation
 
 These are genuine forks the implementation must settle. The team's PM escalates the ones reserved for
 the operator; the rest are the team's to choose and are flagged here so they are chosen, not defaulted.
 
-- **Envelope ownership** — does the crate own the L1 frame header (session id + flag byte) or only the
-  L2 `[verb][body]`, taking session/flag as context from the transport? (Layering; affects where
-  reassembly and multiplexing sit.)
-- **Reassembler residence & cap** — does the crate ship the bounded continuation-bit reassembler, or
-  only the rule, leaving the buffer and cap to each consumer? Where is the fail-closed cap configured,
-  and to what value? (`net.md` §2 mandates *bounded*; the number is unset.)
-- **Message representation** — one crate-wide verb enum, per-service enums, or a trait per message;
-  in-place field overlay vs owned structs at the decode edge.
+- **Envelope ownership (corrected — 010).** The crate owns **no** envelope. The L1 frame — session id,
+  framing, and the continuation flag — is the **transport's** (`model.md` law 1 "no envelope", §1, §2).
+  The crate's unit is the L2 message `[verb][body]`; the transport demuxes by session id and hands the
+  crate one session's in-order stream of L2 messages, plus a per-frame continuation **bool** to the
+  reassembler for `net-payload`. *(How this went wrong: 001–007 built an `envelope.rs` / `ENVELOPE_LEN`
+  / `FLAG_CONTINUATION_BIT` that parsed the L1 frame — a second framing layer law 1 forbids. Sprint 010
+  removes it.)*
+- **Reassembler residence & cap (resolved — 005).** The crate ships the bounded reassembler
+  (`Reassembler`, under the `net` feature), fail-closed and **reject-before-grow**: the cap is checked
+  *before* the append, so the buffer never allocates past it, and a never-ending continuation stream
+  trips the same cap (no timeout needed). The reassembler consumes **opaque bytes plus a continuation
+  bool** handed up by the transport — never a frame header. It is single-session — the crate holds no
+  map; the consumer holds one `Reassembler` per in-flight call (keyed by the transport's session,
+  no_std-friendly). The cap is `REASSEMBLY_CAP`, **provisional 32 MiB**
+  (the Anthropic Messages API's own request limit, so the proxy fails closed where the upstream would),
+  reviewed with the capacity/security lens, not the wire-number lens.
+- **Message representation (resolved — 001).** One crate-wide `Message` enum, one variant per
+  implemented verb, each wrapping an **owned** per-service struct (`Key`, `FileWrite`, `NetAddress`, …)
+  that implements a small `Wire` trait (`VERB` + decode/encode). Owned structs at the decode edge, not
+  in-place overlay — `#![forbid(unsafe_code)]` rules transmute-overlay out. Dispatch is one flat match
+  on the verb low byte; variants are feature-gated, so a slice build holds only its verbs.
 - **Shared implementation, distinct types (resolved — 008).** Where verbs coincide in body *shape* —
   the verbatim-tail bodies (`net-response`/`net-payload`/`file-data`/`paste`, opaque `Vec<u8>`) and the
   fixed-prefix geometry — the crate factors the **implementation** (the `verbatim_verb!` macro, the
@@ -169,8 +182,15 @@ the operator; the rest are the team's to choose and are flagged here so they are
   **carry-raw routing** (`from_*`/`to_*` — the enforce-by-construction check that `Other` cannot hold a
   defined value), along with the verb/field-code **consts**. The dedup is in the codegen; the security
   logic and the routing table are read directly.
-- **Feature-gating granularity** — per-service cargo features, per-direction, or all-in.
-- **`no_std`** — is any consumer constrained enough to need it, or is `std` universal?
+- **Feature-gating granularity (resolved — 006).** Per-service cargo features
+  (`control`/`terminal`/`file`/`net`, default = all), with CORE (verb/reject/wire/message/
+  segment/errors) always on and no inter-feature deps. Each consumer compiles only its slice — the
+  proxy (`file`,`net`) never compiles the terminal grammar — while the default all-features build runs
+  the whole self-validation loop.
+- **`no_std` (resolved — 001).** `#![no_std]` + `alloc`, zero non-dev dependencies (`core` + `alloc`
+  only); `std` is `cfg(test)`-only. Paired with `#![forbid(unsafe_code)]`, this makes library §0's
+  no-effect boundary a **compile error** — `std::{fs,net,process,thread,time,env}` cannot link, and
+  transmute-overlay/over-read are foreclosed — so safe-Rust-end-to-end is structural, not a convention.
 - **Functional keysym values are not a crate concern.** The crate carries `keysym` as an opaque
   `u32` — it validates structure, not values (§2) — so the input codec is **structural and unblocked**;
   it never needed the values. The meaning of `> 0x10FFFF` values is a **head↔box agreement**: both
