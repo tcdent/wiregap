@@ -9,11 +9,13 @@
 //!
 //! U4's corpus shapes (`anthropic_corpus.rs`) and a deny-default fuzz (`anthropic_fuzz.rs`) are
 //! **re-run through this path** (chunked + reassembled), *not* fed to `recognize` directly — the whole
-//! point being that the reassembly seam changes no verdict. The direct oracle uses the identical fixed
-//! envelope the dispatch stub uses (`stub_envelope_request`), so the *only* variable under test is the
-//! reassembly path itself.
+//! point being that the reassembly seam changes no verdict. The direct oracle uses the same envelope
+//! the dispatch seam now **sources from the session's admitted `Route`** (Sprint 8, Task 14): each
+//! session establishes `https://api.anthropic.com/v1/messages` via a prior admitted `net-address`, so
+//! the seam's sourced envelope is `POST` / `api.anthropic.com` / `/v1/messages` / betas-empty — the
+//! same envelope the oracle uses — leaving the reassembly path as the *only* variable under test.
 
-use proto::{Message, NetPayload, encode_message};
+use proto::{Message, NetAddress, NetPayload, Scheme, encode_message, scan_safe};
 use proxy::anthropic::{Denial, Request, recognize};
 use proxy::dispatch::{Dispatcher, Routed};
 use proxy::register::anthropic::VETTED_TOOLS;
@@ -21,7 +23,8 @@ use proxy::register::net::ROUTES;
 use transport::SessionId;
 
 /// The **oracle**: recognize a body directly under the sole admit-envelope (betas empty), matching the
-/// dispatch seam's marked-stub envelope exactly — so the body is the only difference under test.
+/// envelope the seam sources from the `api.anthropic.com` route exactly — so the body is the only
+/// difference under test.
 fn direct(body: &[u8]) -> Result<(), Denial> {
     let req = Request {
         verb: "POST",
@@ -38,13 +41,32 @@ fn chunk_frame(content: &[u8], more: bool) -> Vec<u8> {
     encode_message(&Message::NetPayload(NetPayload { more, content: content.to_vec() }))
 }
 
+/// A `net-address` frame for `joined` (path separators `/` become the safe-stack separator `0x1f`) —
+/// admits + stores the session's Route.
+fn net_address(joined: &str) -> Vec<u8> {
+    let addr = NetAddress {
+        scheme: Scheme::Https,
+        address: scan_safe(joined.replace('/', "\u{1f}").as_bytes()).unwrap(),
+    };
+    encode_message(&Message::NetAddress(addr))
+}
+
 /// Route `body` through the seam split into `chunk_size`-byte pieces on one fresh session, and return
-/// the terminal `Routed` (the final chunk's disposition). A `net-payload` frame self-binds the session
-/// to Net, so no prior net-address is needed. Every non-final chunk MUST `Accumulate` — asserted, as a
-/// harness invariant (a regression that completed early would trip here).
+/// the terminal `Routed` (the final chunk's disposition). The session first admits a `net-address` for
+/// `api.anthropic.com/v1/messages` — the real admission sequence, which stores the Route the
+/// `net-payload` recognizer envelope is sourced from (Sprint 8); without it a `net-payload` fails
+/// closed (`NetPayloadNoRoute`). Every non-final chunk MUST `Accumulate` — asserted, as a harness
+/// invariant (a regression that completed early would trip here).
 fn through_seam(body: &[u8], chunk_size: usize) -> Routed {
     let mut d = Dispatcher::new();
     let s = SessionId(1);
+    assert!(
+        matches!(
+            d.route(s, &net_address("api.anthropic.com/v1/messages"), ROUTES, VETTED_TOOLS),
+            Routed::NetRouteAdmit(_)
+        ),
+        "precondition: the net-address admits and stores the session's route",
+    );
     if body.is_empty() {
         // A single empty final chunk — the whole "body" is zero bytes.
         return d.route(s, &chunk_frame(&[], false), ROUTES, VETTED_TOOLS);

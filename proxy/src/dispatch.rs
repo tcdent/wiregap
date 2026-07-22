@@ -77,6 +77,12 @@ pub enum Routed {
     /// The completed request body was **DENIED** by the tier-1 recognizer — carries the legible
     /// [`Denial`]. Fail-closed; the body is not forwarded.
     NetPayloadDeny(Denial),
+    /// A `net-payload` completed on a session with **no admitted `Route`** (no prior `net-address`,
+    /// or one that was denied) — so no recognizer envelope can be sourced. Fail-closed: the body is
+    /// **not** recognized and **not** forwarded (Sprint 8's no-prior-Route-denies rung). This is
+    /// distinct from a recognizer [`Denial`]: recognition never runs, because there is nothing to
+    /// vet the request *as*.
+    NetPayloadNoRoute,
     /// A follow-on frame routed to its service's stateful handler (file-chunk writing;
     /// open-session control). The full lifecycle is the service's own. Carries the bound service.
     ToServiceHandler(Service),
@@ -121,12 +127,21 @@ pub enum RelayKind {
 /// removes it immediately (see [`Dispatcher::route`]), so only in-flight sessions hold one. Each
 /// buffer is itself capped by `REASSEMBLY_CAP` (reject-before-grow, `proto::Reassembler`), so the
 /// per-entry size is bounded too, not just the entry count.
+///
+/// The per-session `routes` map (Sprint 8, Task 14) holds the matched [`Route`] from a session's
+/// `net-address` admission, so a later `net-payload` on that session sources its recognizer envelope
+/// (domain/path) from the **real** route rather than a hardcoded stub. It shares the binding map's
+/// bounded-per-epoch shape and [`close_session`] eviction. A `net-payload` that completes with **no**
+/// entry here (no prior admitted `net-address`) fails closed ([`Routed::NetPayloadNoRoute`]).
 pub struct Dispatcher {
     bindings: alloc::collections::BTreeMap<SessionId, Service>,
     /// One in-flight net-payload reassembly buffer per session, created on the session's first
     /// `net-payload` chunk and removed the instant the body completes or overflows the cap. Shares
     /// the binding map's bounded-per-epoch shape and [`close_session`] eviction (see the type doc).
     reassemblers: alloc::collections::BTreeMap<SessionId, Reassembler>,
+    /// The matched [`Route`] per session, stored on `net-address` admission — the real source of the
+    /// `net-payload` recognizer envelope (Task 14). Shares the binding map's eviction shape.
+    routes: alloc::collections::BTreeMap<SessionId, Route>,
     /// The per-session reassembly capacity bound. In production this is always
     /// `proto::verb::REASSEMBLY_CAP` (set by [`Dispatcher::new`]); a `#[cfg(test)]` constructor may
     /// inject a small cap to exercise the evict-on-overflow path cheaply — the field is otherwise
@@ -150,6 +165,7 @@ impl Dispatcher {
         Dispatcher {
             bindings: alloc::collections::BTreeMap::new(),
             reassemblers: alloc::collections::BTreeMap::new(),
+            routes: alloc::collections::BTreeMap::new(),
             reassembly_cap: verb::REASSEMBLY_CAP,
             dropped: 0,
         }
@@ -227,7 +243,12 @@ impl Dispatcher {
             // ── Gated: deep-parse the body, invoke the tier-1 core (the only decodes on box bytes) ──
             verb::NET_ADDRESS => match NetAddress::decode(body) {
                 Ok(addr) => match crate::route::match_route(&addr, register) {
-                    Ok(route) => Routed::NetRouteAdmit(route),
+                    Ok(route) => {
+                        // Store the matched Route so this session's later net-payload sources its
+                        // recognizer envelope from the real route (Task 14), not a hardcoded stub.
+                        self.routes.insert(session, route);
+                        Routed::NetRouteAdmit(route)
+                    }
                     Err(_) => Routed::NetDeny,
                 },
                 Err(reject) => Routed::Decode(reject),
@@ -272,8 +293,10 @@ impl Dispatcher {
     /// the buffer — the collision-freedom property, `proto::net` / net.md §2), so the completed body
     /// is byte-identical to the box's request body. On `Complete`, the same buffer is what
     /// [`recognize`] vets and what [`Routed::NetPayloadAdmit`] carries forward to be forwarded — one
-    /// buffer, no split (CB4-across-the-seam). Fail-closed on cap-overflow (the poisoned reassembler
-    /// is evicted) and on a malformed chunk header (`ShortBody`).
+    /// buffer, no split (CB4-across-the-seam). The recognizer envelope's domain/path are sourced from
+    /// the session's admitted [`Route`] (Task 14); a completion with no stored Route fails closed
+    /// ([`Routed::NetPayloadNoRoute`]). Fail-closed on cap-overflow (the poisoned reassembler is
+    /// evicted) and on a malformed chunk header (`ShortBody`).
     fn route_net_payload(&mut self, session: SessionId, body: &[u8], vetted: &[ToolIdentity]) -> Routed {
         // Decode this chunk: strip the fixed 1-byte continuation-flag header, keep the content tail.
         let chunk = match NetPayload::decode(body) {
@@ -294,7 +317,25 @@ impl Dispatcher {
                 // The body is whole; the reassembler already reset, but drop the map entry so the
                 // next request on this session starts a fresh reassembly (and the residual shrinks).
                 self.reassemblers.remove(&session);
-                match recognize(&stub_envelope_request(&request_body), vetted) {
+                // Source the recognizer envelope from the session's admitted Route (Task 14). No
+                // stored Route (no prior admitted net-address) → fail closed: nothing to vet the
+                // request *as*, so it is neither recognized nor forwarded.
+                let Some(route) = self.routes.get(&session).copied() else {
+                    return Routed::NetPayloadNoRoute;
+                };
+                let (domain, path) = split_route(route);
+                // verb/betas are justified constants for the net service: the wire (`NetAddress` +
+                // `net-payload`) conveys neither an HTTP method nor beta headers, and the recognizer
+                // reads betas only from this envelope field, never from the body — so `betas: &[]` is
+                // the literal truth of what the box can express, not a dropped field.
+                let request = Request {
+                    verb: "POST",
+                    domain,
+                    path,
+                    betas: &[],
+                    body: &request_body,
+                };
+                match recognize(&request, vetted) {
                     Ok(()) => Routed::NetPayloadAdmit(request_body),
                     Err(denial) => Routed::NetPayloadDeny(denial),
                 }
@@ -313,10 +354,11 @@ impl Dispatcher {
     /// the MB4 bounded-resource residual. It is structurally ready to wire to a transport
     /// session-close/give-up signal; that signal is not in the committed transport yet (the same
     /// cross-crate gap the residual names), so the hook is present-and-tested but not yet *driven*.
-    /// Returns the evicted binding (the reassembler, if any, is dropped silently — it holds only
-    /// in-flight box content, nothing observable).
+    /// Returns the evicted binding (the reassembler and stored route, if any, are dropped silently —
+    /// they hold only in-flight box content / a matched route, nothing observable).
     pub fn close_session(&mut self, session: SessionId) -> Option<Service> {
         self.reassemblers.remove(&session);
+        self.routes.remove(&session);
         self.bindings.remove(&session)
     }
 
@@ -346,24 +388,18 @@ impl Dispatcher {
     }
 }
 
-/// **MARKED STUB (Sprint 7, Slice 2 — deliberately not production wiring).** Builds the recognizer's
-/// non-body envelope for a reassembled net-payload body. The real envelope (verb/domain/path/betas)
-/// is **not yet sourced** from the session's matched net [`Route`] — that sourcing is a named
-/// follow-on the sprint explicitly leaves open (007 Non-Goals, "recognizer-envelope sourcing").
-///
-/// This placeholder pins the envelope to the **sole admit-envelope** (`POST api.anthropic.com
-/// /v1/messages`, no betas) so that the reassembled **body** is the only variable the recognizer
-/// seam exercises. A reader must **not** mistake this for route→envelope wiring: it does not read the
-/// session's route, and every net-payload body flows through the identical fixed envelope. When the
-/// follow-on lands, these fields come from the `Route` bound at net-address time and this helper is
-/// deleted.
-fn stub_envelope_request(body: &[u8]) -> Request<'_> {
-    Request {
-        verb: "POST",
-        domain: "api.anthropic.com",
-        path: "/v1/messages",
-        betas: &[],
-        body,
+/// Split a canonical [`Route`] (`https://<domain>[/<path…>]`) into `(domain, path)` for the
+/// recognizer envelope (Task 14). The `Route` is validated-canonical by construction
+/// ([`crate::vocab::Route::new`]), so the `https://` prefix is guaranteed and the split is total:
+/// the first `/` after the scheme separates the domain from the path (which keeps its leading `/`);
+/// a path-less route (a bare domain) yields the root path `/`. The returned slices are `&'static`
+/// (the `Route` owns a `&'static str`), so they outlive the `&self` borrow and can back a `Request`.
+fn split_route(route: Route) -> (&'static str, &'static str) {
+    let s = route.as_str();
+    let rest = s.strip_prefix("https://").unwrap_or(s);
+    match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]), // path keeps its leading '/'
+        None => (rest, "/"),                 // bare domain → root path
     }
 }
 

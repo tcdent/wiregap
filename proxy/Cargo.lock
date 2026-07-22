@@ -3,6 +3,32 @@
 version = 4
 
 [[package]]
+name = "benchtools"
+version = "0.0.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "directpath"
+version = "0.0.0"
+dependencies = [
+ "benchtools",
+ "driver",
+ "libc",
+ "reactor",
+ "transport",
+]
+
+[[package]]
+name = "driver"
+version = "0.0.0"
+dependencies = [
+ "reactor",
+ "transport",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -65,6 +91,8 @@ version = "0.0.0"
 name = "proxy"
 version = "0.0.0"
 dependencies = [
+ "benchtools",
+ "directpath",
  "libc",
  "proto",
  "reactor",

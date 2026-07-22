@@ -33,6 +33,10 @@ pub mod anthropic;
 
 pub mod dispatch;
 
+pub mod nic;
+
+pub mod lifecycle;
+
 pub mod cloud_relay;
 
 pub mod terminal_relay;
@@ -44,3 +48,6 @@ pub mod leaf;
 
 #[cfg(unix)]
 pub mod open_discipline;
+
+#[cfg(unix)]
+pub mod privilege;

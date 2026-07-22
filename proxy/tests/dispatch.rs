@@ -12,6 +12,7 @@ use proto::{
     Message, NetAddress, NetPayload, Scheme, encode_message, scan_safe,
 };
 use proto::{FileRead, FileWrite};
+use proxy::anthropic::Denial;
 use proxy::dispatch::{Dispatcher, RelayKind, Routed, Service, service_of_verb};
 use proxy::register::anthropic::VETTED_TOOLS;
 use proxy::register::net::ROUTES;
@@ -79,9 +80,11 @@ fn relay_and_handler_channels_route_correctly() {
     assert_eq!(d.route(SessionId(5), &fr, ROUTES, VETTED_TOOLS), Routed::Relay(RelayKind::FileRead));
 
     // A net-payload single final chunk (more=false) completes the body and reaches the tier-1
-    // recognizer; `body-bytes` is not valid JSON, so the seam denies (Slice 2). The full seam
+    // recognizer — but only once a Route is established for the session (Sprint 8): a prior admitted
+    // net-address stores it. `body-bytes` is not valid JSON, so the seam then denies. The full seam
     // fidelity/transparency corpus lives in tests/net_payload_seam.rs.
     let mut d2 = Dispatcher::new();
+    let _ = d2.route(SessionId(6), &net_address("api.anthropic.com/v1/messages"), ROUTES, VETTED_TOOLS);
     let np = encode_message(&Message::NetPayload(NetPayload { more: false, content: b"body-bytes".to_vec() }));
     assert!(matches!(
         d2.route(SessionId(6), &np, ROUTES, VETTED_TOOLS),
@@ -217,9 +220,11 @@ fn reassemblers_are_in_flight_only_and_evict_via_close() {
     assert_eq!(d.binding(s), None);
 
     // A COMPLETING chunk removes the reassembler immediately — no residual after completion (a valid
-    // body admits and leaves nothing in the map; the session binding persists as normal).
+    // body admits and leaves nothing in the map; the session binding persists as normal). The session
+    // first admits a net-address so the recognizer envelope has a real Route to source (Sprint 8).
     let mut d2 = Dispatcher::new();
     let s2 = SessionId(71);
+    let _ = d2.route(s2, &net_address("api.anthropic.com/v1/messages"), ROUTES, VETTED_TOOLS);
     let done = d2.route(
         s2,
         &net_payload(br#"{"model":"claude-x","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}"#, false),
@@ -229,6 +234,57 @@ fn reassemblers_are_in_flight_only_and_evict_via_close() {
     assert!(matches!(done, Routed::NetPayloadAdmit(_)), "a complete valid body admits");
     assert_eq!(d2.reassembling_count(), 0, "a completed body leaves no reassembler behind");
     assert_eq!(d2.binding(s2), Some(Service::Net), "the session binding persists after completion");
+}
+
+/// Sprint 8 / Task 14 — the no-prior-Route rung: a `net-payload` that completes on a session with NO
+/// admitted `net-address` (no stored Route) fails closed with `NetPayloadNoRoute` — recognition never
+/// runs (there is no envelope to vet the request *as*), and the body is not forwarded. The verb-block
+/// service binding still happens (net-payload maps to Net); only the recognition step now needs a Route.
+#[test]
+fn net_payload_with_no_admitted_route_denies() {
+    let mut d = Dispatcher::new();
+    let s = SessionId(80);
+    // A complete, otherwise-valid Anthropic body — but no prior net-address, so no stored Route.
+    let body = br#"{"model":"claude-x","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}"#;
+    assert_eq!(
+        d.route(s, &net_payload(body, false), ROUTES, VETTED_TOOLS),
+        Routed::NetPayloadNoRoute,
+        "a net-payload with no admitted Route must fail closed, not self-bind and recognize with a stub",
+    );
+    // The verb-block service binding still happened (unchanged) — only recognition required the Route.
+    assert_eq!(d.binding(s), Some(Service::Net));
+}
+
+/// Sprint 8 / Task 14 — the recognizer envelope is sourced from the session's REAL Route, not a shared
+/// stub. Two different admitted routes recognize under two different envelopes: the SAME request body
+/// admits under `api.anthropic.com/v1/messages` but DENIES under `pypi.org/simple` (Stage-1
+/// `BadEnvelope`, domain/path mismatch). A shared hardcoded envelope (the old stub) would wrongly admit
+/// BOTH — so this discriminates the real route-binding from the stub-in-disguise.
+#[test]
+fn net_payload_envelope_is_route_sourced_not_a_shared_stub() {
+    let body = br#"{"model":"claude-x","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}"#;
+
+    // Session A: the Anthropic route → envelope POST api.anthropic.com /v1/messages → admits.
+    let mut d = Dispatcher::new();
+    let sa = SessionId(90);
+    let _ = d.route(sa, &net_address("api.anthropic.com/v1/messages"), ROUTES, VETTED_TOOLS);
+    assert!(
+        matches!(
+            d.route(sa, &net_payload(body, false), ROUTES, VETTED_TOOLS),
+            Routed::NetPayloadAdmit(_)
+        ),
+        "under the api.anthropic.com route, a valid Anthropic body admits",
+    );
+
+    // Session B: the pypi route → envelope POST pypi.org /simple → the Anthropic recognizer denies at
+    // Stage 1 (domain/path are not api.anthropic.com//v1/messages). The SAME body as session A.
+    let sb = SessionId(91);
+    let _ = d.route(sb, &net_address("pypi.org/simple"), ROUTES, VETTED_TOOLS);
+    assert_eq!(
+        d.route(sb, &net_payload(body, false), ROUTES, VETTED_TOOLS),
+        Routed::NetPayloadDeny(Denial::BadEnvelope),
+        "under the pypi route, the same body denies at Stage 1 — the envelope is route-sourced, not shared",
+    );
 }
 
 // ─── MB4 liveness: the reactor loop drives dispatch over a FAKE wire and terminates ──────────
