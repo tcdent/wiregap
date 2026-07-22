@@ -526,7 +526,7 @@ mod reactor_wiring {
     use super::*;
     use std::time::Duration;
     use reactor::{Host, Reactor, RxSource, WakeReason};
-    use transport::{Instant, SessionTable, TransmitSink};
+    use transport::{Instant, Originator, SessionTable, TransmitSink};
 
     /// A fake RX ring: yields a fixed list of pre-encoded L1 frames, then empties.
     struct FakeRx { frames: Vec<Vec<u8>>, pos: usize }
@@ -563,7 +563,10 @@ mod reactor_wiring {
             b
         };
         let rx = FakeRx { frames: vec![f1, f2], pos: 0 };
-        let mut r = Reactor::new(SessionTable::new(), FakeHost, rx, FakeSink);
+        // This endpoint is the proxy (it dispatches box-originated requests), so it allocates from
+        // the high half (box → Low, proxy → High; allocator.rs). No real partition stakes here — the
+        // fake ring's ids are peer-inbound — but High reads correctly for the role this test drives.
+        let mut r = Reactor::new(SessionTable::new(Originator::High), FakeHost, rx, FakeSink);
 
         let mut d = Dispatcher::new();
         let mut seen: Vec<(u64, Routed)> = Vec::new();

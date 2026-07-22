@@ -177,7 +177,11 @@ where
     F: FnMut(Event) -> ControlFlow<()>,
 {
     // Rungs 1–2: privileged bring-up + transport up (real hardware). Atomic — `?` yields no subsystem.
-    let subsystem = Subsystem::construct(local, allowlist, |_own_mac| peer_mac)?;
+    // `Endpoint::Proxy` is the proxy's FIXED identity (it originates response sessions from the high
+    // half of the id space; directpath maps it to `Originator::High`) — a constant of what this binary
+    // is, not a runtime/config choice, so it is hardcoded here rather than threaded as a parameter.
+    let subsystem =
+        Subsystem::construct(local, allowlist, directpath::Endpoint::Proxy, |_own_mac| peer_mac)?;
     let mut nic = RealNic(subsystem);
 
     // The real privilege drop, with the IB2 self-check folded in: after the drop, read the credential
