@@ -13,12 +13,19 @@
 
 
 use std::os::fd::{AsFd, OwnedFd};
+use std::path::PathBuf;
 
-use proto::{FileWrite, NetAddress, NetPayload, Reassembler, ReassemblyState, Reject, Wire, verb};
-use transport::SessionId;
+use proto::{
+    ErrorBody, ErrorCode, FileData, FileError, FileRead, FileWrite, List, ListEntries, Message,
+    NetAddress, NetError, NetPayload, Reassembler, ReassemblyState, Reject, Wire, encode_message,
+    verb,
+};
+use transport::{SendError, SessionId};
 
 use crate::anthropic::{Denial, Request, recognize};
+use crate::fs_read::{DirReader, DirStep, FileReader, ReadStep};
 use crate::fs_write::{QuarantineWriter, WriteStep};
+use crate::nic::Reply;
 use crate::vocab::{Route, ToolIdentity};
 
 /// Peek the L2 verb — the first `u32` (LE) of the payload — **without decoding the body**. This is
@@ -55,15 +62,21 @@ pub fn service_of_verb(verb: u32) -> Option<Service> {
     }
 }
 
-/// The verbs the proxy **acts on** (decodes + gates) today — the JC-1 reserved-check set: the four
-/// verbs `dispatch` itself decodes (`box-proxy.md` §3.1's gated set, minus `file-read`/`list`, whose
-/// acting-wiring is unbuilt and reply-path-gated — as-relayed they are JC-1-exempt). A relayed or
-/// control verb is **not** acted on, so JC-1 does not police it (relay is inert; §2). Matches on the
-/// low-byte id; the reserved-bit check is applied by the caller on the raw u32.
+/// The verbs the proxy **acts on** (decodes + gates) today — the JC-1 reserved-check set: the verbs
+/// `dispatch` itself decodes (`box-proxy.md` §3.1's gated set). `file-read` and `list` join here in
+/// Sprint 10 Slice 2 now that they are genuinely acted on (decoded + streamed, not relayed) — Sprint
+/// 9's own named JC-1 follow-up. A relayed or control verb is **not** acted on, so JC-1 does not police
+/// it (relay is inert; §2). Matches on the low-byte id; the reserved-bit check is applied by the caller
+/// on the raw u32.
 fn acts_on(verb: u32) -> bool {
     matches!(
         verb & 0xff,
-        verb::NET_ADDRESS | verb::FILE_WRITE | verb::FILE_CHUNK | verb::NET_PAYLOAD
+        verb::NET_ADDRESS
+            | verb::FILE_WRITE
+            | verb::FILE_CHUNK
+            | verb::NET_PAYLOAD
+            | verb::FILE_READ
+            | verb::LIST
     )
 }
 
@@ -85,10 +98,35 @@ pub enum Routed {
     /// A `file-chunk` appended `bytes` to the session's quarantine file (Sprint 9 Slice 2) — the
     /// confined write succeeded at the monotonic cursor.
     FileChunkAppended { bytes: usize },
-    /// A `file-chunk` was **denied** and the poisoned writer evicted: the confined open refused the
-    /// destination (traversal/symlink/exists), the per-file cap tripped, a write errored, or the chunk
-    /// arrived with no admitted `file-write` (no destination). Fail-closed; nothing (further) written.
-    FileChunkDeny,
+    /// A `file-chunk` was **denied** by the write floor / a write error, and the poisoned writer
+    /// evicted (Sprint 9 S2; Sprint 10 S4 JC-3 sub-cause split, designer ruling A 2026-07-22): the
+    /// confined open refused the destination (traversal/symlink/exists — the write-destination floor
+    /// firing one message later than `file-write`, so `code = Denied`), the per-file cap tripped
+    /// (`code = Malformed`), or the write errored (`code = Unavailable`). Each is a **meaningful
+    /// outcome the box must know** → notifies `file-error(code)`. Fail-closed; nothing further written.
+    FileChunkDeny { code: ErrorCode },
+    /// A `file-chunk` arrived with **no admitted `file-write`** (no destination) — **structural
+    /// protocol-noise** (JC-3a), not a policy deny: dropped, **silent**, no notification (designer
+    /// ruling A — "notify on a meaningful outcome, silent on structural noise"; the broad bucket).
+    FileChunkNoWriter,
+    /// A `file-read` was **admitted** (Sprint 10 Slice 2): its source opened fail-safe under the
+    /// readable root, and a per-session outbound [`ReplyStream`] is registered to stream `file-data`
+    /// back to the box. The bytes flow on later `pump_replies` ticks (bounded lazy stream, WouldBlock
+    /// -paced), each frame stamped with the request's own session id as `in-reply-to`.
+    FileReadStreaming,
+    /// A `file-read` failed **fail-safe** at open (not-found / denied / non-regular / i-o): the
+    /// read path is harmless, so a failed open reads nothing — no stream is registered. Carries the
+    /// proxy-owned [`ErrorCode`] (never a box name). The box-facing `file-error` *notification* is
+    /// JC-3's job (Slice 4); this slice registers no reply.
+    FileReadError { code: ErrorCode },
+    /// A `list` was **admitted** (Sprint 10 Slice 2): its directory opened fail-safe under the readable
+    /// root via the confined [`DirReader`], and a per-session outbound [`ReplyStream`] streams
+    /// `list-entry` records back (one per frame, bounded-lazy, WouldBlock-paced), each stamped with the
+    /// request's own session id as `in-reply-to`.
+    ListStreaming,
+    /// A `list` failed **fail-safe** at open (non-directory / not-found / i-o): no stream. Carries the
+    /// proxy-owned [`ErrorCode`] (no box name). The box-facing notification is JC-3's (Slice 4).
+    ListError { code: ErrorCode },
     /// A `net-payload` chunk accumulated into the session's [`Reassembler`]; its header flag was
     /// `more`, so more chunks are expected — no decision yet (the body is incomplete).
     NetPayloadAccumulating,
@@ -138,6 +176,178 @@ pub enum RelayKind {
     Terminal,
 }
 
+/// The source of an outbound reply stream — a confined fail-safe reader (Sprint 10 Slice 2). Each
+/// variant yields the next reply **message body** (proto-encoded) on demand; the shared streaming /
+/// pacing / eviction machinery in [`ReplyStream`] is identical for both. Its fd closes when dropped.
+/// The bounded depth of a **push** reply queue (net-response / terminal head→box), in frames. When a
+/// push stream holds this many un-drained frames, [`Dispatcher::enqueue_net_response`] /
+/// [`enqueue_terminal_to_box`](Dispatcher::enqueue_terminal_to_box) return [`Enqueue::Full`] —
+/// **backpressure to the ingress** (it must stop reading upstream/head and retry after the box drains),
+/// never a drop, never unbounded growth. Provisional scalar (marked for review), the outbound analog of
+/// the transport ring depth / `REASSEMBLY_CAP`.
+pub const REPLY_QUEUE_CAP: usize = 64;
+
+/// The result of enqueuing a push-reply frame — the flow-control signal to the ingress.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Enqueue {
+    /// The frame is queued for the box.
+    Accepted,
+    /// The queue is at [`REPLY_QUEUE_CAP`] — **backpressure**: the ingress must stop reading its source
+    /// and retry after the box drains. The frame was **not** taken (never dropped, never grows the queue).
+    Full,
+}
+
+/// The outcome of pulling the next frame from a [`ReplySource`].
+enum Pull {
+    /// The next final (framed) body to emit.
+    Body(alloc::vec::Vec<u8>),
+    /// Nothing available **right now**, but the source is **not** finished — a push queue awaiting more
+    /// from its (async) ingress. The stream stays live; the next tick retries. Pull sources never yield
+    /// this (a local reader always has a next chunk or EOF).
+    Pending,
+    /// The source is finished — end-of-file/dir (pull), or an empty **and closed** queue (push).
+    Done,
+}
+
+/// The source of an outbound reply stream (Sprint 10 Slices 2–3). Two shapes share ONE pacing core
+/// ([`ReplyStream`]): **pull** sources (a confined local reader — `file-read`/`list`) that always have a
+/// next chunk or EOF, and a **push** [`Queue`](ReplySource::Queue) (`net-response` / terminal head→box)
+/// fed asynchronously by an ingress, where "empty" means "wait for more," **not** "done." Each variant
+/// yields the FINAL frame bytes (pull sources `in_reply_to`-stamp here; the push queue holds
+/// already-prepared frames), so the pacing core is source-agnostic.
+enum ReplySource {
+    /// A `file-read` source — yields `file-data` frames, stamped with the request session. Never `Pending`.
+    File { reader: FileReader, in_reply_to: SessionId },
+    /// A `list` source — yields `list-entry` frames (one record each), stamped. Never `Pending`.
+    Dir { reader: DirReader, in_reply_to: SessionId },
+    /// A bounded push queue of ready-to-emit frames (net-response: `in_reply_to`-stamped by the enqueuer;
+    /// terminal head→box: verbatim, no key — emission per F1) plus a `closed` flag. Empty+open →
+    /// `Pending` (wait); empty+closed → `Done` (drained). Depth bounded by [`REPLY_QUEUE_CAP`] at enqueue.
+    Queue { frames: alloc::collections::VecDeque<alloc::vec::Vec<u8>>, closed: bool },
+}
+
+impl ReplySource {
+    /// The next FINAL frame to emit, or `Pending` (push queue awaiting more) / `Done` (finished).
+    fn next_frame(&mut self) -> Pull {
+        match self {
+            ReplySource::File { reader, in_reply_to } => match reader.next_chunk() {
+                ReadStep::Data(chunk) => {
+                    let body = encode_message(&Message::FileData(FileData(chunk)));
+                    Pull::Body(task16_stub_reply_frame(*in_reply_to, &body))
+                }
+                // EOF or a fail-safe read error: done (the box-facing error notification is JC-3, S4).
+                ReadStep::Eof | ReadStep::Error(_) => Pull::Done,
+            },
+            ReplySource::Dir { reader, in_reply_to } => match reader.next_entry() {
+                DirStep::Entry(e) => {
+                    let body = encode_message(&Message::ListEntries(ListEntries(alloc::vec![e])));
+                    Pull::Body(task16_stub_reply_frame(*in_reply_to, &body))
+                }
+                DirStep::Eof | DirStep::Error(_) => Pull::Done,
+            },
+            // EMPTY != DONE: an open queue that is momentarily empty is `Pending` (never evicted); only
+            // an empty AND closed queue is `Done` (the drained tail is never orphaned).
+            ReplySource::Queue { frames, closed } => match frames.pop_front() {
+                Some(frame) => Pull::Body(frame),
+                None if *closed => Pull::Done,
+                None => Pull::Pending,
+            },
+        }
+    }
+}
+
+/// One in-flight outbound reply stream — the **source-agnostic pacing core** (Sprint 10 Slices 2–3):
+/// WouldBlock-paced emission of successive framed bodies from a [`ReplySource`] (pull or push) to the
+/// box. The `in_reply_to` correlation is baked into each frame by the source (pull streams stamp;
+/// net-response is stamped by its enqueuer; terminal is verbatim), so this core never inspects content.
+struct ReplyStream {
+    /// The proxy→box reply session, opened lazily on the first emitted frame (`None` until then). From
+    /// the proxy's own high half.
+    reply_sid: Option<SessionId>,
+    /// The reply source (a confined local reader whose fd closes on drop, or a bounded push queue).
+    source: ReplySource,
+    /// One prepared-not-yet-sent frame, retained across ticks on `WouldBlock` — the single unit of
+    /// buffered pacing memory (the source's own bound caps the rest).
+    pending: Option<alloc::vec::Vec<u8>>,
+    /// Finished (source `Done`) — evicted after the current pump pass. **Never** set on a momentary
+    /// empty push queue (empty != done).
+    done: bool,
+}
+
+impl ReplyStream {
+    fn new(source: ReplySource) -> Self {
+        ReplyStream { reply_sid: None, source, pending: None, done: false }
+    }
+
+    /// Drain this stream as far as the wire accepts this tick (see [`Dispatcher::pump_replies`]).
+    fn pump(&mut self, reply: &mut dyn Reply) {
+        loop {
+            if self.done {
+                return;
+            }
+            // Pull the next frame only once the previous is fully sent (backpressure to the source).
+            if self.pending.is_none() {
+                match self.source.next_frame() {
+                    Pull::Body(frame) => self.pending = Some(frame),
+                    // Push queue momentarily empty (not closed): nothing to do this tick; stay live.
+                    Pull::Pending => return,
+                    // Source finished: mark done (evicted after the pass) and stop.
+                    Pull::Done => {
+                        self.done = true;
+                        return;
+                    }
+                }
+            }
+            let frame = self.pending.take().expect("pulled just above");
+            match self.reply_sid {
+                // First frame: open a new proxy→box reply session (origination cannot WouldBlock).
+                None => self.reply_sid = Some(reply.open(&frame)),
+                // Subsequent frames: send on the reply session, stop-and-wait paced.
+                Some(sid) => match reply.send(sid, &frame) {
+                    Ok(()) => {}
+                    Err(SendError::WouldBlock) => {
+                        // Retain the framed chunk and retry next tick — no drop (reliable-ordered).
+                        self.pending = Some(frame);
+                        return;
+                    }
+                    // A reply session we opened is never NotSender/NoSuchSession; treat any other error
+                    // as terminal and stop this stream (fail-safe).
+                    Err(_) => {
+                        self.done = true;
+                        return;
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// **TASK-16 STUB** — the reply-frame correlation-key wire layout is proto's Task 16 (queued, not
+/// written). A LOUD, deliberately non-canonical placeholder: prepend the 8-byte `in_reply_to` session
+/// id (big-endian, fixed-width) ahead of the proto-encoded reply message, so the *mechanism* — the key
+/// carried faithfully on EVERY frame (the request's own session, never the reply's) — is built and
+/// testable now. When proto Task 16 lands the canonical layout, this single choke point swaps to it and
+/// nothing else in the streaming/pacing/eviction path changes. **Not** a finalized wire format
+/// (Slice-2 acceptance forbids finalizing ahead of the fill-in).
+fn task16_stub_reply_frame(in_reply_to: SessionId, encoded_msg: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut frame = alloc::vec::Vec::with_capacity(8 + encoded_msg.len());
+    frame.extend_from_slice(&in_reply_to.0.to_be_bytes()); // the REQUEST session id, fixed-width u64
+    frame.extend_from_slice(encoded_msg);
+    frame
+}
+
+/// Encode a proxy-authored `file-error` body for a JC-3(b) notification — a category `code` only, with
+/// an **empty detail**: no box-supplied name ever enters the body (`file.md` §0; unsafe names are
+/// display-only and physically cannot reach a proxy-authored error).
+fn file_error(code: ErrorCode) -> alloc::vec::Vec<u8> {
+    encode_message(&Message::FileError(FileError(ErrorBody { code, detail: alloc::vec::Vec::new() })))
+}
+
+/// Encode a proxy-authored `net-error` body — a category `code` only, no box content (empty detail).
+fn net_error(code: ErrorCode) -> alloc::vec::Vec<u8> {
+    encode_message(&Message::NetError(NetError(ErrorBody { code, detail: alloc::vec::Vec::new() })))
+}
+
 /// The dispatch state: the per-session service binding (`box-proxy.md` §1.3). A session is bound
 /// once (its first frame's verb) and never re-bound.
 ///
@@ -184,6 +394,20 @@ pub struct Dispatcher {
     /// entry only while a file is mid-upload) whose per-file size is bounded by `QUARANTINE_WRITE_CAP`.
     /// The held fd closes on eviction (fd-lifecycle — scarcer than memory).
     writers: alloc::collections::BTreeMap<SessionId, QuarantineWriter>,
+    /// The readable-root path (Sprint 10 Slice 2), a config hook set by
+    /// [`Dispatcher::with_readable_root`] — the fail-safe FS **read** root (`fs_read`'s
+    /// `readable_root`, the read-path analog of `quarantine_root`). `None` when the read path is not
+    /// configured (a routing-only test), in which case a `file-read` routes as relayed (its pre-Slice-2
+    /// disposition). A serving proxy always sets it (the ladder validates FS roots first).
+    readable_root: Option<PathBuf>,
+    /// One in-flight outbound reply stream per admitted `file-read`/`list` session (Sprint 10 Slice 2):
+    /// `file-data` for a read, `list-entry` for a listing. Registered on admission, drained across
+    /// `pump_replies` ticks (bounded lazy stream, WouldBlock-paced), evicted on reply-completion and
+    /// `close_session` — its held source fd (`FileReader`/`DirReader`) closes on eviction. Shares the
+    /// reassembler/writers bounded-per-epoch MB4 shape; a *tighter* residual (an entry only while a
+    /// reply is mid-stream), and per-entry memory is one pulled-not-yet-sent frame, never the whole
+    /// source.
+    replies: alloc::collections::BTreeMap<SessionId, ReplyStream>,
     /// The per-session reassembly capacity bound. In production this is always
     /// `proto::verb::REASSEMBLY_CAP` (set by [`Dispatcher::new`]); a `#[cfg(test)]` constructor may
     /// inject a small cap to exercise the evict-on-overflow path cheaply — the field is otherwise
@@ -210,8 +434,23 @@ impl Dispatcher {
             routes: alloc::collections::BTreeMap::new(),
             quarantine_root: None,
             writers: alloc::collections::BTreeMap::new(),
+            readable_root: None,
+            replies: alloc::collections::BTreeMap::new(),
             reassembly_cap: verb::REASSEMBLY_CAP,
             dropped: 0,
+        }
+    }
+
+    /// Configure the fail-safe FS **read** path (Sprint 10 Slice 2): `root` is the readable root every
+    /// `file-read` source resolves under (`fs_read`'s `readable_root` — the read-path analog of
+    /// [`with_quarantine_root`](Self::with_quarantine_root)). Without it, a `file-read` routes as
+    /// relayed (its pre-Slice-2 disposition); a serving proxy always sets it (the ladder validates FS
+    /// roots first).
+    #[must_use]
+    pub fn with_readable_root(root: PathBuf) -> Self {
+        Dispatcher {
+            readable_root: Some(root),
+            ..Dispatcher::new()
         }
     }
 
@@ -242,12 +481,30 @@ impl Dispatcher {
         }
     }
 
-    /// Route one reactor-delivered frame: decode its L2 payload, bind or check the session, and
-    /// dispatch by verb. `register` is the tier-1 route register (U5's compiled-in
-    /// `register::net::ROUTES`) and `vetted` the tier-1 vetted-tool register
-    /// (`register::anthropic::VETTED_TOOLS`) — the two seams that reach the certified core. **Total**:
-    /// every input maps to exactly one [`Routed`], no panic.
+    /// Route one reactor-delivered frame: decode its L2 payload, bind or check the session, dispatch by
+    /// verb, and — on a JC-3(b) policy deny — enqueue the box-facing `file-error`/`net-error`
+    /// notification. `register` is the tier-1 route register (U5's compiled-in `register::net::ROUTES`)
+    /// and `vetted` the tier-1 vetted-tool register (`register::anthropic::VETTED_TOOLS`) — the two seams
+    /// that reach the certified core. **Total**: every input maps to exactly one [`Routed`], no panic.
     pub fn route(
+        &mut self,
+        session: SessionId,
+        payload: &[u8],
+        register: &[Route],
+        vetted: &[ToolIdentity],
+    ) -> Routed {
+        let routed = self.route_inner(session, payload, register, vetted);
+        // JC-3(b) (`box-proxy.md` §2, Sprint 10 Slice 4): a policy deny on an *acted* service notifies
+        // the box with the service's error verb, over the SAME push reply seam as net-response. Reused,
+        // never a re-implemented send path. Structural rejects (JC-3a), relayed/unsupported verbs, and
+        // admits do NOT notify — see [`notify_deny`](Self::notify_deny).
+        self.notify_deny(session, &routed);
+        routed
+    }
+
+    /// The routing + binding + dispatch decision, without the JC-3(b) notification side effect (that is
+    /// [`route`](Self::route)'s wrapper). Returns the [`Routed`] verdict.
+    fn route_inner(
         &mut self,
         session: SessionId,
         payload: &[u8],
@@ -347,10 +604,17 @@ impl Dispatcher {
             verb::FILE_CHUNK => self.route_file_chunk(session, body),
             verb::OPEN_SESSION => Routed::ToServiceHandler(Service::Control),
 
+            // ── Gated fail-safe read channels: open the confined source, stream the reply back (S10 S2) ──
+            verb::FILE_READ => self.route_file_read(session, body),
+            verb::LIST => self.route_list(session, body),
+
             // ── Relay channels: forward the OPAQUE payload; NO body decode (proxy-head.md §1) ──────
             verb::NET_RESPONSE | verb::NET_ERROR => Routed::Relay(RelayKind::CloudResponse),
-            verb::FILE_READ | verb::FILE_DATA | verb::FILE_ERROR | verb::LIST | verb::LIST_ENTRY
-            | verb::REQUEST_FILE => Routed::Relay(RelayKind::FileRead),
+            // `file-data`/`list-entry` are proxy→box REPLY verbs (the proxy emits them, never acts on an
+            // inbound one); `file-error` is JC-3's (Slice 4); `request-file` is head→box. Opaque-relayed.
+            verb::FILE_DATA | verb::FILE_ERROR | verb::LIST_ENTRY | verb::REQUEST_FILE => {
+                Routed::Relay(RelayKind::FileRead)
+            }
             verb::DISPLAY | verb::PANE_STATE | verb::KEY | verb::MOUSE | verb::PASTE | verb::FOCUS
             | verb::CREATE_PTY | verb::RESIZE | verb::VIEWPORT => Routed::Relay(RelayKind::Terminal),
 
@@ -439,15 +703,198 @@ impl Dispatcher {
         };
         let root_fd = root.as_fd();
         let Some(writer) = self.writers.get_mut(&session) else {
-            return Routed::FileChunkDeny; // a chunk with no admitted file-write — no destination
+            // A chunk with no admitted file-write — structural protocol-noise (JC-3a): silent, no notify.
+            return Routed::FileChunkNoWriter;
         };
         match writer.write_chunk(root_fd, body) {
             WriteStep::Appended(n) => Routed::FileChunkAppended { bytes: n },
-            WriteStep::Denied(_) | WriteStep::Capped | WriteStep::WriteFailed(_) => {
-                // Evict the poisoned writer so a later chunk cannot resume a denied/capped/errored write.
+            // A meaningful outcome the box must know → evict the poisoned writer and deny with the ruled
+            // code (designer ruling A): confined-open refusal = the write-destination floor firing late
+            // → Denied; per-file cap trip → Malformed; write i/o error → Unavailable.
+            WriteStep::Denied(_) => {
                 self.writers.remove(&session);
-                Routed::FileChunkDeny
+                Routed::FileChunkDeny { code: ErrorCode::Denied }
             }
+            WriteStep::Capped => {
+                self.writers.remove(&session);
+                Routed::FileChunkDeny { code: ErrorCode::Malformed }
+            }
+            WriteStep::WriteFailed(_) => {
+                self.writers.remove(&session);
+                Routed::FileChunkDeny { code: ErrorCode::Unavailable }
+            }
+        }
+    }
+
+    /// Admit a `file-read` (Sprint 10 Slice 2): decode the source, open it **fail-safe** under the
+    /// readable root via the reused [`FileReader`] (`O_NOFOLLOW`-final + regular-file check, unchanged),
+    /// and register a per-session outbound [`ReplyStream`] that later `pump_replies` ticks drain as
+    /// `file-data` frames. The stream's `in_reply_to` is **this request's own session id** (`session`) —
+    /// the box correlates the reply to its request by that echoed id, never by the reply's own
+    /// (proxy-high) session. A failed open is fail-safe ([`Routed::FileReadError`], no stream, no box
+    /// name); the box-facing `file-error` *notification* is JC-3's job (Slice 4). No readable root
+    /// configured ⇒ relay (the pre-Slice-2 disposition), never a silent accept.
+    fn route_file_read(&mut self, session: SessionId, body: &[u8]) -> Routed {
+        let Some(root) = self.readable_root.as_ref() else {
+            return Routed::Relay(RelayKind::FileRead); // read path not configured (routing-only)
+        };
+        match FileRead::decode(body) {
+            Ok(fr) => match FileReader::open(root, &fr.source) {
+                Ok(reader) => {
+                    // in_reply_to = the ORIGINATING request's session (`session`), NOT the reply session
+                    // `pump_replies` opens — the box correlates on the request id it already holds.
+                    self.replies
+                        .insert(session, ReplyStream::new(ReplySource::File { reader, in_reply_to: session }));
+                    Routed::FileReadStreaming
+                }
+                Err(err) => Routed::FileReadError { code: err.code },
+            },
+            Err(reject) => Routed::Decode(reject),
+        }
+    }
+
+    /// Admit a `list` (Sprint 10 Slice 2): decode the source directory, open it **fail-safe** under the
+    /// readable root via the confined [`DirReader`] (path-based `read_dir`, same unsayable-traversal
+    /// confinement as [`FileReader`], no new `unsafe`), and register a per-session outbound
+    /// [`ReplyStream`] that streams `list-entry` records back (one per frame, bounded-lazy). Like
+    /// `route_file_read`: `in_reply_to` is **this request's own session** (`session`); a failed open is
+    /// fail-safe ([`Routed::ListError`], no stream, no box name); no readable root ⇒ relay.
+    fn route_list(&mut self, session: SessionId, body: &[u8]) -> Routed {
+        let Some(root) = self.readable_root.as_ref() else {
+            return Routed::Relay(RelayKind::FileRead); // read path not configured (routing-only)
+        };
+        match List::decode(body) {
+            Ok(list) => match DirReader::open(root, &list.0) {
+                Ok(reader) => {
+                    self.replies
+                        .insert(session, ReplyStream::new(ReplySource::Dir { reader, in_reply_to: session }));
+                    Routed::ListStreaming
+                }
+                Err(err) => Routed::ListError { code: err.code },
+            },
+            Err(reject) => Routed::Decode(reject),
+        }
+    }
+
+    /// Drive every in-flight outbound reply stream one **pump tick** (Sprint 10 Slice 2): called from
+    /// the run-loop adapter on each `Event::Delivered`/`Event::Idle`, with the [`Reply`] handle live for
+    /// this callback invocation only (never held across calls). Bounded lazy stream, **WouldBlock-paced**
+    /// (F2): each stream drains as far as the wire accepts — one body pulled from the source (a
+    /// `file-data` chunk or a `list-entry` record), stamped with `in_reply_to` on EVERY frame, emitted
+    /// (first frame `open`s the reply session, the rest `send` on it); on [`SendError::WouldBlock`] the
+    /// pulled frame is **retained**
+    /// and retried next tick (no drop — reliable-ordered), so backpressure reaches the source and the
+    /// whole file is never buffered. Completed/errored streams are evicted after the pass (their
+    /// `FileReader` fd closes on drop — fd-lifecycle). Never panics.
+    pub fn pump_replies(&mut self, reply: &mut dyn Reply) {
+        // NAMED RESIDUAL — fairness, non-blocking (reviewer-ruled Slice 2, 2026-07-22: track-don't-fix):
+        // streams drain in BTreeMap id-order, so on the stop-and-wait wire a long low-id reply can
+        // deterministically starve higher-id replies until it completes. LIVENESS HOLDS (every reply is
+        // finite; no deadlock) and this matches the transport's own no-scheduler posture. The cheap fix,
+        // if concurrent-reply latency ever matters, is to rotate the drain-start index (round-robin) —
+        // deliberately NOT built now (not worth the scope for a fairness nicety).
+        for stream in self.replies.values_mut() {
+            stream.pump(reply);
+        }
+        // Evict finished streams — dropping each ReplyStream closes its source fd (fd-lifecycle).
+        self.replies.retain(|_, s| !s.done);
+    }
+
+    /// Enqueue one upstream cloud-response chunk for the box (Sprint 10 Slice 3) — `net-response`,
+    /// stamped with `box_session` (the box's ORIGINATING net-request session) as `in_reply_to`. Fed by
+    /// the cloud ingress (a **fake** in tests this slice; the real upstream TLS client is a follow-on),
+    /// drained to the box on `pump_replies` ticks. Bounded: returns [`Enqueue::Full`] as **backpressure**
+    /// at [`REPLY_QUEUE_CAP`] — the ingress must then stop reading upstream and retry (never drop, never
+    /// grow). Creates the per-session push stream on the first accepted chunk.
+    pub fn enqueue_net_response(&mut self, box_session: SessionId, chunk: &[u8]) -> Enqueue {
+        let body = crate::cloud_relay::relay_response(chunk);
+        let frame = task16_stub_reply_frame(box_session, &body);
+        self.push_reply_frame(box_session, frame)
+    }
+
+    /// Enqueue one head→box terminal frame for the box (Sprint 10 Slice 3) — relayed **VERBATIM**, no
+    /// `in_reply_to`: terminal input is *emission* (F1: emission with no originating request carries no
+    /// correlation key), and the terminal relay is zero-modification (MB3, `terminal_relay`). Fed by the
+    /// head ingress (a **fake** in tests; the real head connection is a follow-on). Same bounded
+    /// backpressure as [`enqueue_net_response`](Self::enqueue_net_response).
+    pub fn enqueue_terminal_to_box(&mut self, box_session: SessionId, payload: &[u8]) -> Enqueue {
+        self.push_reply_frame(box_session, payload.to_vec())
+    }
+
+    /// Enqueue a prepared frame into `box_session`'s push reply queue, bounded by [`REPLY_QUEUE_CAP`]:
+    /// **backpressure** ([`Enqueue::Full`]) when full — never drop, never grow. Creates the queue stream
+    /// on first use.
+    fn push_reply_frame(&mut self, box_session: SessionId, frame: alloc::vec::Vec<u8>) -> Enqueue {
+        let stream = self.replies.entry(box_session).or_insert_with(|| {
+            ReplyStream::new(ReplySource::Queue {
+                frames: alloc::collections::VecDeque::new(),
+                closed: false,
+            })
+        });
+        match &mut stream.source {
+            ReplySource::Queue { frames, .. } => {
+                if frames.len() >= REPLY_QUEUE_CAP {
+                    Enqueue::Full // backpressure: not taken, not dropped, not grown
+                } else {
+                    frames.push_back(frame);
+                    Enqueue::Accepted
+                }
+            }
+            // The session already carries a pull stream (file-read/list) — a net/terminal frame for it is
+            // a mis-key (services are session-bound, so this cannot arise); ignore defensively.
+            _ => Enqueue::Accepted,
+        }
+    }
+
+    /// Signal end-of-stream for a push reply (upstream/head EOF): the queue drains, then the stream
+    /// completes and is evicted on a later `pump_replies` pass (EMPTY != DONE holds until this). A no-op
+    /// for an unknown / non-push session.
+    pub fn close_reply(&mut self, box_session: SessionId) {
+        if let Some(stream) = self.replies.get_mut(&box_session)
+            && let ReplySource::Queue { closed, .. } = &mut stream.source
+        {
+            *closed = true;
+        }
+    }
+
+    /// JC-3(b) deny notification (Sprint 10 Slice 4): map a [`Routed`] policy-deny verdict to the
+    /// box-facing `file-error`/`net-error` and enqueue a single frame on `session`'s reply queue,
+    /// stamped `in_reply_to = session` (a deny is a reply to the box's request), then close it (single
+    /// frame → drains → evicted). Reuses the push seam; **no** box name in the error body (`file.md` §0).
+    ///
+    /// The taxonomy (`box-proxy.md` §2 JC-3 + §3.1; lead-ruled 2026-07-22):
+    /// - `file-write` deny → `file-error(Denied)`; `file-read`/`list` fail-safe → `file-error(<code>)`.
+    /// - `net-address` deny, recognizer deny, no-admitted-route → `net-error(Denied)`.
+    /// - net-payload reassembly cap-trip → `net-error(Malformed)` — the ONE structural reject the spec
+    ///   elevates to a notify; every OTHER `Decode` reject is JC-3(a) structural (drop+log, no return).
+    /// - reserved-verb deny (JC-1) → the verb's service error, `Malformed` (a formal defect in how the
+    ///   box built the message, like the cap-trip — lead ruling B).
+    /// - `file-chunk` deny (designer ruling A — sub-cause split): confined-open refusal → `file-error
+    ///   (Denied)` (the write-destination floor firing one message late), cap-trip → `file-error
+    ///   (Malformed)`, i/o error → `file-error(Unavailable)`; a chunk with **no admitted file-write** is
+    ///   silent structural noise ([`Routed::FileChunkNoWriter`]) → no notification.
+    /// - **No notification**: unsupported/mismatched verbs (JC-2, never bound to a service — ruling C),
+    ///   other structural rejects (JC-3a), `file-chunk`-no-writer noise, and every non-deny verdict.
+    fn notify_deny(&mut self, session: SessionId, routed: &Routed) {
+        let body = match routed {
+            Routed::FileWriteDeny => Some(file_error(ErrorCode::Denied)),
+            Routed::FileReadError { code }
+            | Routed::ListError { code }
+            | Routed::FileChunkDeny { code } => Some(file_error(*code)),
+            Routed::NetDeny | Routed::NetPayloadDeny(_) | Routed::NetPayloadNoRoute => {
+                Some(net_error(ErrorCode::Denied))
+            }
+            Routed::Decode(Reject::ReassemblyOverflow { .. }) => Some(net_error(ErrorCode::Malformed)),
+            Routed::ReservedDeny { verb } => Some(match service_of_verb(*verb) {
+                Some(Service::Net) => net_error(ErrorCode::Malformed),
+                _ => file_error(ErrorCode::Malformed),
+            }),
+            _ => None,
+        };
+        if let Some(body) = body {
+            let frame = task16_stub_reply_frame(session, &body);
+            self.push_reply_frame(session, frame);
+            self.close_reply(session); // single-frame notification: enqueue then close → drains → evicts
         }
     }
 
@@ -464,7 +911,17 @@ impl Dispatcher {
         // an fd leak is more acute than the map residuals). This IS the file's completion (file.md §1:
         // completion is the transport session ending — no wire close signal).
         self.writers.remove(&session);
+        // Drop any in-flight outbound reply stream — its source fd (a FileReader) closes here too. A
+        // reply cut short by session-end simply stops mid-stream (fail-safe: the box got a prefix).
+        self.replies.remove(&session);
         self.bindings.remove(&session)
+    }
+
+    /// The number of in-flight outbound reply streams (test/observability) — the tighter MB4 residual
+    /// (an entry only while a `file-read` is mid-stream; evicted on completion and `close_session`).
+    #[must_use]
+    pub fn replies_count(&self) -> usize {
+        self.replies.len()
     }
 
     /// The number of live session bindings — the O(sessions-per-epoch) resource the residual names.
@@ -536,6 +993,18 @@ mod tests {
         v
     }
 
+    /// A one-frame [`Reply`] recorder — captures the single JC-3 notification frame (`open`ed first).
+    struct CaptureReply(Option<Vec<u8>>);
+    impl Reply for CaptureReply {
+        fn open(&mut self, payload: &[u8]) -> SessionId {
+            self.0 = Some(payload.to_vec());
+            SessionId(1 << 63) // proxy-high; cosmetic for this recorder
+        }
+        fn send(&mut self, _id: SessionId, _payload: &[u8]) -> Result<(), SendError> {
+            Ok(())
+        }
+    }
+
     /// Dispatch-level **evict-on-overflow** (the one genuinely new bit of logic at this layer): a
     /// per-session reassembly that exceeds the cap fails closed with `Decode(ReassemblyOverflow)`
     /// **and** evicts the poisoned buffer, so a later chunk cannot resume an over-cap accumulation.
@@ -562,6 +1031,18 @@ mod tests {
         );
         assert_eq!(d.reassembling_count(), 0, "the poisoned reassembler is evicted on overflow");
         assert_eq!(d.dropped(), dropped_before + 1, "the overflow frame is counted as dropped");
+
+        // JC-3 (Slice 4): the cap-trip is the ONE structural reject the spec elevates to a notify —
+        // net-error(Malformed), stamped in_reply_to = the request session, over the push reply seam.
+        assert_eq!(d.replies_count(), 1, "the cap-trip enqueues a JC-3 net-error notification");
+        let mut cap = CaptureReply(None);
+        d.pump_replies(&mut cap);
+        let frame = cap.0.expect("one notification frame emitted");
+        assert_eq!(u64::from_be_bytes(frame[0..8].try_into().unwrap()), s.0, "stamped with the request session");
+        match proto::decode_message(&frame[8..]).expect("a net-error message") {
+            Message::NetError(ne) => assert_eq!(ne.0.code, ErrorCode::Malformed),
+            other => panic!("expected net-error(Malformed), got {other:?}"),
+        }
 
         // A fresh chunk on the same session starts a NEW reassembly (the evicted buffer did not
         // silently resume the over-cap accumulation).

@@ -18,31 +18,58 @@ use directpath::{Event, SessionId};
 use proto::{Message, NetAddress, NetPayload, Scheme, encode_message, scan_safe};
 use proxy::dispatch::{Dispatcher, Routed};
 use proxy::lifecycle::{AUTHORITIES, Authority, Readiness, run_adapter, serve, validate_authority};
-use proxy::nic::NicRun;
+use proxy::nic::{NicRun, Reply};
 use proxy::privilege::{Credentials, observe};
 use proxy::register::anthropic::VETTED_TOOLS;
 use proxy::register::net::ROUTES;
+use transport::{IdAllocator, Originator};
+
+/// A shared, ordered log of `(session, payload)` pairs the recording [`Reply`] captures.
+type ReplyLog = Rc<RefCell<Vec<(SessionId, Vec<u8>)>>>;
+
+/// A recording [`Reply`] handle: the reversal of R-c made assertable hardware-free. It mints reply ids
+/// from the proxy's OWN half via the **real committed** `transport::IdAllocator` (`Originator::High`,
+/// what `Endpoint::Proxy` selects), so even the fake's reply ids land in the proxy partition — never a
+/// box request id — and records every `open`/`send` for the test to inspect.
+struct RecordingReply {
+    alloc: IdAllocator,
+    opened: ReplyLog,
+    sent: ReplyLog,
+}
+impl Reply for RecordingReply {
+    fn open(&mut self, payload: &[u8]) -> SessionId {
+        let id = self.alloc.allocate();
+        self.opened.borrow_mut().push((id, payload.to_vec()));
+        id
+    }
+    fn send(&mut self, id: SessionId, payload: &[u8]) -> Result<(), directpath::SendError> {
+        self.sent.borrow_mut().push((id, payload.to_vec()));
+        Ok(())
+    }
+}
 
 /// A fake `NicRun`: records that `run` was entered (into a shared order log), delivers a fixed event
-/// list to the handler, and counts deliveries. No hardware.
+/// list to the handler — each with a recording [`Reply`] handle — and counts deliveries. No hardware.
 struct FakeNic {
     events: Vec<Event>,
     log: Rc<RefCell<Vec<&'static str>>>,
     deliveries: Rc<RefCell<usize>>,
+    opened: ReplyLog,
+    sent: ReplyLog,
 }
 impl NicRun for FakeNic {
-    fn open(&mut self, _payload: &[u8]) -> SessionId {
-        SessionId(0)
-    }
-    fn send(&mut self, _id: SessionId, _payload: &[u8]) -> Result<(), directpath::SendError> {
-        Ok(())
-    }
-    fn run<F: FnMut(Event) -> ControlFlow<()>>(&mut self, mut on_event: F) {
+    fn run<F: FnMut(&mut dyn Reply, Event) -> ControlFlow<()>>(&mut self, mut on_event: F) {
         self.log.borrow_mut().push("run");
+        // The reply handle a real proxy gets: origination from its own high half via the real allocator.
+        let mut reply = RecordingReply {
+            alloc: IdAllocator::new(Originator::High),
+            opened: self.opened.clone(),
+            sent: self.sent.clone(),
+        };
         let events: Vec<Event> = self.events.drain(..).collect();
         for ev in events {
             *self.deliveries.borrow_mut() += 1;
-            if on_event(ev).is_break() {
+            if on_event(&mut reply, ev).is_break() {
                 return;
             }
         }
@@ -52,7 +79,13 @@ impl NicRun for FakeNic {
 fn fake_nic(events: Vec<Event>, log: &Rc<RefCell<Vec<&'static str>>>) -> (FakeNic, Rc<RefCell<usize>>) {
     let deliveries = Rc::new(RefCell::new(0));
     (
-        FakeNic { events, log: log.clone(), deliveries: deliveries.clone() },
+        FakeNic {
+            events,
+            log: log.clone(),
+            deliveries: deliveries.clone(),
+            opened: Rc::new(RefCell::new(Vec::new())),
+            sent: Rc::new(RefCell::new(Vec::new())),
+        },
         deliveries,
     )
 }
@@ -70,7 +103,7 @@ fn all_authorities_valid_serves_and_drops_before_run() {
             Ok(())
         },
         |_authority| true, // every authority validates
-        |_ev| ControlFlow::Continue(()),
+        |_reply, _ev| ControlFlow::Continue(()),
     );
     assert_eq!(r, Readiness::Served);
     assert_eq!(*log.borrow(), vec!["drop", "run"], "the privilege drop must precede run (L15)");
@@ -92,7 +125,7 @@ fn any_single_broken_authority_closes_the_whole_proxy_named_and_run_never_entere
                 Ok(())
             },
             |authority| authority != broken,
-            |_ev| ControlFlow::Continue(()),
+            |_reply, _ev| ControlFlow::Continue(()),
         );
         assert_eq!(r, Readiness::Closed(broken), "the failed authority is named");
         assert_eq!(*log.borrow(), vec!["drop"], "run must NEVER be entered when an authority is broken");
@@ -109,7 +142,7 @@ fn a_failed_privilege_drop_closes_and_never_serves() {
         &mut nic,
         || Err(std::io::Error::from_raw_os_error(1)), // EPERM — the drop failed
         |_authority| true,
-        |_ev| ControlFlow::Continue(()),
+        |_reply, _ev| ControlFlow::Continue(()),
     );
     assert!(matches!(r, Readiness::DropFailed(_)), "a failed drop reports DropFailed");
     assert!(log.borrow().is_empty(), "a failed drop must not enter run (no box byte processed)");
@@ -145,7 +178,7 @@ fn production_ladder_holds_closed_pending_config_but_drops_first() {
             Ok(())
         },
         |authority| validate_authority(authority, ROUTES),
-        |_ev| ControlFlow::Continue(()),
+        |_reply, _ev| ControlFlow::Continue(()),
     );
     assert_eq!(
         r,
@@ -154,6 +187,59 @@ fn production_ladder_holds_closed_pending_config_but_drops_first() {
     );
     assert_eq!(*log.borrow(), vec!["drop"], "drop happened; run did not");
     assert_eq!(*deliveries.borrow(), 0);
+}
+
+// ── Sprint 10 Slice 1: the reply seam (R-c reversal), hardware-free ──────────────────────────────────
+
+/// The reply seam: `NicRun::run` hands the callback a [`Reply`] handle, and a handler that originates a
+/// response is **assertable without hardware** — the first time a proxy reply can be proven off the
+/// 82599. The recording fake mints the reply id from the proxy's OWN half via the real committed
+/// allocator, so the id lands in the proxy partition (top bit set), and the payload is echoed verbatim.
+#[test]
+fn reply_seam_hands_a_recording_handle_and_originate_in_response_is_assertable() {
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let (mut nic, _d) = fake_nic(vec![delivered(1, b"req".to_vec())], &log);
+    let mut reply_id = None;
+    // A minimal handler: on the delivery, open a reply session and send a follow-up frame on it.
+    nic.run(|reply, ev| {
+        if let Event::Delivered(_s, _p) = ev {
+            let id = reply.open(b"reply-body");
+            reply.send(id, b"more").unwrap();
+            reply_id = Some(id);
+        }
+        ControlFlow::Break(())
+    });
+    let opened = nic.opened.borrow();
+    assert_eq!(opened.len(), 1, "the handler originated exactly one reply session");
+    assert_eq!(opened[0].1, b"reply-body", "the reply payload is recorded verbatim (echoed, not interpreted)");
+    let id = reply_id.expect("the delivery originated a reply");
+    assert_ne!(id.0 & (1 << 63), 0, "the reply id lands in the proxy's high half (its own partition)");
+    let sent = nic.sent.borrow();
+    assert_eq!(sent.len(), 1, "one follow-up send");
+    assert_eq!(sent[0], (id, b"more".to_vec()), "the follow-up send targets the just-opened reply session");
+}
+
+/// Id-partition correctness against the REAL committed allocator (the R-c-reversal safety check): the
+/// proxy replies from `Endpoint::Proxy` → `Originator::High` (lifecycle bring_up + directpath's committed
+/// mapping). The committed `transport::IdAllocator` keeps that half disjoint from the box's `Low` half,
+/// so no proxy reply id (`Reply::open`) can ever collide with a box request id — the classic
+/// both-from-zero / N-stall the originator-partition exists to prevent.
+#[test]
+fn proxy_reply_ids_never_collide_with_box_request_ids() {
+    let mut proxy = IdAllocator::new(Originator::High);
+    let mut boxx = IdAllocator::new(Originator::Low);
+    let box_ids: std::collections::HashSet<u64> = (0..2000).map(|_| boxx.allocate().0).collect();
+    for _ in 0..2000 {
+        let reply = proxy.allocate().0;
+        assert_ne!(reply & (1 << 63), 0, "every proxy reply id is in the high half");
+        assert!(!box_ids.contains(&reply), "a proxy reply id must never collide with a box request id");
+    }
+    // The exact Fork-1 stall case: both endpoints' FIRST id must differ.
+    assert_ne!(
+        IdAllocator::new(Originator::High).allocate(),
+        IdAllocator::new(Originator::Low).allocate(),
+        "both-from-zero must not collide (the partition's whole point)",
+    );
 }
 
 // ── The privilege module's observable surface, hardware-free (the real drop is capture-model) ────────

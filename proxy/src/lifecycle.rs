@@ -26,7 +26,7 @@ use std::ops::ControlFlow;
 use directpath::{Bdf, Event, SessionId, Subsystem};
 
 use crate::dispatch::{Dispatcher, Routed};
-use crate::nic::{NicRun, RealNic};
+use crate::nic::{NicRun, RealNic, Reply};
 use crate::vocab::{Route, ToolIdentity};
 
 /// A named authority the proxy must validate before it serves — a channel of trust that, broken, holds
@@ -81,7 +81,7 @@ where
     N: NicRun,
     D: FnOnce() -> io::Result<()>,
     V: Fn(Authority) -> bool,
-    F: FnMut(Event) -> ControlFlow<()>,
+    F: FnMut(&mut dyn Reply, Event) -> ControlFlow<()>,
 {
     // Rung 1 end (L15): drop privilege before any authority check or box byte. Fail closed if the drop
     // — or its self-observation — did not complete; never serve at elevated privilege.
@@ -107,25 +107,37 @@ where
 /// per-session binding/route/reassembler state); the resulting [`Routed`] verdict is handed to
 /// `on_verdict` for observation. `Event::Idle` continues.
 ///
-/// **No `Ctx`.** The proxy never originates in response (R-c), so nothing is sent back this sprint —
-/// the adapter routes the receive path only. It never breaks on its **own**: the loop runs until the
-/// subsystem stops. `on_verdict` returns the [`ControlFlow`], so an observer *can* stop the loop (the
-/// Slice-5 e2e stops after its proof; production returns `Continue` and runs indefinitely).
+/// The receive-then-reply run-loop adapter. On each `Event::Delivered`, route the frame through the
+/// [`Dispatcher`] (which may register an outbound reply stream, e.g. an admitted `file-read`), hand the
+/// [`Routed`] verdict to `on_verdict`, then **pump the reply streams** via the [`Reply`] handle. On
+/// `Event::Idle`, pump the reply streams (so a stalled reply makes progress the moment the wire frees).
+///
+/// **The reply happens through the Slice-1 seam** ([`Dispatcher::pump_replies`] takes the `Reply`
+/// handle, live only for this callback invocation — never held across calls). Pacing/streaming/eviction
+/// all live in the dispatcher; the adapter only drives the ticks. The adapter never breaks on its
+/// **own**: the loop runs until the subsystem stops. `on_verdict` returns the [`ControlFlow`], so an
+/// observer *can* stop the loop (the Slice-5 e2e stops after its proof; production returns `Continue`).
 pub fn run_adapter<O>(
     mut dispatcher: Dispatcher,
     register: &'static [Route],
     vetted: &'static [ToolIdentity],
     mut on_verdict: O,
-) -> impl FnMut(Event) -> ControlFlow<()>
+) -> impl FnMut(&mut dyn Reply, Event) -> ControlFlow<()>
 where
     O: FnMut(SessionId, &Routed) -> ControlFlow<()>,
 {
-    move |event| match event {
+    move |reply, event| match event {
         Event::Delivered(session, payload) => {
             let routed = dispatcher.route(session, &payload, register, vetted);
-            on_verdict(session, &routed)
+            let cf = on_verdict(session, &routed);
+            dispatcher.pump_replies(reply); // drive any outbound reply stream (WouldBlock-paced)
+            cf
         }
-        Event::Idle => ControlFlow::Continue(()),
+        // Idle: no new frame, but push in-flight replies forward (a WouldBlock-stalled stream resumes).
+        Event::Idle => {
+            dispatcher.pump_replies(reply);
+            ControlFlow::Continue(())
+        }
     }
 }
 
@@ -174,7 +186,7 @@ pub fn bring_up<F>(
     on_event: F,
 ) -> io::Result<Readiness>
 where
-    F: FnMut(Event) -> ControlFlow<()>,
+    F: FnMut(&mut dyn Reply, Event) -> ControlFlow<()>,
 {
     // Rungs 1–2: privileged bring-up + transport up (real hardware). Atomic — `?` yields no subsystem.
     // `Endpoint::Proxy` is the proxy's FIXED identity (it originates response sessions from the high

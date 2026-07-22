@@ -402,12 +402,14 @@ fn jc1_exempts_relayed_verbs_reserved_bits_still_relay() {
         Routed::Relay(RelayKind::Terminal),
         "a relayed display verb with reserved bits must relay (JC-1 exempts relayed messages), not ReservedDeny",
     );
-    // file-read (0x22, FileRead relay) with a reserved byte set → Relay(FileRead), not ReservedDeny.
+    // request-file (0x26, FileRead relay) with a reserved byte set → Relay(FileRead), not ReservedDeny.
+    // (file-read AND list now ACT — Sprint 10 Slice 2 — so `request-file` (head→box, never proxy-acted)
+    // is the still-relayed FileRead-kind example.)
     let mut d = Dispatcher::new();
     assert_eq!(
-        d.route(SessionId(2), &set_reserved(&raw_frame(proto::verb::FILE_READ, b"src"), 0x0100_0000), ROUTES, VETTED_TOOLS),
+        d.route(SessionId(2), &set_reserved(&raw_frame(proto::verb::REQUEST_FILE, b"src"), 0x0100_0000), ROUTES, VETTED_TOOLS),
         Routed::Relay(RelayKind::FileRead),
-        "a relayed file-read verb with reserved bits must relay, not ReservedDeny (acting-wiring unbuilt/reply-path-gated)",
+        "a relayed request-file verb with reserved bits must relay, not ReservedDeny (proxy never acts on it)",
     );
 }
 
@@ -495,14 +497,15 @@ fn quarantine_write_appends_via_dispatch_and_closes_fd_on_session_end() {
     assert_eq!(d.writes_count(), 0, "close_session evicts the writer and closes its fd (fd-lifecycle)");
 }
 
-/// A file-chunk with NO admitted file-write (no destination declared) fails closed — FileChunkDeny,
-/// nothing created, no writer.
+/// A file-chunk with NO admitted file-write (no destination declared) is **structural protocol-noise**
+/// (JC-3a): `FileChunkNoWriter` — silent, no notification (designer ruling A), nothing created.
 #[test]
-fn file_chunk_with_no_prior_file_write_denies() {
+fn file_chunk_with_no_prior_file_write_is_silent_noise() {
     let sc = Scratch::new();
     let mut d = sc.dispatcher();
-    assert_eq!(d.route(SessionId(1), &file_chunk(b"x"), ROUTES, VETTED_TOOLS), Routed::FileChunkDeny);
+    assert_eq!(d.route(SessionId(1), &file_chunk(b"x"), ROUTES, VETTED_TOOLS), Routed::FileChunkNoWriter);
     assert_eq!(d.writes_count(), 0);
+    assert_eq!(d.replies_count(), 0, "structural noise is silent — NO JC-3 notification");
 }
 
 /// The confined open is the real floor, applied at chunk time — not just the file-write leaf gate: a
@@ -517,7 +520,13 @@ fn file_chunk_confined_open_deny_evicts_the_writer() {
     let mut d = sc.dispatcher();
     let s = SessionId(1);
     assert_eq!(d.route(s, &file_write_to("link/passwd"), ROUTES, VETTED_TOOLS), Routed::FileWriteAdmit, "leaf gate admits a clean-named destination");
-    assert_eq!(d.route(s, &file_chunk(b"x"), ROUTES, VETTED_TOOLS), Routed::FileChunkDeny, "the confined open denies the symlink escape");
+    // Confined-open refusal = the write-destination floor firing one message late → FileChunkDeny(Denied)
+    // (designer ruling A), which JC-3 notifies as file-error(Denied).
+    assert_eq!(
+        d.route(s, &file_chunk(b"x"), ROUTES, VETTED_TOOLS),
+        Routed::FileChunkDeny { code: proto::ErrorCode::Denied },
+        "the confined open denies the symlink escape",
+    );
     assert_eq!(d.writes_count(), 0, "the poisoned writer is evicted on the confined-open deny");
 }
 
@@ -582,5 +591,583 @@ mod reactor_wiring {
         assert!(seen.iter().any(|(s, r)| *s == 200 && matches!(r, Routed::FileWriteAdmit)));
         assert_eq!(d.binding(SessionId(100)), Some(Service::Net));
         assert_eq!(d.binding(SessionId(200)), Some(Service::File));
+    }
+}
+
+// ─── Sprint 10 Slice 2 — file-read acting + streaming reply ───────────────────────────────────
+mod file_read_reply {
+    use super::*;
+    use proxy::fs_read::READ_CHUNK;
+    use proxy::nic::Reply;
+    use transport::{IdAllocator, Originator, SendError};
+
+    /// A `file-read` request frame naming a flat source under the readable root.
+    fn file_read(name: &str) -> Vec<u8> {
+        encode_message(&Message::FileRead(FileRead {
+            source: proto::scan_unsafe(name.as_bytes()).unwrap(),
+        }))
+    }
+
+    /// A controllable [`Reply`] fake: mints reply ids from the proxy's own high half via the real
+    /// committed allocator, records every emitted frame **in order** (the `open`, then each `send`), and
+    /// WouldBlocks a `send` once its `budget` is exhausted — so pacing is exercised hardware-free.
+    struct FakeReply {
+        alloc: IdAllocator,
+        reply_sid: Option<SessionId>,
+        emitted: Vec<Vec<u8>>,
+        budget: usize,
+    }
+    impl FakeReply {
+        fn new(budget: usize) -> Self {
+            FakeReply { alloc: IdAllocator::new(Originator::High), reply_sid: None, emitted: Vec::new(), budget }
+        }
+    }
+    impl Reply for FakeReply {
+        fn open(&mut self, payload: &[u8]) -> SessionId {
+            let id = self.alloc.allocate();
+            self.reply_sid = Some(id);
+            self.emitted.push(payload.to_vec());
+            id
+        }
+        fn send(&mut self, id: SessionId, payload: &[u8]) -> Result<(), SendError> {
+            assert_eq!(Some(id), self.reply_sid, "a send must target the opened reply session");
+            if self.budget == 0 {
+                return Err(SendError::WouldBlock);
+            }
+            self.budget -= 1;
+            self.emitted.push(payload.to_vec());
+            Ok(())
+        }
+    }
+
+    /// Decode one reply frame: the 8-byte big-endian `in_reply_to` (the TASK-16 stub prefix), then the
+    /// proto `file-data` message. Returns `(in_reply_to, verbatim bytes)`.
+    fn decode_reply_frame(frame: &[u8]) -> (u64, Vec<u8>) {
+        let in_reply_to = u64::from_be_bytes(frame[0..8].try_into().unwrap());
+        match proto::decode_message(&frame[8..]).expect("a proto file-data message") {
+            Message::FileData(fd) => (in_reply_to, fd.0),
+            other => panic!("expected file-data, got {other:?}"),
+        }
+    }
+
+    fn three_chunk_content() -> Vec<u8> {
+        (0..(READ_CHUNK * 2 + 1024)).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// The happy path: an admitted file-read streams the file back as `file-data`, verbatim and in
+    /// order, each frame stamped with the REQUEST session as `in-reply-to` (never the reply's own
+    /// proxy-high id — the un-fakeable correlation check), and the completed stream is evicted (fd
+    /// closes).
+    #[test]
+    fn file_read_streams_file_data_stamped_with_the_request_session() {
+        let sc = Scratch::new();
+        let content = three_chunk_content();
+        std::fs::write(sc.dir.join("src.txt"), &content).unwrap();
+        let mut d = Dispatcher::with_readable_root(sc.dir.clone());
+        let s_req = SessionId(7); // a low-half request session
+        assert_eq!(d.route(s_req, &file_read("src.txt"), ROUTES, VETTED_TOOLS), Routed::FileReadStreaming);
+        assert_eq!(d.replies_count(), 1, "an admitted file-read registers one outbound stream");
+
+        let mut reply = FakeReply::new(usize::MAX);
+        d.pump_replies(&mut reply); // unlimited budget: drains fully in one tick, then evicts
+        assert_eq!(d.replies_count(), 0, "the completed stream is evicted (its FileReader fd closes)");
+
+        let reply_sid = reply.reply_sid.expect("a reply session was opened").0;
+        assert_ne!(reply_sid & (1 << 63), 0, "the reply session is the proxy's own high half");
+        assert!(reply.emitted.len() >= 3, "a >2-chunk file streamed as multiple frames");
+        let mut got = Vec::new();
+        for frame in &reply.emitted {
+            let (irt, body) = decode_reply_frame(frame);
+            // THE un-fakeable check: in_reply_to is the REQUEST session, never the reply session.
+            assert_eq!(irt, s_req.0, "every frame carries the request session as in-reply-to");
+            assert_ne!(irt, reply_sid, "in-reply-to must NOT be the reply's own session id");
+            got.extend_from_slice(&body);
+        }
+        assert_eq!(got, content, "the streamed file-data reassembles to the original, in order");
+    }
+
+    /// F2 pacing: a multi-chunk reply paces off `SendError::WouldBlock` — the stream is retained (never
+    /// dropped) across backpressure and resumes in order, delivering the whole file with no drop or
+    /// reorder, the correlation key on EVERY frame.
+    #[test]
+    fn file_read_reply_paces_off_wouldblock_no_drop_no_reorder() {
+        let sc = Scratch::new();
+        let content = three_chunk_content();
+        std::fs::write(sc.dir.join("src.txt"), &content).unwrap();
+        let mut d = Dispatcher::with_readable_root(sc.dir.clone());
+        let s_req = SessionId(9);
+        assert_eq!(d.route(s_req, &file_read("src.txt"), ROUTES, VETTED_TOOLS), Routed::FileReadStreaming);
+
+        // Budget 0: the first frame opens (origination cannot WouldBlock); the next send WouldBlocks.
+        let mut reply = FakeReply::new(0);
+        d.pump_replies(&mut reply);
+        assert_eq!(reply.emitted.len(), 1, "only the opened first frame went out; the rest is backpressured");
+        assert_eq!(d.replies_count(), 1, "the stream is retained across the WouldBlock, not dropped");
+
+        // Free one send per tick; the stream resumes in order until complete.
+        let mut ticks = 0;
+        while d.replies_count() > 0 {
+            ticks += 1;
+            assert!(ticks < 1000, "pacing made no progress");
+            reply.budget += 1;
+            d.pump_replies(&mut reply);
+        }
+        let mut got = Vec::new();
+        for frame in &reply.emitted {
+            let (irt, body) = decode_reply_frame(frame);
+            assert_eq!(irt, s_req.0, "the correlation key is on EVERY frame, not just the first");
+            got.extend_from_slice(&body);
+        }
+        assert_eq!(got, content, "WouldBlock-paced stream delivered the whole file in order, no drop");
+    }
+
+    /// JC-1 extends to file-read (now acted on): a nonzero reserved surface denies the whole message,
+    /// deny-without-binding, and registers no stream.
+    #[test]
+    fn file_read_reserved_bits_deny_whole_no_stream() {
+        let sc = Scratch::new();
+        let mut d = Dispatcher::with_readable_root(sc.dir.clone());
+        let frame = set_reserved(&file_read("whatever.txt"), 0x0100_0000);
+        assert!(matches!(
+            d.route(SessionId(1), &frame, ROUTES, VETTED_TOOLS),
+            Routed::ReservedDeny { .. }
+        ));
+        // No DATA stream (the verdict is a deny, not FileReadStreaming); but Slice 4 enqueues the JC-3
+        // notification (file-error), verified in the notification tests below.
+        assert_eq!(d.replies_count(), 1, "a reserved-denied file-read enqueues a JC-3 notification, not a data stream");
+        assert_eq!(d.binding_count(), 0, "deny-without-binding");
+    }
+
+    /// A missing source fails safe: `FileReadError` (proxy-owned code, no box name), no stream. The
+    /// box-facing `file-error` notification is JC-3's (Slice 4).
+    #[test]
+    fn file_read_missing_source_fails_safe_no_stream() {
+        let sc = Scratch::new();
+        let mut d = Dispatcher::with_readable_root(sc.dir.clone());
+        match d.route(SessionId(1), &file_read("does-not-exist.txt"), ROUTES, VETTED_TOOLS) {
+            Routed::FileReadError { code } => assert_eq!(code, proto::ErrorCode::NotFound),
+            other => panic!("expected a fail-safe FileReadError, got {other:?}"),
+        }
+        // No file-data stream (a failed open reads nothing); Slice 4 enqueues the file-error JC-3
+        // notification (content verified in the notification tests).
+        assert_eq!(d.replies_count(), 1, "a failed open enqueues a JC-3 file-error notification, no data stream");
+    }
+
+    /// fd-lifecycle: `close_session` evicts an in-flight reply stream (its source fd closes), mirroring
+    /// the writer eviction.
+    #[test]
+    fn close_session_evicts_an_in_flight_reply_stream() {
+        let sc = Scratch::new();
+        std::fs::write(sc.dir.join("src.txt"), vec![0u8; READ_CHUNK * 2]).unwrap();
+        let mut d = Dispatcher::with_readable_root(sc.dir.clone());
+        let s = SessionId(3);
+        assert_eq!(d.route(s, &file_read("src.txt"), ROUTES, VETTED_TOOLS), Routed::FileReadStreaming);
+        let mut reply = FakeReply::new(0);
+        d.pump_replies(&mut reply); // opens frame 1, backpressured on frame 2 → still in-flight
+        assert_eq!(d.replies_count(), 1, "stream in-flight");
+        d.close_session(s);
+        assert_eq!(d.replies_count(), 0, "close_session evicts the in-flight stream (source fd closes)");
+    }
+
+    /// With no readable root configured, a file-read routes as relayed (its pre-Slice-2 disposition),
+    /// never a silent accept, and registers no stream.
+    #[test]
+    fn file_read_without_readable_root_relays() {
+        let mut d = Dispatcher::new();
+        assert_eq!(
+            d.route(SessionId(1), &file_read("x.txt"), ROUTES, VETTED_TOOLS),
+            Routed::Relay(RelayKind::FileRead)
+        );
+        assert_eq!(d.replies_count(), 0);
+    }
+
+    // ─── the `list` dir-lister sub-gate (Slice 2, its own named adversarial corpus) ──────────────
+
+    fn list_frame(name: &str) -> Vec<u8> {
+        encode_message(&Message::List(proto::List(proto::scan_unsafe(name.as_bytes()).unwrap())))
+    }
+    fn decode_list_frame(frame: &[u8]) -> (u64, Vec<proto::ListEntry>) {
+        let irt = u64::from_be_bytes(frame[0..8].try_into().unwrap());
+        match proto::decode_message(&frame[8..]).expect("a proto list-entry message") {
+            Message::ListEntries(le) => (irt, le.0),
+            other => panic!("expected list-entry, got {other:?}"),
+        }
+    }
+    fn name_of(e: &proto::ListEntry) -> String {
+        String::from_utf8_lossy(e.name.as_bytes()).into_owned()
+    }
+
+    /// Happy path: a `list` streams the directory's entries as `list-entry` records — ONE entry per
+    /// frame (bounded-lazy, never slurped), each stamped with the REQUEST session as `in-reply-to`,
+    /// names typed + types correct, and the completed stream evicted.
+    #[test]
+    fn list_streams_entries_stamped_with_request_session() {
+        let sc = Scratch::new();
+        std::fs::create_dir(sc.dir.join("d")).unwrap();
+        std::fs::write(sc.dir.join("d/alpha.txt"), b"a").unwrap();
+        std::fs::write(sc.dir.join("d/beta.txt"), b"bb").unwrap();
+        std::fs::create_dir(sc.dir.join("d/sub")).unwrap();
+        let mut d = Dispatcher::with_readable_root(sc.dir.clone());
+        let s_req = SessionId(11);
+        assert_eq!(d.route(s_req, &list_frame("d"), ROUTES, VETTED_TOOLS), Routed::ListStreaming);
+        assert_eq!(d.replies_count(), 1);
+
+        let mut reply = FakeReply::new(usize::MAX);
+        d.pump_replies(&mut reply);
+        assert_eq!(d.replies_count(), 0, "the completed list stream is evicted");
+        assert_eq!(reply.emitted.len(), 3, "three entries → three frames (one entry each, bounded-lazy)");
+
+        let mut names = std::collections::HashSet::new();
+        for frame in &reply.emitted {
+            let (irt, entries) = decode_list_frame(frame);
+            assert_eq!(irt, s_req.0, "every list-entry frame carries the request session as in-reply-to");
+            assert_eq!(entries.len(), 1, "ONE entry per frame — never slurps the whole directory");
+            let e = &entries[0];
+            let ft = if name_of(e) == "sub" { proto::FileType::Dir } else { proto::FileType::File };
+            assert_eq!(e.file_type, ft, "entry type is correct");
+            names.insert(name_of(e));
+        }
+        let expected: std::collections::HashSet<String> =
+            ["alpha.txt", "beta.txt", "sub"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(names, expected, "all entries listed, names typed verbatim");
+    }
+
+    /// The symlink-follow accepted-harmless case (sub-gate #6): a symlinked source directory is followed
+    /// by `read_dir` and lists the TARGET's names — free on a fail-safe read channel (listing a
+    /// different directory is harmless), documented as accepted, not papered as a hole.
+    #[test]
+    fn list_symlink_source_follows_target_harmless() {
+        let sc = Scratch::new();
+        std::fs::create_dir(sc.dir.join("real")).unwrap();
+        std::fs::write(sc.dir.join("real/inside.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(sc.dir.join("real"), sc.dir.join("link")).unwrap();
+        let mut d = Dispatcher::with_readable_root(sc.dir.clone());
+        assert_eq!(d.route(SessionId(1), &list_frame("link"), ROUTES, VETTED_TOOLS), Routed::ListStreaming);
+        let mut reply = FakeReply::new(usize::MAX);
+        d.pump_replies(&mut reply);
+        let mut names = std::collections::HashSet::new();
+        for frame in &reply.emitted {
+            let (_, entries) = decode_list_frame(frame);
+            for e in &entries {
+                names.insert(name_of(e));
+            }
+        }
+        assert!(names.contains("inside.txt"), "the symlinked source lists its target's entries (harmless follow)");
+    }
+
+    /// Fail-safe on a non-directory (sub-gate #2): `read_dir` on a regular file errors → `ListError`,
+    /// no stream, no box name.
+    #[test]
+    fn list_non_directory_fails_safe_no_stream() {
+        let sc = Scratch::new();
+        std::fs::write(sc.dir.join("afile"), b"x").unwrap();
+        let mut d = Dispatcher::with_readable_root(sc.dir.clone());
+        match d.route(SessionId(1), &list_frame("afile"), ROUTES, VETTED_TOOLS) {
+            Routed::ListError { .. } => {}
+            other => panic!("expected a fail-safe ListError on a non-directory, got {other:?}"),
+        }
+        assert_eq!(d.replies_count(), 1, "the ListError enqueues a JC-3 file-error notification, no data stream");
+    }
+
+    /// Fail-safe on a missing source: `ListError` with `NotFound`, no stream.
+    #[test]
+    fn list_missing_source_fails_safe() {
+        let sc = Scratch::new();
+        let mut d = Dispatcher::with_readable_root(sc.dir.clone());
+        match d.route(SessionId(1), &list_frame("nope"), ROUTES, VETTED_TOOLS) {
+            Routed::ListError { code } => assert_eq!(code, proto::ErrorCode::NotFound),
+            other => panic!("expected ListError NotFound, got {other:?}"),
+        }
+    }
+
+    /// Traversal/absolute sources are structurally unrepresentable (sub-gate #1): the `list` source is an
+    /// `UnsafeSegmentStack` via `scan_unsafe`, which rejects `..`/`.`/`/` — the same codec floor as
+    /// file-read/file-write. A traversal source can never reach the dir-lister.
+    #[test]
+    fn list_traversal_source_unrepresentable_at_the_codec() {
+        assert!(proto::scan_unsafe(b"..").is_err(), "`..` is not a representable list source");
+        assert!(proto::scan_unsafe(b".").is_err(), "`.` is not a representable list source");
+    }
+
+    /// JC-1 extends to list (now acted on): a nonzero reserved surface denies the whole message,
+    /// deny-without-binding, no stream.
+    #[test]
+    fn list_reserved_bits_deny_whole_no_stream() {
+        let sc = Scratch::new();
+        std::fs::create_dir(sc.dir.join("d")).unwrap();
+        let mut d = Dispatcher::with_readable_root(sc.dir.clone());
+        let frame = set_reserved(&list_frame("d"), 0x0100_0000);
+        assert!(matches!(
+            d.route(SessionId(1), &frame, ROUTES, VETTED_TOOLS),
+            Routed::ReservedDeny { .. }
+        ));
+        assert_eq!(d.replies_count(), 1, "a reserved-denied list enqueues a JC-3 notification, not a data stream");
+        assert_eq!(d.binding_count(), 0, "deny-without-binding");
+    }
+
+    /// With no readable root configured, a list routes as relayed, never a silent accept, no stream.
+    #[test]
+    fn list_without_readable_root_relays() {
+        let mut d = Dispatcher::new();
+        assert_eq!(
+            d.route(SessionId(1), &list_frame("d"), ROUTES, VETTED_TOOLS),
+            Routed::Relay(RelayKind::FileRead)
+        );
+        assert_eq!(d.replies_count(), 0);
+    }
+
+    // ─── Sprint 10 Slice 3 — the relay reply halves: push-fed queue (fake ingress) ───────────────
+    //
+    // BOUNDARY HONESTY (gate 4): these prove the box-facing SEND + the push-queue pacing against a
+    // FAKE ingress that simulates cloud/head data arriving — NOT the real upstream TLS client or head
+    // connection (an explicit follow-on). Same receive-only-style honesty as Sprint 8.
+    use proxy::dispatch::{Enqueue, REPLY_QUEUE_CAP};
+
+    fn decode_net_response_frame(frame: &[u8]) -> (u64, Vec<u8>) {
+        let irt = u64::from_be_bytes(frame[0..8].try_into().unwrap());
+        match proto::decode_message(&frame[8..]).expect("a proto net-response message") {
+            Message::NetResponse(nr) => (irt, nr.0),
+            other => panic!("expected net-response, got {other:?}"),
+        }
+    }
+
+    /// net-response shares the push-fed shape: chunks arriving from the (fake) cloud ingress stream to
+    /// the box as `net-response`, verbatim and in order, each stamped with the BOX's originating
+    /// net-request session as `in_reply_to` (never the reply's own session), then closed → evicted.
+    #[test]
+    fn net_response_streams_stamped_with_the_box_request_session() {
+        let mut d = Dispatcher::new(); // no readable root — this is the push (ingress) path
+        let s_req = SessionId(21); // the box's net-request session (box-low)
+        assert_eq!(d.enqueue_net_response(s_req, b"chunk-A"), Enqueue::Accepted);
+        assert_eq!(d.enqueue_net_response(s_req, b"chunk-B"), Enqueue::Accepted);
+        assert_eq!(d.enqueue_net_response(s_req, b"chunk-C"), Enqueue::Accepted);
+        assert_eq!(d.replies_count(), 1, "one push reply stream for the session");
+        d.close_reply(s_req); // upstream EOF
+
+        let mut reply = FakeReply::new(usize::MAX);
+        d.pump_replies(&mut reply);
+        assert_eq!(d.replies_count(), 0, "closed + drained → evicted");
+        let reply_sid = reply.reply_sid.expect("a reply session opened").0;
+        let mut chunks = Vec::new();
+        for frame in &reply.emitted {
+            let (irt, chunk) = decode_net_response_frame(frame);
+            assert_eq!(irt, s_req.0, "every net-response frame stamped with the BOX request session");
+            assert_ne!(irt, reply_sid, "in-reply-to is NOT the reply's own session");
+            chunks.push(chunk);
+        }
+        assert_eq!(chunks, vec![b"chunk-A".to_vec(), b"chunk-B".to_vec(), b"chunk-C".to_vec()], "verbatim, in order");
+    }
+
+    /// GATE 1 — bounded with backpressure, never drop: the fake ingress pushes FASTER than the box
+    /// drains; the queue is capped at REPLY_QUEUE_CAP and returns `Full` (the ingress stops reading),
+    /// and every pushed chunk is eventually delivered, in order, none dropped, none reordered.
+    #[test]
+    fn net_response_backpressures_when_pushed_faster_than_drained_never_drops() {
+        let mut d = Dispatcher::new();
+        let s = SessionId(22);
+        let total: u32 = (REPLY_QUEUE_CAP * 3) as u32; // want to push 3× the queue depth
+        let mut next_push = 0u32;
+        let mut saw_backpressure = false;
+        let mut reply = FakeReply::new(0);
+        let mut delivered: Vec<u32> = Vec::new();
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            assert!(guard < 1_000_000, "no forward progress");
+            // Ingress pushes as fast as it can until backpressured — NEVER drops.
+            while next_push < total {
+                match d.enqueue_net_response(s, &next_push.to_le_bytes()) {
+                    Enqueue::Accepted => next_push += 1,
+                    Enqueue::Full => {
+                        saw_backpressure = true;
+                        break;
+                    }
+                }
+            }
+            if next_push == total {
+                d.close_reply(s);
+            }
+            // The box drains SLOWLY — one more send freed per tick.
+            reply.budget += 1;
+            let before = reply.emitted.len();
+            d.pump_replies(&mut reply);
+            for f in &reply.emitted[before..] {
+                delivered.push(u32::from_le_bytes(decode_net_response_frame(f).1.try_into().unwrap()));
+            }
+            if next_push == total && d.replies_count() == 0 {
+                break;
+            }
+        }
+        assert!(saw_backpressure, "pushing faster than draining MUST hit the bounded-queue backpressure");
+        assert_eq!(delivered.len() as u32, total, "every pushed chunk delivered — backpressure never dropped one");
+        assert!(delivered.iter().copied().eq(0..total), "delivered strictly in order — no reorder");
+    }
+
+    /// GATE 2 — EMPTY != DONE: a momentarily-empty (still-open) push queue is NOT evicted; a late chunk
+    /// streams on the same live reply session; only close_reply + drain evicts (the tail is never
+    /// orphaned).
+    #[test]
+    fn push_reply_empty_is_not_done_only_closed_and_drained_evicts() {
+        let mut d = Dispatcher::new();
+        let s = SessionId(23);
+        d.enqueue_net_response(s, b"first");
+        let mut reply = FakeReply::new(usize::MAX);
+        d.pump_replies(&mut reply); // drains "first"; queue now EMPTY but OPEN
+        assert_eq!(reply.emitted.len(), 1);
+        assert_eq!(d.replies_count(), 1, "empty-but-open stream is NOT evicted (waiting for more)");
+
+        d.enqueue_net_response(s, b"second"); // a late chunk arrives
+        d.pump_replies(&mut reply);
+        assert_eq!(reply.emitted.len(), 2, "the late chunk streamed on the still-live reply session");
+        assert_eq!(d.replies_count(), 1, "still open");
+
+        d.close_reply(s); // upstream EOF → drain (nothing left) → done → evicted
+        d.pump_replies(&mut reply);
+        assert_eq!(d.replies_count(), 0, "closed + drained → evicted");
+    }
+
+    /// Terminal head→box shares the push-fed shape but is relayed VERBATIM — emission (F1: no
+    /// correlation key) + zero-modification relay (MB3): the emitted frame is byte-identical to the
+    /// input, with NO proxy-added in_reply_to prefix.
+    #[test]
+    fn terminal_head_to_box_relayed_verbatim_no_correlation_key() {
+        let mut d = Dispatcher::new();
+        let s = SessionId(24); // the box terminal session
+        let input = raw_frame(proto::verb::KEY, b"keystroke-bytes"); // an opaque head→box input frame
+        assert_eq!(d.enqueue_terminal_to_box(s, &input), Enqueue::Accepted);
+        d.close_reply(s);
+        let mut reply = FakeReply::new(usize::MAX);
+        d.pump_replies(&mut reply);
+        assert_eq!(reply.emitted.len(), 1);
+        assert_eq!(reply.emitted[0], input, "terminal input relayed byte-identical — no proxy-added key");
+    }
+
+    /// A push reply stream is evicted on close_session too (fd-lifecycle parity with the pull streams).
+    #[test]
+    fn push_reply_evicted_on_close_session() {
+        let mut d = Dispatcher::new();
+        let s = SessionId(25);
+        d.enqueue_net_response(s, b"x");
+        assert_eq!(d.replies_count(), 1);
+        d.close_session(s);
+        assert_eq!(d.replies_count(), 0, "close_session evicts a push reply stream too");
+    }
+
+    // ─── Sprint 10 Slice 4 — JC-3 deny-notification content (the ruled taxonomy) ─────────────────
+
+    #[derive(PartialEq, Eq, Debug)]
+    enum Notif {
+        File(proto::ErrorCode),
+        Net(proto::ErrorCode),
+    }
+    fn decode_notification(frame: &[u8]) -> (u64, Notif) {
+        let irt = u64::from_be_bytes(frame[0..8].try_into().unwrap());
+        let n = match proto::decode_message(&frame[8..]).expect("a proto error message") {
+            Message::FileError(fe) => Notif::File(fe.0.code),
+            Message::NetError(ne) => Notif::Net(ne.0.code),
+            other => panic!("expected file-error/net-error, got {other:?}"),
+        };
+        (irt, n)
+    }
+    /// Drive the (already-routed) deny's single-frame notification out and decode it.
+    fn notification_of(d: &mut Dispatcher) -> (u64, Notif) {
+        let mut reply = FakeReply::new(usize::MAX);
+        d.pump_replies(&mut reply);
+        assert_eq!(reply.emitted.len(), 1, "a JC-3 notification is exactly one frame");
+        decode_notification(&reply.emitted[0])
+    }
+    fn net_payload(content: &[u8]) -> Vec<u8> {
+        encode_message(&Message::NetPayload(NetPayload { more: false, content: content.to_vec() }))
+    }
+
+    /// A reserved-verb deny (JC-1) notifies with the VERB's service error and code Malformed (ruling B):
+    /// a net verb → net-error(Malformed); a file verb → file-error(Malformed). Stamped in_reply_to = the
+    /// request session.
+    #[test]
+    fn jc3_reserved_deny_notifies_service_error_malformed() {
+        // net verb (net-address): net-error(Malformed).
+        let mut d = Dispatcher::new();
+        let s = SessionId(31);
+        assert!(matches!(
+            d.route(s, &set_reserved(&net_address("api.anthropic.com/v1/messages"), 0x0100_0000), ROUTES, VETTED_TOOLS),
+            Routed::ReservedDeny { .. }
+        ));
+        assert_eq!(notification_of(&mut d), (s.0, Notif::Net(proto::ErrorCode::Malformed)));
+
+        // file verb (file-read): file-error(Malformed).
+        let sc = Scratch::new();
+        let mut d = Dispatcher::with_readable_root(sc.dir.clone());
+        let s = SessionId(32);
+        assert!(matches!(
+            d.route(s, &set_reserved(&file_read("x.txt"), 0x0100_0000), ROUTES, VETTED_TOOLS),
+            Routed::ReservedDeny { .. }
+        ));
+        assert_eq!(notification_of(&mut d), (s.0, Notif::File(proto::ErrorCode::Malformed)));
+    }
+
+    /// A fail-safe file-read (missing source) notifies file-error with the fail-safe code (NotFound).
+    #[test]
+    fn jc3_file_read_failsafe_notifies_file_error_code() {
+        let sc = Scratch::new();
+        let mut d = Dispatcher::with_readable_root(sc.dir.clone());
+        let s = SessionId(33);
+        assert!(matches!(
+            d.route(s, &file_read("nope.txt"), ROUTES, VETTED_TOOLS),
+            Routed::FileReadError { .. }
+        ));
+        assert_eq!(notification_of(&mut d), (s.0, Notif::File(proto::ErrorCode::NotFound)));
+    }
+
+    /// A net-payload with no admitted route notifies net-error(Denied) (ruling D).
+    #[test]
+    fn jc3_net_payload_no_route_notifies_net_error_denied() {
+        let mut d = Dispatcher::new();
+        let s = SessionId(34);
+        assert_eq!(
+            d.route(s, &net_payload(b"{}"), ROUTES, VETTED_TOOLS),
+            Routed::NetPayloadNoRoute
+        );
+        assert_eq!(notification_of(&mut d), (s.0, Notif::Net(proto::ErrorCode::Denied)));
+    }
+
+    /// A file-chunk confined-open deny notifies file-error(Denied) — the write-destination floor firing
+    /// one message late (ruling A).
+    #[test]
+    fn jc3_file_chunk_confined_open_deny_notifies_file_error_denied() {
+        let sc = Scratch::new();
+        std::os::unix::fs::symlink("/etc", sc.dir.join("link")).unwrap();
+        let mut d = sc.dispatcher(); // quarantine-root configured
+        let s = SessionId(35);
+        assert_eq!(d.route(s, &file_write_to("link/passwd"), ROUTES, VETTED_TOOLS), Routed::FileWriteAdmit);
+        assert_eq!(
+            d.route(s, &file_chunk(b"x"), ROUTES, VETTED_TOOLS),
+            Routed::FileChunkDeny { code: proto::ErrorCode::Denied }
+        );
+        assert_eq!(notification_of(&mut d), (s.0, Notif::File(proto::ErrorCode::Denied)));
+    }
+
+    /// An unsupported verb (JC-2, never bound to a service) is SILENT — no notification (ruling C).
+    #[test]
+    fn jc3_unsupported_verb_is_silent() {
+        let mut d = Dispatcher::new();
+        let s = SessionId(36);
+        assert!(matches!(
+            d.route(s, &raw_frame(0x4F, b""), ROUTES, VETTED_TOOLS), // block 4 → no service
+            Routed::Unsupported { .. }
+        ));
+        assert_eq!(d.replies_count(), 0, "an unsupported verb notifies NOTHING (JC-2/JC-3a)");
+    }
+
+    /// A structural decode reject (non-cap) is SILENT — JC-3(a), drop+log, no return.
+    #[test]
+    fn jc3_structural_decode_is_silent() {
+        let mut d = Dispatcher::new();
+        let s = SessionId(37);
+        // A net-address verb with a truncated body → a proto decode Reject (structural), not a policy deny.
+        assert!(matches!(
+            d.route(s, &raw_frame(proto::verb::NET_ADDRESS, &[0x00]), ROUTES, VETTED_TOOLS),
+            Routed::Decode(_)
+        ));
+        assert_eq!(d.replies_count(), 0, "a structural decode reject notifies NOTHING (JC-3a)");
     }
 }

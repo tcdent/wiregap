@@ -8,8 +8,8 @@
 > `docs/teams/proxy/003-*.md`). The **fill-in half is now pinned** against the finalized
 > `directpath` public API (§4, sprint `docs/teams/proxy/008-*.md` Slice 1): each demand
 > mapped to its concrete API form, and the one real gap found (D-3, quiescence) **named and
-> routed to the nic team** rather than accepted as satisfied. One currency caveat: the
-> finalized API is pinned to a working-tree content anchor, not yet a commit (R-7). Clause
+> routed to the nic team** rather than accepted as satisfied. The finalized API is now pinned to
+> `directpath`'s commit `a5a215c` (R-7 discharged 2026-07-22). Clause
 > tagging per `contract/box-proxy.md`; owners: **nic**, **policy**, **proxy**.
 
 ---
@@ -93,15 +93,15 @@ re-exported `Bdf`/`SessionId`; every hardware module (`gate`/`pci`/`mem`/`datapa
 `cfg(feature = "bench")`, compile-absent from the proxy/TCB build. **The API identifiers below
 are the nic team's, cited — not asserted or owned by this contract.**
 
-**Pin.** `directpath/src/lib.rs`, content-anchored at sha256
-`3c69e5ddca431e8cb48dacfb161d41a1ea8af8b63fb10e2a9bd244d82c17e724` (re-pinned 2026-07-22 when the
-NIC team landed the session-continuation surface — the prior anchor `3b9319af…` predates `send(id)`).
-*Commit pin still pending (R-7):* the surface remains uncommitted working-tree state (a 440-line diff
-against repo HEAD `0ebfaa0`, no new commit), so the content anchor stands and is **re-verified at each
-dependent slice** per the recurring-pin discipline — re-pin to the NIC team's commit hash once landed.
+**Pin.** `directpath/src/lib.rs`, pinned to commit `a5a215c` (`nic: originator-partition the session-id
+space so both endpoints originate — sprint 9, task 15`) — **R-7 discharged** (2026-07-22): the facade is
+now committed, so the exact-commit pin replaces the interim content anchor
+(`3c69e5dd…`) and retires the recurring re-verify-per-slice discipline that an uncommitted source
+required. This pin includes the `endpoint: Endpoint` originator-partition argument `a5a215c` added to
+`construct`.
 
 The cited surface:
-- `Subsystem::construct(local: Bdf, allowlist: &[Bdf], resolve_peer: impl FnOnce([u8;6]) -> [u8;6]) -> io::Result<Self>`
+- `Subsystem::construct(local: Bdf, allowlist: &[Bdf], endpoint: Endpoint, resolve_peer: impl FnOnce([u8;6]) -> [u8;6]) -> io::Result<Self>` — `endpoint` selects this side's half of the originator-partitioned id space (`Endpoint::Box` → low, `Endpoint::Proxy` → high); the proxy passes `Endpoint::Proxy`.
 - `Subsystem::open(&mut self, &[u8]) -> SessionId` / `Ctx::open(&mut self, &[u8]) -> SessionId` — originate a **new** session.
 - `Subsystem::send(&mut self, SessionId, &[u8]) -> Result<(), SendError>` / `Ctx::send(&mut self, SessionId, &[u8]) -> Result<(), SendError>` — continue an **existing** session.
 - `Subsystem::run(&mut self, impl FnMut(&mut Ctx<'_>, Event) -> ControlFlow<()>)`
@@ -142,8 +142,8 @@ question is R-1, already ledgered.
 - **R-4 — Preliminary-API naming flux — DISCHARGED (sprint 008 Slice 1).** Scoping used the
   preliminary shape and asserted no identifier; the fill-in gate has now run (§4) and
   re-derived every concrete claim from the finalized API. The flux is closed — the identifiers
-  in §4 are the real ones, cited to the nic crate. (Superseded by R-7's remaining currency
-  caveat: the API is pinned by content, not yet by commit.)
+  in §4 are the real ones, cited to the nic crate. (R-7's currency caveat is now discharged — §4 is
+  pinned to `directpath`'s commit `a5a215c`.)
 - **R-5 — Bench-pin inheritance**: the NIC subsystem's own bench pins (elsenor) carry
   their deploy-host re-verification duty; this contract adds no new pin.
 - **R-6 — Idle-wakeup divergence inside the nic team's own sources** — **RECONCILED,
@@ -159,17 +159,18 @@ question is R-1, already ledgered.
   mechanism-neutral throughout — both resolutions satisfy the demand — and this
   contract's §2 cites the committed proxy-side L15 row faithfully as its own source, so
   no clause here changed meaning while this was open.
-- **R-7 — API pinned by content, not yet by commit (currency).** The finalized `directpath`
-  facade (§4) lives in the working tree, not a committed tree. It now includes the landed
-  session-continuation surface (`open` + `send(id, …)`, ruled 2026-07-21, landed 2026-07-22) —
-  a 440-line working-tree diff against repo HEAD `0ebfaa0`, still **no new commit**. §4 is pinned
-  to the current sha256 content anchor (`3c69e5dd…`, re-pinned 2026-07-22) as the interim, exactly
-  as the currency discipline prescribes for a stable-but-uncommitted source, and the anchor is
-  **re-verified at each dependent slice** (the recurring-pin discipline). The exact-commit pin is
-  **still owed once the NIC team commits the surface**; the proxy re-pins §4 to that hash then.
-  Bounded: the API *content* is landed and accepted, so every §4 claim holds; only the commit
-  anchor is pending. (This residual has now absorbed two re-pins — the original facade and the
-  `send(id)` addition — each a content-anchor bump, not a new residual.)
+- **R-7 — API pinned by content, not yet by commit (currency) — DISCHARGED (2026-07-22).** The
+  finalized `directpath` facade (§4) is now committed: the NIC team landed the session-continuation
+  surface and then the originator-partition (`endpoint: Endpoint`) as commits `211ef6e` (facade +
+  `send(id)`) and `a5a215c` (task 15). §4 and §7 re-pin to commit `a5a215c`; the interim sha256
+  content anchor (`3c69e5dd…`) is retired, along with the re-verify-per-slice discipline an
+  uncommitted source required. The proxy verified the working tree matches `a5a215c` (clean, no
+  uncommitted `directpath` diff) before re-pinning, and folded the `endpoint: Endpoint` argument that
+  `a5a215c` added to `construct` into §4's cited signature.
+  *How this was carried while open:* §4 was pinned to a sha256 content anchor of the stable-but-
+  uncommitted working tree, re-verified at every dependent slice and re-bumped on each content change
+  (the original facade, then the `send(id)` addition) — the correct interim for a stable-but-
+  uncommitted source, now replaced by the exact-commit pin.
 - **R-8 — D-3 quiescence gap on the shipped surface.** The only completion/quiescence signal
   (`Ctx::is_quiescent`, and `Subsystem::tx_dropped`) is `cfg(bench)`-only; the shipped surface
   carries just `Event::Idle` (drained-about-to-park), which is not a transmit-completion /
@@ -179,8 +180,8 @@ question is R-1, already ledgered.
 
 ## 7. Currency pins (2026-07-22)
 
-`directpath/src/lib.rs` (the finalized public API §4 pins, now incl. `open`+`send(id)`) @ working-tree
-sha256 `3c69e5ddca431e8cb48dacfb161d41a1ea8af8b63fb10e2a9bd244d82c17e724` — **content-anchored,
-commit pin owed** (R-7: a 440-line working-tree diff against repo HEAD `0ebfaa0`, no new commit;
-re-verify this hash at each dependent slice). `docs/nic/architecture.md` @ `6580d82` (§2.1/§3.1/§5,
+`directpath/src/lib.rs` (the finalized public API §4 pins, incl. `open`+`send(id)` and the
+`endpoint: Endpoint` originator-partition arg) @ commit `a5a215c` — **committed pin (R-7 discharged
+2026-07-22)**; the interim content anchor (`3c69e5dd…`) is retired now that the facade is committed.
+`docs/nic/architecture.md` @ `6580d82` (§2.1/§3.1/§5,
 §8); `docs/proxy/architecture.md` @ `dec2453` (L8/L11/L15 rows); `docs/proxy/terminal.md` @ `da6c63c`.
