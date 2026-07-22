@@ -108,11 +108,38 @@ impl Wire for NetError {
     }
 }
 
-verbatim_verb! {
-    /// `net-payload` (`box → proxy`): the verbatim request body, **reassembled** across transport
-    /// frames by the proxy ([`crate::Reassembler`]) before this decodes. The first chunk carries verb
-    /// `0x33`; the transport's continued chunks are raw payload concatenated opaquely, so the
-    /// **complete** buffer (`[0x33][full payload]`) decodes through `decode_message` **once** here — a
-    /// single verbatim tail over the full payload.
-    NetPayload, verb::NET_PAYLOAD
+/// `net-payload` (`box → proxy`): one **chunk** of the request body — a 1-byte fixed-width
+/// **continuation flag** header (`0x00` = more chunks follow, nonzero = final), then the verbatim
+/// content tail. This is `model.md` §6's `[fixed-width prefix][one frame-bounded tail]` shape (the
+/// same shape as [`NetAddress`]). The proxy's [`crate::Reassembler`] concatenates each chunk's
+/// `content` until a chunk's flag is nonzero. The flag lives in the message **header**, never in the
+/// accumulated content, so it can never collide with a box-authored content byte — the boundary is
+/// fixed-width and structural (`model.md` §11), never a value searched for in content. Supersedes the
+/// earlier "transport continuation signal" framing (no such transport field exists — confirmed at
+/// the Sprint-6 reassembly finding).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct NetPayload {
+    /// `true` = more chunks follow (`0x00` on the wire); `false` = this is the final chunk (nonzero).
+    pub more: bool,
+    /// This chunk's verbatim content (the flag prefix stripped) — concatenated by the reassembler.
+    pub content: Vec<u8>,
+}
+
+impl Wire for NetPayload {
+    const VERB: u32 = verb::NET_PAYLOAD;
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.push(if self.more { 0 } else { 1 });
+        out.extend_from_slice(&self.content);
+    }
+
+    fn decode(body: &[u8]) -> Result<Self, Reject> {
+        // The fixed-width 1-byte flag prefix, then the verbatim content tail; an empty body has no
+        // flag byte → `Reject::ShortBody`. The boundary is fixed width, never a box-authored length.
+        let (flag, content) = take_prefix::<1>(body)?;
+        Ok(NetPayload {
+            more: flag[0] == 0,
+            content: content.to_vec(),
+        })
+    }
 }

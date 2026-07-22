@@ -12,10 +12,11 @@
 //! security-relevant wiring invariant, MB3).
 
 
-use proto::{FileWrite, NetAddress, Reject, Wire, verb};
+use proto::{FileWrite, NetAddress, NetPayload, Reassembler, ReassemblyState, Reject, Wire, verb};
 use transport::SessionId;
 
-use crate::vocab::Route;
+use crate::anthropic::{Denial, Request, recognize};
+use crate::vocab::{Route, ToolIdentity};
 
 /// Peek the L2 verb — the first `u32` (LE) of the payload — **without decoding the body**. This is
 /// the whole of the deep-parsing the proxy does for a *relay* channel (`proxy-head.md` §1,
@@ -65,9 +66,19 @@ pub enum Routed {
     FileWriteAdmit,
     /// A single-frame gated decision: the file-write destination was denied by the tier-1 core.
     FileWriteDeny,
-    /// A follow-on frame routed to its service's stateful handler (net-payload reassembly + the
-    /// Anthropic recognizer; file-chunk writing). The full lifecycle is the service's own — see the
-    /// reassembly-continuation seam note in the module tests. Carries the bound service.
+    /// A `net-payload` chunk accumulated into the session's [`Reassembler`]; its header flag was
+    /// `more`, so more chunks are expected — no decision yet (the body is incomplete).
+    NetPayloadAccumulating,
+    /// The final `net-payload` chunk completed the request body, which the tier-1 Anthropic
+    /// recognizer ([`recognize`]) **ADMITTED**. Carries the reassembled, verbatim body — the exact
+    /// bytes the recognizer vetted and the exact bytes to forward upstream (CB4-across-the-seam:
+    /// recognized == reassembled == forwarded, no split, no rewrite).
+    NetPayloadAdmit(alloc::vec::Vec<u8>),
+    /// The completed request body was **DENIED** by the tier-1 recognizer — carries the legible
+    /// [`Denial`]. Fail-closed; the body is not forwarded.
+    NetPayloadDeny(Denial),
+    /// A follow-on frame routed to its service's stateful handler (file-chunk writing;
+    /// open-session control). The full lifecycle is the service's own. Carries the bound service.
     ToServiceHandler(Service),
     /// A relay channel (file-read, net-response, display/input) routed to its relay (S2–S4).
     Relay(RelayKind),
@@ -103,26 +114,73 @@ pub enum RelayKind {
 /// residual — not a correctness bug (SessionId is monotonic-unique within an epoch, so no stale
 /// binding can mismatch) — resolved fully once the transport surfaces a session-close signal, at
 /// which point [`close_session`] is wired to it.
-#[derive(Default)]
+///
+/// The per-session `reassemblers` map (Sprint 7) inherits the **same** bounded-per-epoch shape and
+/// the **same** [`close_session`] eviction hook. It is in fact a *tighter* residual: an entry exists
+/// only while a session's net-payload body is mid-reassembly — a completed body or a cap-overflow
+/// removes it immediately (see [`Dispatcher::route`]), so only in-flight sessions hold one. Each
+/// buffer is itself capped by `REASSEMBLY_CAP` (reject-before-grow, `proto::Reassembler`), so the
+/// per-entry size is bounded too, not just the entry count.
 pub struct Dispatcher {
     bindings: alloc::collections::BTreeMap<SessionId, Service>,
+    /// One in-flight net-payload reassembly buffer per session, created on the session's first
+    /// `net-payload` chunk and removed the instant the body completes or overflows the cap. Shares
+    /// the binding map's bounded-per-epoch shape and [`close_session`] eviction (see the type doc).
+    reassemblers: alloc::collections::BTreeMap<SessionId, Reassembler>,
+    /// The per-session reassembly capacity bound. In production this is always
+    /// `proto::verb::REASSEMBLY_CAP` (set by [`Dispatcher::new`]); a `#[cfg(test)]` constructor may
+    /// inject a small cap to exercise the evict-on-overflow path cheaply — the field is otherwise
+    /// invisible to callers.
+    reassembly_cap: usize,
     /// Count of frames dropped as unsupported/undecodable — a liveness/observability counter, not a
     /// gate. (No box content ever enters it — a verb id and a `Reject` class are safe by
     /// construction.)
     dropped: u64,
 }
 
+impl Default for Dispatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Dispatcher {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Dispatcher {
+            bindings: alloc::collections::BTreeMap::new(),
+            reassemblers: alloc::collections::BTreeMap::new(),
+            reassembly_cap: verb::REASSEMBLY_CAP,
+            dropped: 0,
+        }
+    }
+
+    /// **Test-only** ([`cfg(test)`]): a dispatcher whose net-payload reassembly is bounded by an
+    /// explicit small `cap`, so the dispatch-level evict-on-overflow behavior is reachable cheaply
+    /// (the production cap is 32 MiB). This does **not** exist in the production build — the
+    /// `#[cfg(test)]` gate keeps it out of the public API entirely. The proto-level reject-before-grow
+    /// mechanism itself is cited, not re-proven here (it is exhaustively certified in `proto/tests`
+    /// with a small cap); this only confirms dispatch *propagates* the reject and *evicts* the entry.
+    #[cfg(test)]
+    fn with_reassembly_cap_for_test(cap: usize) -> Self {
+        Dispatcher {
+            reassembly_cap: cap,
+            ..Dispatcher::new()
+        }
     }
 
     /// Route one reactor-delivered frame: decode its L2 payload, bind or check the session, and
     /// dispatch by verb. `register` is the tier-1 route register (U5's compiled-in
-    /// `register::net::ROUTES`) — the seam that reaches the core. **Total**: every input maps to
-    /// exactly one [`Routed`], no panic.
-    pub fn route(&mut self, session: SessionId, payload: &[u8], register: &[Route]) -> Routed {
+    /// `register::net::ROUTES`) and `vetted` the tier-1 vetted-tool register
+    /// (`register::anthropic::VETTED_TOOLS`) — the two seams that reach the certified core. **Total**:
+    /// every input maps to exactly one [`Routed`], no panic.
+    pub fn route(
+        &mut self,
+        session: SessionId,
+        payload: &[u8],
+        register: &[Route],
+        vetted: &[ToolIdentity],
+    ) -> Routed {
         // Peek the verb ONLY — no body decode (proxy-head.md §1: routing + binding verb only).
         let Some(verb) = peek_verb(payload) else {
             self.dropped += 1;
@@ -148,7 +206,7 @@ impl Dispatcher {
             }
         }
 
-        self.dispatch(verb, payload, register)
+        self.dispatch(session, verb, payload, register, vetted)
     }
 
     /// Route a bound frame by verb. The **gated** channels (net-address, file-write) — and *only*
@@ -156,7 +214,14 @@ impl Dispatcher {
     /// "deep-parse only what it acts on"). Every **relay** channel returns a [`RelayKind`] with the
     /// body **un-decoded** — the caller forwards the opaque payload; the receiver's own parser
     /// handles it. So the proxy runs *no* terminal/display/input decoder on box bytes.
-    fn dispatch(&mut self, verb: u32, payload: &[u8], register: &[Route]) -> Routed {
+    fn dispatch(
+        &mut self,
+        session: SessionId,
+        verb: u32,
+        payload: &[u8],
+        register: &[Route],
+        vetted: &[ToolIdentity],
+    ) -> Routed {
         let body = &payload[4..]; // safe: peek_verb confirmed payload.len() >= 4
         match verb & 0xff {
             // ── Gated: deep-parse the body, invoke the tier-1 core (the only decodes on box bytes) ──
@@ -177,8 +242,10 @@ impl Dispatcher {
                 Err(reject) => Routed::Decode(reject),
             },
 
+            // ── Gated stateful channel: reassemble the body, then invoke the tier-1 recognizer ─────
+            verb::NET_PAYLOAD => self.route_net_payload(session, body, vetted),
+
             // ── Stateful follow-on channels: routed to their service handler, body un-decoded ──────
-            verb::NET_PAYLOAD => Routed::ToServiceHandler(Service::Net), // reassembly + recognizer
             verb::FILE_CHUNK => Routed::ToServiceHandler(Service::File), // append at the cursor
             verb::OPEN_SESSION => Routed::ToServiceHandler(Service::Control),
 
@@ -197,11 +264,59 @@ impl Dispatcher {
         }
     }
 
-    /// Evict a session's binding — the **eviction hook** for the MB4 bounded-resource residual. It
-    /// is structurally ready to wire to a transport session-close/give-up signal; that signal is not
-    /// in the committed transport yet (the same cross-crate gap as the net-payload continuation
-    /// bit), so the hook is present-and-tested but not yet *driven*. Returns the evicted binding.
+    /// The `net-payload` handler (Sprint 7): decode this chunk's `[flag][content]`, push its
+    /// **content** into the session's [`Reassembler`] with the header's `more` flag, and — only when
+    /// the body is complete — hand the whole reassembled buffer to the tier-1 Anthropic recognizer.
+    ///
+    /// The reassembler concatenates *content* (the 1-byte flag is stripped at decode and never enters
+    /// the buffer — the collision-freedom property, `proto::net` / net.md §2), so the completed body
+    /// is byte-identical to the box's request body. On `Complete`, the same buffer is what
+    /// [`recognize`] vets and what [`Routed::NetPayloadAdmit`] carries forward to be forwarded — one
+    /// buffer, no split (CB4-across-the-seam). Fail-closed on cap-overflow (the poisoned reassembler
+    /// is evicted) and on a malformed chunk header (`ShortBody`).
+    fn route_net_payload(&mut self, session: SessionId, body: &[u8], vetted: &[ToolIdentity]) -> Routed {
+        // Decode this chunk: strip the fixed 1-byte continuation-flag header, keep the content tail.
+        let chunk = match NetPayload::decode(body) {
+            Ok(chunk) => chunk,
+            Err(reject) => {
+                self.dropped += 1;
+                return Routed::Decode(reject);
+            }
+        };
+        let cap = self.reassembly_cap; // read before the mutable entry borrow (no self-alias)
+        let reassembler = self
+            .reassemblers
+            .entry(session)
+            .or_insert_with(|| Reassembler::new(cap));
+        match reassembler.push(&chunk.content, chunk.more) {
+            Ok(ReassemblyState::Accumulating) => Routed::NetPayloadAccumulating,
+            Ok(ReassemblyState::Complete(request_body)) => {
+                // The body is whole; the reassembler already reset, but drop the map entry so the
+                // next request on this session starts a fresh reassembly (and the residual shrinks).
+                self.reassemblers.remove(&session);
+                match recognize(&stub_envelope_request(&request_body), vetted) {
+                    Ok(()) => Routed::NetPayloadAdmit(request_body),
+                    Err(denial) => Routed::NetPayloadDeny(denial),
+                }
+            }
+            Err(reject) => {
+                // Cap-exceeded (or an absurd-length overflow): fail closed and evict the poisoned
+                // reassembler so a subsequent chunk cannot resume a rejected, over-cap accumulation.
+                self.reassemblers.remove(&session);
+                self.dropped += 1;
+                Routed::Decode(reject)
+            }
+        }
+    }
+
+    /// Evict a session's binding **and any in-flight reassembly buffer** — the **eviction hook** for
+    /// the MB4 bounded-resource residual. It is structurally ready to wire to a transport
+    /// session-close/give-up signal; that signal is not in the committed transport yet (the same
+    /// cross-crate gap the residual names), so the hook is present-and-tested but not yet *driven*.
+    /// Returns the evicted binding (the reassembler, if any, is dropped silently — it holds only
+    /// in-flight box content, nothing observable).
     pub fn close_session(&mut self, session: SessionId) -> Option<Service> {
+        self.reassemblers.remove(&session);
         self.bindings.remove(&session)
     }
 
@@ -221,5 +336,84 @@ impl Dispatcher {
     #[must_use]
     pub fn binding(&self, session: SessionId) -> Option<Service> {
         self.bindings.get(&session).copied()
+    }
+
+    /// The number of sessions with an in-flight net-payload reassembly — the tighter MB4 residual
+    /// (an entry lives only between a session's first chunk and its completing/overflowing chunk).
+    #[must_use]
+    pub fn reassembling_count(&self) -> usize {
+        self.reassemblers.len()
+    }
+}
+
+/// **MARKED STUB (Sprint 7, Slice 2 — deliberately not production wiring).** Builds the recognizer's
+/// non-body envelope for a reassembled net-payload body. The real envelope (verb/domain/path/betas)
+/// is **not yet sourced** from the session's matched net [`Route`] — that sourcing is a named
+/// follow-on the sprint explicitly leaves open (007 Non-Goals, "recognizer-envelope sourcing").
+///
+/// This placeholder pins the envelope to the **sole admit-envelope** (`POST api.anthropic.com
+/// /v1/messages`, no betas) so that the reassembled **body** is the only variable the recognizer
+/// seam exercises. A reader must **not** mistake this for route→envelope wiring: it does not read the
+/// session's route, and every net-payload body flows through the identical fixed envelope. When the
+/// follow-on lands, these fields come from the `Route` bound at net-address time and this helper is
+/// deleted.
+fn stub_envelope_request(body: &[u8]) -> Request<'_> {
+    Request {
+        verb: "POST",
+        domain: "api.anthropic.com",
+        path: "/v1/messages",
+        betas: &[],
+        body,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    /// A raw `net-payload` L2 frame: `[verb][1-byte flag][content]` (flag `0x00` = more, nonzero =
+    /// final) — the bytes `route` receives. Built by hand to keep this unit test dependency-light.
+    fn net_payload_frame(content: &[u8], more: bool) -> Vec<u8> {
+        let mut v = verb::NET_PAYLOAD.to_le_bytes().to_vec();
+        v.push(if more { 0 } else { 1 });
+        v.extend_from_slice(content);
+        v
+    }
+
+    /// Dispatch-level **evict-on-overflow** (the one genuinely new bit of logic at this layer): a
+    /// per-session reassembly that exceeds the cap fails closed with `Decode(ReassemblyOverflow)`
+    /// **and** evicts the poisoned buffer, so a later chunk cannot resume an over-cap accumulation.
+    /// Uses the `#[cfg(test)]` small-cap injector so the overflow is reachable cheaply (production cap
+    /// is 32 MiB). The reject-before-grow mechanism itself is cited, not re-proven — it is exhaustively
+    /// certified in `proto/tests` (`reassembler.rs`, small-cap boundary); this confirms only that
+    /// dispatch *propagates* the reject and *evicts* the entry. `register`/`vetted` are unused on the
+    /// overflow path (the recognizer is never reached), so empty slices suffice.
+    #[test]
+    fn net_payload_overflow_fails_closed_and_evicts() {
+        let mut d = Dispatcher::with_reassembly_cap_for_test(8);
+        let s = SessionId(1);
+        // First chunk (6 bytes, more): 6 ≤ 8 → accumulates, one in-flight buffer.
+        assert_eq!(
+            d.route(s, &net_payload_frame(&[0u8; 6], true), &[], &[]),
+            Routed::NetPayloadAccumulating,
+        );
+        assert_eq!(d.reassembling_count(), 1);
+        let dropped_before = d.dropped();
+        // Second chunk (6 bytes): 6 + 6 = 12 > 8 → overflow, fail closed, evict the buffer.
+        assert_eq!(
+            d.route(s, &net_payload_frame(&[0u8; 6], true), &[], &[]),
+            Routed::Decode(Reject::ReassemblyOverflow { cap: 8 }),
+        );
+        assert_eq!(d.reassembling_count(), 0, "the poisoned reassembler is evicted on overflow");
+        assert_eq!(d.dropped(), dropped_before + 1, "the overflow frame is counted as dropped");
+
+        // A fresh chunk on the same session starts a NEW reassembly (the evicted buffer did not
+        // silently resume the over-cap accumulation).
+        assert_eq!(
+            d.route(s, &net_payload_frame(&[0u8; 4], true), &[], &[]),
+            Routed::NetPayloadAccumulating,
+        );
+        assert_eq!(d.reassembling_count(), 1, "a post-overflow chunk begins a fresh, empty buffer");
     }
 }

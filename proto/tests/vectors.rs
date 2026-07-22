@@ -486,36 +486,39 @@ fn vector_net_payload() {
     #[rustfmt::skip]
     let golden: &[u8] = &[
         0x33, 0x00, 0x00, 0x00, // verb 0x33 (net-payload)
+        0x01,                   // continuation flag: nonzero = final chunk (0x00 would be "more")
         0x50, 0x4F, 0x53, 0x54, // "POST"
     ];
-    let expected = Message::NetPayload(NetPayload(vec![0x50, 0x4F, 0x53, 0x54]));
+    let expected = Message::NetPayload(NetPayload { more: false, content: vec![0x50, 0x4F, 0x53, 0x54] });
     assert_eq!(decode_message(golden).unwrap(), expected);
     assert_eq!(encode_message(&expected), golden);
 }
 
-/// The first **push-sequence** golden — a payload spanning N transport chunks reassembles to the joined
-/// bytes, which decode ONCE to `NetPayload(full)`. Authored byte-by-byte: the transport delivers each
-/// `(chunk, continuation)` (the L1 framing is below the copy boundary); the first chunk carries `0x33`,
-/// the continued chunks are raw payload concatenated opaquely.
+/// The **per-chunk** push-sequence golden (Sprint 7) — a body spanning N chunks, each its own
+/// `[0x33][flag][content]` message. Authored byte-by-byte: each chunk decodes to `NetPayload`, its
+/// **content** is pushed with the decoded `more` flag, and the reassembler concatenates the content
+/// into the request body. `0x00` = more chunks follow, nonzero = final.
 #[test]
 fn vector_net_payload_reassembles_n_chunks() {
-    // chunk 1 (continuation=1) carries the verb; chunks 2/3 are raw; chunk 3 (continuation=0) ends.
-    let chunk1: &[u8] = &[0x33, 0x00, 0x00, 0x00, 0x50, 0x4F]; // [0x33]"PO"
-    let chunk2: &[u8] = &[0x53, 0x54]; // "ST" — raw
-    let chunk3: &[u8] = &[0x21]; // "!" — raw
+    let chunk1: &[u8] = &[0x33, 0x00, 0x00, 0x00, 0x00, 0x50, 0x4F]; // [0x33][more=0x00]"PO"
+    let chunk2: &[u8] = &[0x33, 0x00, 0x00, 0x00, 0x00, 0x53, 0x54]; // [0x33][more=0x00]"ST"
+    let chunk3: &[u8] = &[0x33, 0x00, 0x00, 0x00, 0x01, 0x21]; // [0x33][final=0x01]"!"
+    let take = |wire: &[u8]| match decode_message(wire).unwrap() {
+        Message::NetPayload(p) => p,
+        other => panic!("{other:?}"),
+    };
     let mut r = Reassembler::new(64);
-    assert_eq!(r.push(chunk1, true).unwrap(), ReassemblyState::Accumulating);
-    assert_eq!(r.push(chunk2, true).unwrap(), ReassemblyState::Accumulating);
-    let complete = match r.push(chunk3, false).unwrap() {
+    for chunk in [chunk1, chunk2] {
+        let p = take(chunk);
+        assert_eq!(r.push(&p.content, p.more).unwrap(), ReassemblyState::Accumulating);
+    }
+    let p3 = take(chunk3);
+    let complete = match r.push(&p3.content, p3.more).unwrap() {
         ReassemblyState::Complete(b) => b,
         other => panic!("{other:?}"),
     };
-    // joined = [0x33][POST!] -> decode_message ONCE -> NetPayload("POST!")
-    assert_eq!(complete, vec![0x33, 0x00, 0x00, 0x00, 0x50, 0x4F, 0x53, 0x54, 0x21]);
-    assert_eq!(
-        decode_message(&complete).unwrap(),
-        Message::NetPayload(NetPayload(b"POST!".to_vec()))
-    );
+    // The reassembled buffer is the request BODY (the flags live in each message header, not here).
+    assert_eq!(complete, b"POST!".to_vec());
 }
 
 /// Fail-closed regression guard — a CAP-EXCEED reject (small test-cap). Two chunks sum past the cap →

@@ -13,6 +13,7 @@ use proto::{
 };
 use proto::{FileRead, FileWrite};
 use proxy::dispatch::{Dispatcher, RelayKind, Routed, Service, service_of_verb};
+use proxy::register::anthropic::VETTED_TOOLS;
 use proxy::register::net::ROUTES;
 use transport::SessionId;
 
@@ -27,6 +28,9 @@ fn file_write(n_segments: usize) -> Vec<u8> {
         v
     };
     encode_message(&Message::FileWrite(FileWrite(scan_safe(&joined).unwrap())))
+}
+fn net_payload(content: &[u8], more: bool) -> Vec<u8> {
+    encode_message(&Message::NetPayload(NetPayload { more, content: content.to_vec() }))
 }
 
 /// MB3 (pure routing, exhaustive over verb blocks): service_of_verb maps by block, no content.
@@ -47,11 +51,11 @@ fn service_of_verb_maps_by_block() {
 #[test]
 fn net_address_gates_through_the_real_core_and_register() {
     let mut d = Dispatcher::new();
-    let admit = d.route(SessionId(1), &net_address("api.anthropic.com/v1/messages"), ROUTES);
+    let admit = d.route(SessionId(1), &net_address("api.anthropic.com/v1/messages"), ROUTES, VETTED_TOOLS);
     assert!(matches!(admit, Routed::NetRouteAdmit(r) if r.as_str() == "https://api.anthropic.com/v1/messages"));
 
     let mut d2 = Dispatcher::new();
-    let deny = d2.route(SessionId(2), &net_address("evil.example.com/x"), ROUTES);
+    let deny = d2.route(SessionId(2), &net_address("evil.example.com/x"), ROUTES, VETTED_TOOLS);
     assert_eq!(deny, Routed::NetDeny);
 }
 
@@ -60,11 +64,11 @@ fn net_address_gates_through_the_real_core_and_register() {
 #[test]
 fn file_write_gates_through_prescanned_leaf_check() {
     let mut d = Dispatcher::new();
-    assert_eq!(d.route(SessionId(3), &file_write(3), ROUTES), Routed::FileWriteAdmit);
+    assert_eq!(d.route(SessionId(3), &file_write(3), ROUTES, VETTED_TOOLS), Routed::FileWriteAdmit);
 
     let mut d2 = Dispatcher::new();
     // MAX_ELEMENTS is 64; 65 segments must deny via leaf_validate_prescanned.
-    assert_eq!(d2.route(SessionId(4), &file_write(65), ROUTES), Routed::FileWriteDeny);
+    assert_eq!(d2.route(SessionId(4), &file_write(65), ROUTES, VETTED_TOOLS), Routed::FileWriteDeny);
 }
 
 /// MB2 routing: relay + handler channels route to the right destination.
@@ -72,11 +76,18 @@ fn file_write_gates_through_prescanned_leaf_check() {
 fn relay_and_handler_channels_route_correctly() {
     let mut d = Dispatcher::new();
     let fr = encode_message(&Message::FileRead(FileRead { source: proto::scan_unsafe(b"real\x1fname.txt").unwrap() }));
-    assert_eq!(d.route(SessionId(5), &fr, ROUTES), Routed::Relay(RelayKind::FileRead));
+    assert_eq!(d.route(SessionId(5), &fr, ROUTES, VETTED_TOOLS), Routed::Relay(RelayKind::FileRead));
 
+    // A net-payload single final chunk (more=false) completes the body and reaches the tier-1
+    // recognizer; `body-bytes` is not valid JSON, so the seam denies (Slice 2). The full seam
+    // fidelity/transparency corpus lives in tests/net_payload_seam.rs.
     let mut d2 = Dispatcher::new();
-    let np = encode_message(&Message::NetPayload(NetPayload(b"body-bytes".to_vec())));
-    assert_eq!(d2.route(SessionId(6), &np, ROUTES), Routed::ToServiceHandler(Service::Net));
+    let np = encode_message(&Message::NetPayload(NetPayload { more: false, content: b"body-bytes".to_vec() }));
+    assert!(matches!(
+        d2.route(SessionId(6), &np, ROUTES, VETTED_TOOLS),
+        Routed::NetPayloadDeny(_)
+    ));
+    assert_eq!(d2.binding(SessionId(6)), Some(Service::Net), "net-payload still binds the session to Net");
 }
 
 /// MB3 — the session→service binding invariant (box-proxy §1.3): a session binds to a service on
@@ -86,10 +97,10 @@ fn session_binds_once_and_rejects_a_mismatched_service() {
     let mut d = Dispatcher::new();
     let s = SessionId(7);
     // First frame: a net-address binds the session to Net.
-    let _ = d.route(s, &net_address("api.anthropic.com/v1/messages"), ROUTES);
+    let _ = d.route(s, &net_address("api.anthropic.com/v1/messages"), ROUTES, VETTED_TOOLS);
     assert_eq!(d.binding(s), Some(Service::Net));
     // A file-write on the SAME session is a service mismatch → Unsupported, binding unchanged.
-    let mismatched = d.route(s, &file_write(3), ROUTES);
+    let mismatched = d.route(s, &file_write(3), ROUTES, VETTED_TOOLS);
     assert!(matches!(mismatched, Routed::Unsupported { .. }));
     assert_eq!(d.binding(s), Some(Service::Net), "the binding is never overwritten");
 }
@@ -100,8 +111,8 @@ fn session_binds_once_and_rejects_a_mismatched_service() {
 fn binding_is_by_verb_not_content() {
     let mut d = Dispatcher::new();
     let s = SessionId(8);
-    let _ = d.route(s, &net_address("api.anthropic.com/v1/messages"), ROUTES); // admit
-    let second = d.route(s, &net_address("evil.example.com/x"), ROUTES);       // deny, but STILL Net-routed
+    let _ = d.route(s, &net_address("api.anthropic.com/v1/messages"), ROUTES, VETTED_TOOLS); // admit
+    let second = d.route(s, &net_address("evil.example.com/x"), ROUTES, VETTED_TOOLS);       // deny, but STILL Net-routed
     assert!(matches!(second, Routed::NetDeny), "content differs, but it still routed to the net gate");
     assert_eq!(d.binding(s), Some(Service::Net));
 }
@@ -118,7 +129,7 @@ fn fuzz_malformed_payloads_never_panic() {
         let len = (rng.next() % 128) as usize;
         let bytes: Vec<u8> = (0..len).map(|_| (rng.next() & 0xff) as u8).collect();
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            d.route(SessionId(i), &bytes, ROUTES)
+            d.route(SessionId(i), &bytes, ROUTES, VETTED_TOOLS)
         }));
         assert!(out.is_ok(), "dispatch panicked on payload {bytes:?}");
     }
@@ -137,7 +148,7 @@ fn bindings_grow_per_epoch_and_evict_via_the_close_hook() {
     let mut d = Dispatcher::new();
     // N distinct sessions → N bindings (the O(sessions-per-epoch) growth, characterized).
     for i in 0..100u64 {
-        let _ = d.route(SessionId(i), &net_address("api.anthropic.com/v1/messages"), ROUTES);
+        let _ = d.route(SessionId(i), &net_address("api.anthropic.com/v1/messages"), ROUTES, VETTED_TOOLS);
     }
     assert_eq!(d.binding_count(), 100, "one binding per live session (O(sessions-per-epoch))");
     // The eviction hook removes a binding (structurally ready for a transport session-close signal).
@@ -145,7 +156,7 @@ fn bindings_grow_per_epoch_and_evict_via_the_close_hook() {
     assert_eq!(d.binding(SessionId(50)), None);
     assert_eq!(d.binding_count(), 99, "eviction shrinks the map — the hook works");
     // After eviction, that session re-binds like a fresh one (the epoch-reset shape).
-    let _ = d.route(SessionId(50), &file_write(2), ROUTES);
+    let _ = d.route(SessionId(50), &file_write(2), ROUTES, VETTED_TOOLS);
     assert_eq!(d.binding(SessionId(50)), Some(Service::File));
 }
 
@@ -162,7 +173,7 @@ fn relay_channels_forward_opaque_without_deep_parsing() {
     let mut frame = 0x11u32.to_le_bytes().to_vec();
     frame.extend_from_slice(&[0xDE, 0xAD, 0xBE]); // 3 bytes — a partial cell record
     assert_eq!(
-        d.route(SessionId(42), &frame, ROUTES),
+        d.route(SessionId(42), &frame, ROUTES, VETTED_TOOLS),
         Routed::Relay(RelayKind::Terminal),
         "a malformed display body must relay OPAQUELY (not decoded, not dropped) — §1 conformance",
     );
@@ -174,9 +185,50 @@ fn relay_channels_forward_opaque_without_deep_parsing() {
     bad_addr.extend_from_slice(&0u32.to_le_bytes()); // scheme = 0 (https)
     bad_addr.extend_from_slice(b"has/slash"); // stack with '/' → scan rejects
     assert!(
-        matches!(d.route(SessionId(43), &bad_addr, ROUTES), Routed::Decode(_)),
+        matches!(d.route(SessionId(43), &bad_addr, ROUTES, VETTED_TOOLS), Routed::Decode(_)),
         "a gated channel still deep-parses and rejects a malformed body",
     );
+}
+
+/// MB4 (the Slice-2 reassembler residual): a per-session reassembly buffer exists ONLY while a body
+/// is in flight — created on the first `more` chunk, removed the instant the body completes — and the
+/// `close_session` hook evicts an in-flight buffer alongside the binding. This is a *tighter* residual
+/// than the binding map (which lives for the whole session), and shares the same eviction hook.
+#[test]
+fn reassemblers_are_in_flight_only_and_evict_via_close() {
+    let mut d = Dispatcher::new();
+    let s = SessionId(70);
+    // A non-final chunk starts an in-flight reassembly (and binds the session to Net by verb).
+    assert_eq!(
+        d.route(s, &net_payload(b"partial", true), ROUTES, VETTED_TOOLS),
+        Routed::NetPayloadAccumulating,
+    );
+    assert_eq!(d.reassembling_count(), 1, "an in-flight body holds exactly one reassembler");
+    assert_eq!(d.binding(s), Some(Service::Net));
+    // A second non-final chunk keeps accumulating on the SAME buffer (still one entry).
+    assert_eq!(
+        d.route(s, &net_payload(b"-more", true), ROUTES, VETTED_TOOLS),
+        Routed::NetPayloadAccumulating,
+    );
+    assert_eq!(d.reassembling_count(), 1);
+    // The close hook evicts the in-flight buffer alongside the binding.
+    assert_eq!(d.close_session(s), Some(Service::Net));
+    assert_eq!(d.reassembling_count(), 0, "close_session drops the in-flight reassembler");
+    assert_eq!(d.binding(s), None);
+
+    // A COMPLETING chunk removes the reassembler immediately — no residual after completion (a valid
+    // body admits and leaves nothing in the map; the session binding persists as normal).
+    let mut d2 = Dispatcher::new();
+    let s2 = SessionId(71);
+    let done = d2.route(
+        s2,
+        &net_payload(br#"{"model":"claude-x","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}"#, false),
+        ROUTES,
+        VETTED_TOOLS,
+    );
+    assert!(matches!(done, Routed::NetPayloadAdmit(_)), "a complete valid body admits");
+    assert_eq!(d2.reassembling_count(), 0, "a completed body leaves no reassembler behind");
+    assert_eq!(d2.binding(s2), Some(Service::Net), "the session binding persists after completion");
 }
 
 // ─── MB4 liveness: the reactor loop drives dispatch over a FAKE wire and terminates ──────────
@@ -228,7 +280,7 @@ mod reactor_wiring {
         // The wiring: pump_all hands each (session, L2 payload) to the dispatcher. It TERMINATES
         // (the fake ring empties → step() returns false → the loop exits).
         r.pump_all(|session, payload| {
-            let routed = d.route(session, &payload, ROUTES);
+            let routed = d.route(session, &payload, ROUTES, VETTED_TOOLS);
             seen.push((session.0, routed));
         });
 

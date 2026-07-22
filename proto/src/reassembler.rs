@@ -1,8 +1,10 @@
 //! The bounded, fail-closed reassembler — the protocol's **one** trusted-side reassembly (net.md §2).
-//! The **proxy** accumulates a `net-payload` request whose payload spans transport frames into a
-//! complete buffer before the off-wire recognizer rules on it. The transport delivers each frame's L2
-//! payload and a `continuation` signal (the L1 framing lives below the crate's copy boundary, model.md
-//! §1/§3); the crate parses no frame header. Because the proxy holds the buffer, totality here is **TCB
+//! The **proxy** accumulates a `net-payload` request whose content spans multiple chunk messages into
+//! a complete request body before the off-wire recognizer rules on it. Each `net-payload` chunk is a
+//! `[verb][1-byte continuation flag][content]` message (`net.md` §2); the proxy decodes each chunk and
+//! feeds this reassembler its **content** plus the header's `continuation` flag (`NetPayload.more`) —
+//! the flag lives in the message header, **not** in a transport signal (no such transport field
+//! exists). Because the proxy holds the buffer, totality here is **TCB
 //! defense**: no payload sequence the box authors may crash, over-read, **unbounded-allocate**, or
 //! **hang** it.
 //!
@@ -64,8 +66,11 @@ impl Reassembler {
         self.cap
     }
 
-    /// Feed one payload chunk. `continuation` is the transport's continuation signal (set = more
-    /// follows). The chunk is appended **opaquely** (never parsed); `Complete` carries the joined bytes
+    /// Feed one chunk's **content** with its continuation flag. `continuation` is the decoded
+    /// `NetPayload.more` — the per-chunk continuation flag carried in each `net-payload` message's
+    /// **header** (`net.md` §2), extracted at message decode (**not** a transport signal — no such
+    /// transport field exists, confirmed at the Sprint-6 reassembly finding). `set = more follows`.
+    /// The content is appended **opaquely** (never parsed); `Complete` carries the joined request body
     /// (and resets `self`).
     ///
     /// Fail-closed: if the accumulated total would exceed the cap (**inclusive**: `≤ cap` is allowed,
