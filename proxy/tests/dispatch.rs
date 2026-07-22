@@ -14,9 +14,37 @@ use proto::{
 use proto::{FileRead, FileWrite};
 use proxy::anthropic::Denial;
 use proxy::dispatch::{Dispatcher, RelayKind, Routed, Service, service_of_verb};
+use proxy::open_discipline::pin_root;
 use proxy::register::anthropic::VETTED_TOOLS;
 use proxy::register::net::ROUTES;
 use transport::SessionId;
+
+// A unique temp quarantine root per write test (mirrors fs_read/fs_write's scratch pattern).
+static SCRATCH_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+struct Scratch {
+    dir: std::path::PathBuf,
+}
+impl Scratch {
+    fn new() -> Self {
+        let n = SCRATCH_N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("proxy-s9d-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        Scratch { dir }
+    }
+    fn dispatcher(&self) -> Dispatcher {
+        Dispatcher::with_quarantine_root(pin_root(self.dir.to_str().unwrap()).unwrap())
+    }
+}
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+fn file_write_to(joined: &str) -> Vec<u8> {
+    encode_message(&Message::FileWrite(FileWrite(
+        scan_safe(joined.replace('/', "\u{1f}").as_bytes()).unwrap(),
+    )))
+}
 
 fn net_address(joined: &str) -> Vec<u8> {
     let addr = NetAddress { scheme: Scheme::Https, address: scan_safe(joined.replace('/', "\u{1f}").as_bytes()).unwrap() };
@@ -32,6 +60,25 @@ fn file_write(n_segments: usize) -> Vec<u8> {
 }
 fn net_payload(content: &[u8], more: bool) -> Vec<u8> {
     encode_message(&Message::NetPayload(NetPayload { more, content: content.to_vec() }))
+}
+/// A raw L2 frame `[verb u32 LE][body]` — for verbs dispatch routes opaquely (no body decode).
+fn raw_frame(verb: u32, body: &[u8]) -> Vec<u8> {
+    let mut f = verb.to_le_bytes().to_vec();
+    f.extend_from_slice(body);
+    f
+}
+/// A raw `file-chunk` L2 frame (`[verb 0x21][verbatim bytes]`) — dispatch routes it opaquely to the
+/// File handler without decoding the body, so a hand-built frame is exact.
+fn file_chunk(bytes: &[u8]) -> Vec<u8> {
+    raw_frame(proto::verb::FILE_CHUNK, bytes)
+}
+/// OR reserved bits (`reserved_upper`, upper three bytes) into a frame's verb `u32` — the un-fakeable
+/// input for the JC-1 raw-verb check (the low byte, hence routing, is unchanged).
+fn set_reserved(frame: &[u8], reserved_upper: u32) -> Vec<u8> {
+    let mut f = frame.to_vec();
+    let verb = u32::from_le_bytes(f[0..4].try_into().unwrap()) | reserved_upper;
+    f[0..4].copy_from_slice(&verb.to_le_bytes());
+    f
 }
 
 /// MB3 (pure routing, exhaustive over verb blocks): service_of_verb maps by block, no content.
@@ -285,6 +332,193 @@ fn net_payload_envelope_is_route_sourced_not_a_shared_stub() {
         Routed::NetPayloadDeny(Denial::BadEnvelope),
         "under the pypi route, the same body denies at Stage 1 — the envelope is route-sourced, not shared",
     );
+}
+
+// ─── Sprint 9 Slice 1 — Task 13 / JC-1: reserved-verb-byte deny ──────────────────────────────
+
+/// JC-1: a message the proxy ACTS ON (one of the four acted-on verbs) whose raw verb u32 carries a
+/// nonzero reserved surface (upper three bytes) → `ReservedDeny`, deny-without-binding — proven
+/// positively across every acted-on verb × a spread of reserved patterns (the reserved *space*, not
+/// one magic value: a low reserved byte, a high reserved byte, and all three reserved bytes).
+#[test]
+fn jc1_reserved_verb_denies_whole_deny_without_binding() {
+    let anthropic = br#"{"model":"m","messages":[]}"#;
+    let clean_frames: [(&str, Vec<u8>); 4] = [
+        ("net-address", net_address("api.anthropic.com/v1/messages")),
+        ("file-write", file_write(3)),
+        ("file-chunk", file_chunk(b"bytes")),
+        ("net-payload", net_payload(anthropic, true)),
+    ];
+    for reserved in [0x0000_0100u32, 0x0100_0000, 0xFFFF_FF00] {
+        for (name, clean) in &clean_frames {
+            let mut d = Dispatcher::new();
+            let frame = set_reserved(clean, reserved);
+            let raw_verb = u32::from_le_bytes(frame[0..4].try_into().unwrap());
+            assert_eq!(
+                d.route(SessionId(1), &frame, ROUTES, VETTED_TOOLS),
+                Routed::ReservedDeny { verb: raw_verb },
+                "{name} + reserved {reserved:#010x} must ReservedDeny (raw verb {raw_verb:#010x})",
+            );
+            // Deny-WITHOUT-binding, proven positively: NOTHING is created for the session.
+            assert_eq!(d.binding_count(), 0, "{name} reserved: no service binding");
+            assert_eq!(d.routes_count(), 0, "{name} reserved: no stored route");
+            assert_eq!(d.reassembling_count(), 0, "{name} reserved: no reassembler entry");
+        }
+    }
+}
+
+/// The un-fakeable tell: the reserved check reads the RAW verb, not the masked low byte. `0x01000030`
+/// has low byte `0x30` (net-address — which ADMITS clean), so a masked-low-byte check would wrongly
+/// route+admit it; the raw check must `ReservedDeny`. This test FAILS under a masked implementation.
+#[test]
+fn jc1_reserved_check_reads_raw_verb_not_masked_low_byte() {
+    let clean = net_address("api.anthropic.com/v1/messages"); // low byte 0x30
+    // Sanity: the clean frame DOES admit — so a masked check would admit the reserved one too.
+    let mut d0 = Dispatcher::new();
+    assert!(
+        matches!(d0.route(SessionId(9), &clean, ROUTES, VETTED_TOOLS), Routed::NetRouteAdmit(_)),
+        "the clean net-address admits — a masked-low-byte check would wrongly admit the reserved variant",
+    );
+    let frame = set_reserved(&clean, 0x0100_0000); // → verb 0x01000030
+    let mut d = Dispatcher::new();
+    assert_eq!(
+        d.route(SessionId(1), &frame, ROUTES, VETTED_TOOLS),
+        Routed::ReservedDeny { verb: 0x0100_0030 },
+        "raw check must deny 0x01000030; a masked (& 0xff = 0x30) check would have routed it as net-address",
+    );
+}
+
+/// JC-1's OTHER half — the relayed-verb EXEMPTION (the checked=0 companion to the acted-on half): a
+/// RELAYED verb with reserved bits set still routes to `Relay(..)`, NOT `ReservedDeny`. Proves
+/// `acts_on()` correctly excludes relayed verbs and that JC-1 polices nothing on relayed messages
+/// (relay is inert; reserved bits pass to the head, whose consumer policy is its own) — the exemption
+/// holds through the real dispatch path, across two relay kinds.
+#[test]
+fn jc1_exempts_relayed_verbs_reserved_bits_still_relay() {
+    // display (0x11, Terminal relay) with ALL reserved bytes set → Relay(Terminal), not ReservedDeny.
+    let mut d = Dispatcher::new();
+    assert_eq!(
+        d.route(SessionId(1), &set_reserved(&raw_frame(proto::verb::DISPLAY, b"cells"), 0xFFFF_FF00), ROUTES, VETTED_TOOLS),
+        Routed::Relay(RelayKind::Terminal),
+        "a relayed display verb with reserved bits must relay (JC-1 exempts relayed messages), not ReservedDeny",
+    );
+    // file-read (0x22, FileRead relay) with a reserved byte set → Relay(FileRead), not ReservedDeny.
+    let mut d = Dispatcher::new();
+    assert_eq!(
+        d.route(SessionId(2), &set_reserved(&raw_frame(proto::verb::FILE_READ, b"src"), 0x0100_0000), ROUTES, VETTED_TOOLS),
+        Routed::Relay(RelayKind::FileRead),
+        "a relayed file-read verb with reserved bits must relay, not ReservedDeny (acting-wiring unbuilt/reply-path-gated)",
+    );
+}
+
+/// The same acted-on verbs with ZERO reserved bytes route by their real logic, unchanged — the
+/// reserved check does not disturb the clean path.
+#[test]
+fn jc1_clean_acted_on_verbs_route_by_real_logic_unchanged() {
+    let anthropic = br#"{"model":"m","messages":[]}"#;
+    let mut d = Dispatcher::new();
+    assert!(matches!(d.route(SessionId(1), &net_address("api.anthropic.com/v1/messages"), ROUTES, VETTED_TOOLS), Routed::NetRouteAdmit(_)));
+    let mut d = Dispatcher::new();
+    assert_eq!(d.route(SessionId(2), &file_write(3), ROUTES, VETTED_TOOLS), Routed::FileWriteAdmit);
+    let mut d = Dispatcher::new();
+    assert_eq!(d.route(SessionId(3), &file_chunk(b"x"), ROUTES, VETTED_TOOLS), Routed::ToServiceHandler(Service::File));
+    let mut d = Dispatcher::new();
+    assert_eq!(d.route(SessionId(4), &net_payload(anthropic, true), ROUTES, VETTED_TOOLS), Routed::NetPayloadAccumulating);
+}
+
+/// JC-2 precedence (settled fork): `service_of_verb` on the masked low byte FIRST — an unsupported low
+/// byte is `Unsupported`/JC-2 REGARDLESS of reserved bits (never reaches JC-1, as it is never acted on).
+#[test]
+fn jc2_unsupported_low_byte_precedes_jc1_regardless_of_reserved_bits() {
+    // Low byte 0x40 is a reserved block (no service) — Unsupported — even with reserved upper bytes set.
+    let mut frame = 0x0100_0040u32.to_le_bytes().to_vec();
+    frame.extend_from_slice(b"whatever");
+    let mut d = Dispatcher::new();
+    assert_eq!(
+        d.route(SessionId(1), &frame, ROUTES, VETTED_TOOLS),
+        Routed::Unsupported { verb: 0x0100_0040 },
+        "an unsupported low byte is JC-2 Unsupported, not JC-1 ReservedDeny — service_of_verb runs first",
+    );
+    assert_eq!(d.binding_count(), 0, "an unsupported verb never binds");
+}
+
+/// JC-2 precedence, mismatch case: a frame whose verb's service does not match the session's binding
+/// is `Unsupported` (JC-2) BEFORE the reserved-check even with reserved bits set — a mismatched frame
+/// is never *acted on* for this session, so JC-1 does not police it. The standing binding is untouched.
+#[test]
+fn jc2_service_mismatch_precedes_jc1_even_with_reserved_bits() {
+    let mut d = Dispatcher::new();
+    let s = SessionId(1);
+    let _ = d.route(s, &net_address("api.anthropic.com/v1/messages"), ROUTES, VETTED_TOOLS); // binds Net
+    let mismatched = set_reserved(&file_write(3), 0x0100_0000); // file-write (File service) + reserved bits
+    let raw = u32::from_le_bytes(mismatched[0..4].try_into().unwrap());
+    assert_eq!(
+        d.route(s, &mismatched, ROUTES, VETTED_TOOLS),
+        Routed::Unsupported { verb: raw },
+        "a mismatched frame is Unsupported (JC-2) before the reserved-check — never acted on for this session",
+    );
+    assert_eq!(d.binding(s), Some(Service::Net), "the binding stands; only the message denies");
+}
+
+/// The reserved-SCHEME surface (net-address, scheme != 0) still denies via U2's scheme gate
+/// (`vocab::assemble` → `None` → `NetDeny`) — a CLEAN verb, so NOT `ReservedDeny`: the two reserved
+/// surfaces are distinct and not double-gated. Confirms Sprint-8 behavior unchanged.
+#[test]
+fn reserved_scheme_still_denies_via_u2_not_reserveddeny() {
+    let mut frame = net_address("api.anthropic.com/v1/messages"); // verb clean; scheme=0 at bytes 4..8
+    frame[4..8].copy_from_slice(&5u32.to_le_bytes()); // a reserved scheme value
+    let mut d = Dispatcher::new();
+    assert_eq!(
+        d.route(SessionId(1), &frame, ROUTES, VETTED_TOOLS),
+        Routed::NetDeny,
+        "a reserved scheme denies via U2 (NetDeny), unchanged — not ReservedDeny, not double-gated",
+    );
+}
+
+// ─── Sprint 9 Slice 2 — the quarantine-write dispatch integration ────────────────────────────
+
+/// The receive-side upload path end to end: file-write admits + declares the writer; file-chunks
+/// append at the monotonic cursor; the bytes land at the confined destination on disk; and
+/// **completion = session end** closes the held fd (fd-lifecycle, proven via writes_count()).
+#[test]
+fn quarantine_write_appends_via_dispatch_and_closes_fd_on_session_end() {
+    let sc = Scratch::new();
+    let mut d = sc.dispatcher();
+    let s = SessionId(1);
+    assert_eq!(d.route(s, &file_write_to("up.txt"), ROUTES, VETTED_TOOLS), Routed::FileWriteAdmit);
+    assert_eq!(d.writes_count(), 1, "file-write declares the per-session writer");
+    assert_eq!(d.route(s, &file_chunk(b"hello "), ROUTES, VETTED_TOOLS), Routed::FileChunkAppended { bytes: 6 });
+    assert_eq!(d.route(s, &file_chunk(b"world"), ROUTES, VETTED_TOOLS), Routed::FileChunkAppended { bytes: 5 });
+    assert_eq!(std::fs::read(sc.dir.join("up.txt")).unwrap(), b"hello world", "bytes landed verbatim, in order");
+    // Completion is the transport session ending (file.md §1): the writer is evicted, the fd closed.
+    d.close_session(s);
+    assert_eq!(d.writes_count(), 0, "close_session evicts the writer and closes its fd (fd-lifecycle)");
+}
+
+/// A file-chunk with NO admitted file-write (no destination declared) fails closed — FileChunkDeny,
+/// nothing created, no writer.
+#[test]
+fn file_chunk_with_no_prior_file_write_denies() {
+    let sc = Scratch::new();
+    let mut d = sc.dispatcher();
+    assert_eq!(d.route(SessionId(1), &file_chunk(b"x"), ROUTES, VETTED_TOOLS), Routed::FileChunkDeny);
+    assert_eq!(d.writes_count(), 0);
+}
+
+/// The confined open is the real floor, applied at chunk time — not just the file-write leaf gate: a
+/// destination whose name-alphabet is clean (so file-write ADMITS) but whose on-ground resolution
+/// escapes via a symlink component is caught by the first file-chunk's confined open (RESOLVE_NO_SYMLINKS)
+/// → FileChunkDeny, and the poisoned writer is evicted.
+#[test]
+fn file_chunk_confined_open_deny_evicts_the_writer() {
+    let sc = Scratch::new();
+    // Pre-plant a symlink escaping the quarantine root at a clean-named component.
+    std::os::unix::fs::symlink("/etc", sc.dir.join("link")).unwrap();
+    let mut d = sc.dispatcher();
+    let s = SessionId(1);
+    assert_eq!(d.route(s, &file_write_to("link/passwd"), ROUTES, VETTED_TOOLS), Routed::FileWriteAdmit, "leaf gate admits a clean-named destination");
+    assert_eq!(d.route(s, &file_chunk(b"x"), ROUTES, VETTED_TOOLS), Routed::FileChunkDeny, "the confined open denies the symlink escape");
+    assert_eq!(d.writes_count(), 0, "the poisoned writer is evicted on the confined-open deny");
 }
 
 // ─── MB4 liveness: the reactor loop drives dispatch over a FAKE wire and terminates ──────────

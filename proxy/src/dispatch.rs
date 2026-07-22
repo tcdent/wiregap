@@ -12,10 +12,13 @@
 //! security-relevant wiring invariant, MB3).
 
 
+use std::os::fd::{AsFd, OwnedFd};
+
 use proto::{FileWrite, NetAddress, NetPayload, Reassembler, ReassemblyState, Reject, Wire, verb};
 use transport::SessionId;
 
 use crate::anthropic::{Denial, Request, recognize};
+use crate::fs_write::{QuarantineWriter, WriteStep};
 use crate::vocab::{Route, ToolIdentity};
 
 /// Peek the L2 verb — the first `u32` (LE) of the payload — **without decoding the body**. This is
@@ -52,6 +55,18 @@ pub fn service_of_verb(verb: u32) -> Option<Service> {
     }
 }
 
+/// The verbs the proxy **acts on** (decodes + gates) today — the JC-1 reserved-check set: the four
+/// verbs `dispatch` itself decodes (`box-proxy.md` §3.1's gated set, minus `file-read`/`list`, whose
+/// acting-wiring is unbuilt and reply-path-gated — as-relayed they are JC-1-exempt). A relayed or
+/// control verb is **not** acted on, so JC-1 does not police it (relay is inert; §2). Matches on the
+/// low-byte id; the reserved-bit check is applied by the caller on the raw u32.
+fn acts_on(verb: u32) -> bool {
+    matches!(
+        verb & 0xff,
+        verb::NET_ADDRESS | verb::FILE_WRITE | verb::FILE_CHUNK | verb::NET_PAYLOAD
+    )
+}
+
 /// The disposition of one delivered frame after decode + binding + routing.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Routed {
@@ -62,10 +77,18 @@ pub enum Routed {
     /// scheme or no matching route).
     NetDeny,
     /// A single-frame gated decision: the file-write destination passed the tier-1 leaf check
-    /// (via `leaf_validate_prescanned` — the single-scan-site path, RQ2).
+    /// (via `leaf_validate_prescanned` — the single-scan-site path, RQ2). The validated destination is
+    /// stored as a per-session [`QuarantineWriter`] for the ensuing `file-chunk`s to append to.
     FileWriteAdmit,
     /// A single-frame gated decision: the file-write destination was denied by the tier-1 core.
     FileWriteDeny,
+    /// A `file-chunk` appended `bytes` to the session's quarantine file (Sprint 9 Slice 2) — the
+    /// confined write succeeded at the monotonic cursor.
+    FileChunkAppended { bytes: usize },
+    /// A `file-chunk` was **denied** and the poisoned writer evicted: the confined open refused the
+    /// destination (traversal/symlink/exists), the per-file cap tripped, a write errored, or the chunk
+    /// arrived with no admitted `file-write` (no destination). Fail-closed; nothing (further) written.
+    FileChunkDeny,
     /// A `net-payload` chunk accumulated into the session's [`Reassembler`]; its header flag was
     /// `more`, so more chunks are expected — no decision yet (the body is incomplete).
     NetPayloadAccumulating,
@@ -91,6 +114,15 @@ pub enum Routed {
     /// A verb no proxy service supports, or a frame whose verb's service does not match the
     /// session's binding (`box-proxy.md` JC-2) — dropped, logged.
     Unsupported { verb: u32 },
+    /// **JC-1 (`box-proxy.md` §2): reserved disposition.** A message the proxy *acts on* (one of the
+    /// four acted-on verbs — `net-address`/`file-write`/`file-chunk`/`net-payload`) whose **raw** verb
+    /// `u32` carries a nonzero reserved surface (the upper three bytes) **denies the whole message,
+    /// deny-without-binding**. The check reads the raw [`peek_verb`] u32, never the masked low byte (a
+    /// masked check would pass vacuously). Silent, like every deny — the JC-3b error-verb notification
+    /// stays R-c-deferred. Carries the raw verb (numeric, safe to log). Relayed verbs are exempt (JC-1
+    /// polices nothing on relayed messages; relay is inert). Forward-compatibility floor: whatever ids
+    /// ratify later, today's proxy denies a reserved surface fail-closed.
+    ReservedDeny { verb: u32 },
     /// The L2 payload failed to decode (a structural `proto::Reject`) — dropped, logged.
     Decode(Reject),
 }
@@ -142,6 +174,16 @@ pub struct Dispatcher {
     /// The matched [`Route`] per session, stored on `net-address` admission — the real source of the
     /// `net-payload` recognizer envelope (Task 14). Shares the binding map's eviction shape.
     routes: alloc::collections::BTreeMap<SessionId, Route>,
+    /// The pinned quarantine root fd (Sprint 9 Slice 2), a config hook set by
+    /// [`Dispatcher::with_quarantine_root`]. `None` when the write path is not configured (e.g. a
+    /// hardware-free routing test that sends no chunks) — a `file-chunk` then routes to the File
+    /// handler unchanged. All confined opens resolve BENEATH this fd (`file.md` §1).
+    quarantine_root: Option<OwnedFd>,
+    /// One in-flight quarantine write per session (Sprint 9 Slice 2), created on `file-write` admission
+    /// and removed on session-end or a chunk-deny. Shares the eviction shape; a *tighter* residual (an
+    /// entry only while a file is mid-upload) whose per-file size is bounded by `QUARANTINE_WRITE_CAP`.
+    /// The held fd closes on eviction (fd-lifecycle — scarcer than memory).
+    writers: alloc::collections::BTreeMap<SessionId, QuarantineWriter>,
     /// The per-session reassembly capacity bound. In production this is always
     /// `proto::verb::REASSEMBLY_CAP` (set by [`Dispatcher::new`]); a `#[cfg(test)]` constructor may
     /// inject a small cap to exercise the evict-on-overflow path cheaply — the field is otherwise
@@ -166,8 +208,23 @@ impl Dispatcher {
             bindings: alloc::collections::BTreeMap::new(),
             reassemblers: alloc::collections::BTreeMap::new(),
             routes: alloc::collections::BTreeMap::new(),
+            quarantine_root: None,
+            writers: alloc::collections::BTreeMap::new(),
             reassembly_cap: verb::REASSEMBLY_CAP,
             dropped: 0,
+        }
+    }
+
+    /// Configure the quarantine write path (Sprint 9 Slice 2): `root` is the pinned quarantine root fd
+    /// (opened once by the composition root via [`crate::open_discipline::pin_root`] — a config hook,
+    /// the same shape as `fs_read`'s `readable_root`). Every `file-chunk`'s confined open resolves
+    /// BENEATH this fd. Without it, the write path is inert (a `file-chunk` routes to the handler
+    /// unchanged); a serving proxy always sets it (the lifecycle ladder validates the FS roots first).
+    #[must_use]
+    pub fn with_quarantine_root(root: OwnedFd) -> Self {
+        Dispatcher {
+            quarantine_root: Some(root),
+            ..Dispatcher::new()
         }
     }
 
@@ -205,22 +262,36 @@ impl Dispatcher {
                 got: payload.len(),
             });
         };
+        // JC-2 precedence (box-proxy.md §2, the settled fork): `service_of_verb` runs on the MASKED low
+        // byte FIRST. An unsupported low byte is never *acted on*, so it denies as `Unsupported`
+        // regardless of any reserved bits — JC-1 applies only to messages the proxy acts on, so the
+        // reserved-check must not run for a verb the proxy would never act on.
         let Some(service) = service_of_verb(verb) else {
             self.dropped += 1;
             return Routed::Unsupported { verb };
         };
 
-        // Session→service binding: bind on the first frame; thereafter the verb's service must match.
-        match self.bindings.get(&session) {
-            None => {
-                self.bindings.insert(session, service);
-            }
-            Some(&bound) if bound == service => {}
-            Some(_) => {
-                self.dropped += 1;
-                return Routed::Unsupported { verb };
-            }
+        // JC-2 (later frame, wrong service): a mismatched verb is likewise never acted on for this
+        // session — `Unsupported`, *before* the JC-1 reserved-check, and without disturbing the standing
+        // binding (the session stands; only this message denies).
+        if let Some(&bound) = self.bindings.get(&session)
+            && bound != service
+        {
+            self.dropped += 1;
+            return Routed::Unsupported { verb };
         }
+
+        // JC-1 (box-proxy.md §2): a message the proxy *acts on* whose **raw** verb `u32` carries a
+        // nonzero reserved surface (upper three bytes) denies the whole message, **deny-without-binding**
+        // — returned before the binding insert, so a reserved first frame never leaves a session
+        // half-bound. Checked on the raw peek_verb u32 (a masked-low-byte check would pass vacuously);
+        // reached only for a recognized, matched, acted-on verb (the JC-2 checks above ran first).
+        if acts_on(verb) && (verb & 0xFFFF_FF00) != 0 {
+            return Routed::ReservedDeny { verb };
+        }
+
+        // Bind on the first frame (both JC-2 and JC-1 passed); a matched later frame is a no-op.
+        self.bindings.entry(session).or_insert(service);
 
         self.dispatch(session, verb, payload, register, vetted)
     }
@@ -257,7 +328,13 @@ impl Dispatcher {
                 // The single-scan-site path (RQ2): FileWrite::decode already scan_safe-validated the
                 // stack, so the core does count-only via leaf_validate_prescanned.
                 Ok(fw) => match crate::leaf::leaf_validate_prescanned(&fw.0) {
-                    Ok(()) => Routed::FileWriteAdmit,
+                    Ok(()) => {
+                        // Admit: declare the per-session quarantine write for the ensuing file-chunks
+                        // (Slice 2). The fd is opened lazily on the first chunk (no empty file on a
+                        // file-write-then-abandon). The destination was just validated; store it.
+                        self.writers.insert(session, QuarantineWriter::declare(fw.0));
+                        Routed::FileWriteAdmit
+                    }
                     Err(_) => Routed::FileWriteDeny,
                 },
                 Err(reject) => Routed::Decode(reject),
@@ -266,8 +343,8 @@ impl Dispatcher {
             // ── Gated stateful channel: reassemble the body, then invoke the tier-1 recognizer ─────
             verb::NET_PAYLOAD => self.route_net_payload(session, body, vetted),
 
-            // ── Stateful follow-on channels: routed to their service handler, body un-decoded ──────
-            verb::FILE_CHUNK => Routed::ToServiceHandler(Service::File), // append at the cursor
+            // ── Gated stateful channel: append the chunk to the session's confined quarantine file ──
+            verb::FILE_CHUNK => self.route_file_chunk(session, body),
             verb::OPEN_SESSION => Routed::ToServiceHandler(Service::Control),
 
             // ── Relay channels: forward the OPAQUE payload; NO body decode (proxy-head.md §1) ──────
@@ -350,6 +427,30 @@ impl Dispatcher {
         }
     }
 
+    /// The `file-chunk` handler (Sprint 9 Slice 2): append the chunk to the session's confined
+    /// quarantine file via the reused `open_discipline` confined-create (full write-floor mask, opened
+    /// lazily on the first chunk). **Fail-closed** — a confined-open deny (traversal/symlink/exists),
+    /// a per-file cap trip, a write error, or a chunk with no admitted `file-write` evicts the poisoned
+    /// writer and denies. Without a configured quarantine root the write path is inert (the pre-Slice-2
+    /// handler disposition), which a serving proxy never hits (the ladder validates FS roots first).
+    fn route_file_chunk(&mut self, session: SessionId, body: &[u8]) -> Routed {
+        let Some(root) = self.quarantine_root.as_ref() else {
+            return Routed::ToServiceHandler(Service::File); // write path not configured (routing-only)
+        };
+        let root_fd = root.as_fd();
+        let Some(writer) = self.writers.get_mut(&session) else {
+            return Routed::FileChunkDeny; // a chunk with no admitted file-write — no destination
+        };
+        match writer.write_chunk(root_fd, body) {
+            WriteStep::Appended(n) => Routed::FileChunkAppended { bytes: n },
+            WriteStep::Denied(_) | WriteStep::Capped | WriteStep::WriteFailed(_) => {
+                // Evict the poisoned writer so a later chunk cannot resume a denied/capped/errored write.
+                self.writers.remove(&session);
+                Routed::FileChunkDeny
+            }
+        }
+    }
+
     /// Evict a session's binding **and any in-flight reassembly buffer** — the **eviction hook** for
     /// the MB4 bounded-resource residual. It is structurally ready to wire to a transport
     /// session-close/give-up signal; that signal is not in the committed transport yet (the same
@@ -359,6 +460,10 @@ impl Dispatcher {
     pub fn close_session(&mut self, session: SessionId) -> Option<Service> {
         self.reassemblers.remove(&session);
         self.routes.remove(&session);
+        // Drop the session's quarantine writer — its held fd (an owned File) closes here (fd-lifecycle:
+        // an fd leak is more acute than the map residuals). This IS the file's completion (file.md §1:
+        // completion is the transport session ending — no wire close signal).
+        self.writers.remove(&session);
         self.bindings.remove(&session)
     }
 
@@ -385,6 +490,20 @@ impl Dispatcher {
     #[must_use]
     pub fn reassembling_count(&self) -> usize {
         self.reassemblers.len()
+    }
+
+    /// The number of sessions holding a stored matched `Route` (test/observability) — used to prove
+    /// deny-without-binding leaves no route trace, alongside `binding_count`/`reassembling_count`.
+    #[must_use]
+    pub fn routes_count(&self) -> usize {
+        self.routes.len()
+    }
+
+    /// The number of sessions holding an in-flight quarantine writer (test/observability) — used to
+    /// prove the held fd is closed on session-end / chunk-deny (the fd-lifecycle gate).
+    #[must_use]
+    pub fn writes_count(&self) -> usize {
+        self.writers.len()
     }
 }
 

@@ -44,6 +44,9 @@ pub mod terminal_relay;
 #[cfg(unix)]
 pub mod fs_read;
 
+#[cfg(unix)]
+pub mod fs_write;
+
 pub mod leaf;
 
 #[cfg(unix)]
