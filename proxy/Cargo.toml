@@ -32,6 +32,13 @@ ureq = "3.3.0"
 # (the production/TCB build) never links the bench surface — only `--features bench-capture` does.
 bench-capture = ["directpath/bench", "dep:benchtools"]
 
+# The Sprint-13 composition-root binary (src/bin/serve.rs) — the first runnable proxy. A pure BIN gate
+# (no extra deps: the RealNic construct, HeadConnection, and AnthropicClient are all in the default lib),
+# so it enables no feature flags — it only makes the bin buildable. OFF BY DEFAULT so `cargo build` (the
+# production/TCB build) never compiles this hardware-touching binary; only `--features serve` does.
+# Reuses s5_capture's feature-gated posture (compile-absent from a normal build).
+serve = []
+
 # The one confined-unsafe dependency: raw openat2/mkdirat syscalls for U1's open-discipline
 # (RQ7 → Option A, design 2026-07-19: box-reachable code carries confined IN-HOUSE unsafe,
 # never a third-party wrapper — reviewability is the guarantee, not a zero-unsafe-token count).
@@ -48,3 +55,8 @@ trybuild = "1"
 [[bin]]
 name = "s5_capture"
 required-features = ["bench-capture"]
+
+# The Sprint-13 composition-root bin — declared so its required-features gate it off the default build.
+[[bin]]
+name = "serve"
+required-features = ["serve"]

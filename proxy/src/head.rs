@@ -36,9 +36,10 @@ use std::thread::JoinHandle;
 use directpath::Event;
 use transport::SessionId;
 
-use crate::dispatch::{Dispatcher, RelayKind, Routed, peek_verb};
+use crate::dispatch::{Dispatcher, RelayKind, Routed, TerminalInput, peek_verb};
 use crate::nic::Reply;
 use crate::terminal_relay::{Direction, direction_of};
+use crate::upstream::{UpstreamIngress, UpstreamSpawn};
 use crate::vocab::{Route, ToolIdentity};
 
 /// The bounded depth (frames) of each head↔loop channel. A full channel backpressures the producer (the
@@ -215,6 +216,30 @@ fn write_loop(mut sock: UnixStream, rx: &Receiver<HeadFrame>) {
     }
 }
 
+/// Drain head→box input into the dispatcher, NON-BLOCKING, WITH backpressure (Sprint 13 Slice 1.5).
+/// Retry any input **retained** from a prior tick's full box queue first, then drain the head channel
+/// until it is empty OR a display's box queue **fills**. On a full queue ([`TerminalInput::Backpressure`])
+/// the un-routed input is **retained** in the one-slot `pending` and draining **stops** for this tick —
+/// the head channel is left unread, so it fills and the reader thread backpressures the socket, resuming
+/// next tick once the box drains. A fail-safe [`TerminalInput::Dropped`] (unknown/stale display) is a
+/// *correct* drop and does NOT stop the drain. Mirrors the upstream ingress's one-slot backpressure —
+/// a pulled keystroke is never handed to a full queue and lost.
+fn drain_head_input(head: &HeadConnection, dispatcher: &mut Dispatcher, pending: &mut Option<HeadFrame>) {
+    // Resume a retained input before pulling anything new (keep the channel unread while backpressured).
+    if let Some(frame) = pending.take()
+        && dispatcher.route_head_input(frame.session, &frame.payload) == TerminalInput::Backpressure
+    {
+        *pending = Some(frame);
+        return;
+    }
+    while let Some(frame) = head.try_recv_from_head() {
+        if dispatcher.route_head_input(frame.session, &frame.payload) == TerminalInput::Backpressure {
+            *pending = Some(frame);
+            return;
+        }
+    }
+}
+
 /// The box-facing run-loop adapter **with the head connection** (Sprint 12 Slice 2) — wires
 /// `terminal_relay` BOTH directions through the head connection. Each tick: (1) **drain** head→box input
 /// (NON-BLOCKING, F3) and route each frame via [`Dispatcher::route_head_input`] (fail-safe: input for an
@@ -236,11 +261,11 @@ pub fn run_adapter_with_head<O>(
 where
     O: FnMut(SessionId, &Routed) -> ControlFlow<()>,
 {
+    let mut pending_head: Option<HeadFrame> = None;
     move |reply, event| {
-        // 1. Drain head→box input, NON-BLOCKING — route each (fail-safe on unknown/stale display S).
-        while let Some(HeadFrame { session, payload }) = head.try_recv_from_head() {
-            let _ = dispatcher.route_head_input(session, &payload);
-        }
+        // 1. Drain head→box input, NON-BLOCKING, WITH backpressure (Sprint 13 Slice 1.5) — route each
+        //    (fail-safe on unknown/stale display S); a full box queue retains the input, never drops it.
+        drain_head_input(&head, &mut dispatcher, &mut pending_head);
         // 2. Handle the box event.
         let cf = match event {
             Event::Delivered(session, payload) => {
@@ -257,6 +282,82 @@ where
             Event::Idle => ControlFlow::Continue(()),
         };
         // 3. Pump reply streams (routed input → box, net/file replies).
+        dispatcher.pump_replies(reply);
+        cf
+    }
+}
+
+/// **The one production run-loop adapter (Sprint 13 Slice 1)** — the union of the three sibling
+/// adapters ([`crate::lifecycle::run_adapter`], [`crate::upstream::run_adapter_with_upstream`],
+/// [`run_adapter_with_head`]) into a single loop over **one** [`Dispatcher`], so a real proxy can drive
+/// the upstream **and** the head capabilities at once (each sibling owned its own dispatcher). Each tick:
+///
+/// 1. **Drain the upstream ingress** (non-blocking) — a response arriving during box-quiescence reaches
+///    the box on this tick. Drain **head→box input** (non-blocking, F3), fail-safe per
+///    [`Dispatcher::route_head_input`]. The two drains' order is a free choice, not load-bearing:
+///    delivery to the box is decided by the single [`Dispatcher::pump_replies`] pass (id/key-ordered),
+///    not by which ingress drained first. Each fully drains before the other and before the pump, but
+///    both channels are bounded ([`HEAD_CHANNEL_CAP`], upstream's `UPSTREAM_CHANNEL_CAP`), so the
+///    within-tick coupling is bounded — a named residual, not solved here.
+/// 2. **Route the single box event** — a `NetPayloadAdmit` kicks the upstream call (serial bound denies
+///    a second), a box→head `display`/`pane-state` is sent to the head, exactly as Sprints 11 and 12
+///    already built, unchanged.
+/// 3. **One `pump_replies`** — net-response, terminal-input, and file replies drain in one id-ordered
+///    pass.
+///
+/// **No shared mutable state** is introduced (Final State #2): the upstream mpsc and the head's two
+/// channels remain the only thread boundaries; both ingress drains and the route/pump borrow
+/// `&mut Dispatcher` sequentially within this single-threaded closure — never an `Arc`/`Mutex`, never a
+/// second thread touching the `Dispatcher`.
+///
+/// **Held (Task 20):** the live quiescent-arrival liveness of **both** ingresses — a head keystroke on
+/// an idle pty and an upstream response during box-silence deadlock identically absent the reactor's
+/// bounded park. The composition makes the head's share of that dependency explicit; it does not add a
+/// new one.
+pub fn run_adapter_composed<S, O>(
+    mut dispatcher: Dispatcher,
+    register: &'static [Route],
+    vetted: &'static [ToolIdentity],
+    spawn: S,
+    head: HeadConnection,
+    mut on_verdict: O,
+) -> impl FnMut(&mut dyn Reply, Event) -> ControlFlow<()>
+where
+    S: UpstreamSpawn,
+    O: FnMut(SessionId, &Routed) -> ControlFlow<()>,
+{
+    let mut ingress = UpstreamIngress::new(spawn);
+    let mut pending_head: Option<HeadFrame> = None;
+    move |reply, event| {
+        // 1a. Drain the upstream ingress (non-blocking): a response arriving while the box is silent
+        //     reaches the box on this tick — given Task 20 woke the tick. Backpressure, never drop.
+        ingress.drain(&mut dispatcher);
+        // 1b. Drain head→box input (non-blocking, F3) WITH backpressure: fail-safe on an unknown/stale
+        //     display session; a full box queue retains the input and stops the drain, never a drop.
+        drain_head_input(&head, &mut dispatcher, &mut pending_head);
+        // 2. Handle the single box event.
+        let cf = match event {
+            Event::Delivered(session, payload) => {
+                let routed = dispatcher.route(session, &payload, register, vetted);
+                match &routed {
+                    // A recognizer-admitted net payload kicks the upstream call (serial bound denies a 2nd).
+                    // `body` is cloned once — byte-identical to the admitted bytes (bind-the-chain).
+                    Routed::NetPayloadAdmit(body) => {
+                        ingress.on_admit(&mut dispatcher, session, body.clone());
+                    }
+                    // A box→head display/pane-state → the head, non-blocking, drop-on-full.
+                    Routed::Relay(RelayKind::Terminal)
+                        if peek_verb(&payload).and_then(direction_of) == Some(Direction::BoxToHead) =>
+                    {
+                        let _ = head.send_to_head(HeadFrame { session, payload: payload.to_vec() });
+                    }
+                    _ => {}
+                }
+                on_verdict(session, &routed)
+            }
+            Event::Idle => ControlFlow::Continue(()),
+        };
+        // 3. One pump pass — routed head input, net responses, and file replies to the box (id-ordered).
         dispatcher.pump_replies(reply);
         cf
     }
@@ -564,5 +665,248 @@ mod tests {
 
     fn recv_head_spin(sock: &mut UnixStream) -> HeadFrame {
         decode_head_frame(sock).expect("a framed head frame")
+    }
+
+    // ── Sprint 13 Slice 1 — the composed loop: BOTH ingresses active + interleaved, one Dispatcher ──
+
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    use std::sync::mpsc::{SyncSender, sync_channel};
+
+    use crate::upstream::{UPSTREAM_CHANNEL_CAP, UpstreamFrame, UpstreamHandle};
+
+    // A body the tier-1 recognizer ADMITS (identical to the upstream/lifecycle receive-path tests).
+    const ADMIT_BODY: &[u8] =
+        br#"{"model":"claude-x","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}"#;
+
+    fn net_address_frame() -> Vec<u8> {
+        proto::encode_message(&proto::Message::NetAddress(proto::NetAddress {
+            scheme: proto::Scheme::Https,
+            address: proto::scan_safe("api.anthropic.com/v1/messages".replace('/', "\u{1f}").as_bytes())
+                .unwrap(),
+        }))
+    }
+    fn net_payload_frame(content: &[u8]) -> Vec<u8> {
+        proto::encode_message(&proto::Message::NetPayload(proto::NetPayload {
+            more: false,
+            content: content.to_vec(),
+        }))
+    }
+
+    // A threadless upstream spawner (the test IS the worker): hands the created Sender back via a cell,
+    // counts spawns. Deterministic — no thread timing in the upstream leg.
+    struct ScriptedSpawner {
+        cell: Rc<RefCell<Option<SyncSender<UpstreamFrame>>>>,
+        count: Rc<Cell<usize>>,
+    }
+    impl UpstreamSpawn for ScriptedSpawner {
+        fn spawn(&self, _session: SessionId, _body: Vec<u8>) -> UpstreamHandle {
+            self.count.set(self.count.get() + 1);
+            let (tx, rx) = sync_channel(UPSTREAM_CHANNEL_CAP);
+            *self.cell.borrow_mut() = Some(tx);
+            UpstreamHandle { rx, join: None }
+        }
+    }
+
+    // A box-facing Reply recorder that decodes BOTH reply kinds by their stamped session + content, so a
+    // net-response and a terminal-input can be told apart and checked for misrouting.
+    struct ComposedRec {
+        alloc: transport::IdAllocator,
+        emitted: Vec<Vec<u8>>,
+        blocked: bool,
+    }
+    impl ComposedRec {
+        fn new() -> Self {
+            ComposedRec {
+                alloc: transport::IdAllocator::new(transport::Originator::High),
+                emitted: Vec::new(),
+                blocked: false,
+            }
+        }
+        fn stamp(f: &[u8]) -> u64 {
+            u64::from_be_bytes(f[0..8].try_into().unwrap())
+        }
+        // net-responses stamped `irt`: frame[8..] decodes to a NetResponse; returns the response bytes.
+        fn net_responses(&self, irt: u64) -> Vec<Vec<u8>> {
+            self.emitted
+                .iter()
+                .filter(|f| Self::stamp(f) == irt)
+                .filter_map(|f| match proto::decode_message(&f[8..]) {
+                    Ok(proto::Message::NetResponse(nr)) => Some(nr.0),
+                    _ => None,
+                })
+                .collect()
+        }
+        // terminal-inputs stamped `irt`: frame[8..12] is the KEY verb (the pty-routing stub); returns the
+        // input body riding after the verb.
+        fn terminal_inputs(&self, irt: u64) -> Vec<Vec<u8>> {
+            self.emitted
+                .iter()
+                .filter(|f| Self::stamp(f) == irt && f.len() >= 12)
+                .filter(|f| u32::from_le_bytes(f[8..12].try_into().unwrap()) == proto::verb::KEY)
+                .map(|f| f[12..].to_vec())
+                .collect()
+        }
+    }
+    impl Reply for ComposedRec {
+        fn open(&mut self, payload: &[u8]) -> SessionId {
+            self.emitted.push(payload.to_vec());
+            self.alloc.allocate()
+        }
+        fn send(&mut self, _id: SessionId, payload: &[u8]) -> Result<(), transport::SendError> {
+            if self.blocked {
+                return Err(transport::SendError::WouldBlock); // the box wire is not draining
+            }
+            self.emitted.push(payload.to_vec());
+            Ok(())
+        }
+    }
+
+    /// **The Slice-1 gate**: one `Dispatcher`, one composed adapter, BOTH ingresses carrying live
+    /// multi-frame traffic **interleaved in the same run** (a fake upstream response stream *and* a fake
+    /// head-input stream, pushed intermixed) — proving disjoint routing (each lands on its own session,
+    /// neither misrouted to the other), no interference (neither corrupts, drops, or blocks the other),
+    /// and the head-side fail-safety (Sprint 12) still holds under composition.
+    #[test]
+    fn composed_loop_drives_both_ingresses_interleaved_without_interference() {
+        let (worker_sock, mut fake_head) = UnixStream::pair().unwrap();
+        let conn = HeadConnection::spawn(worker_sock).unwrap();
+        let cell: Rc<RefCell<Option<SyncSender<UpstreamFrame>>>> = Rc::new(RefCell::new(None));
+        let count = Rc::new(Cell::new(0usize));
+        let mut adapter = run_adapter_composed(
+            Dispatcher::new(),
+            ROUTES,
+            VETTED_TOOLS,
+            ScriptedSpawner { cell: cell.clone(), count: count.clone() },
+            conn,
+            |_s, _r| ControlFlow::Continue(()),
+        );
+        let mut box_rec = ComposedRec::new();
+        let s_net = SessionId(2); // the box's net-request session (box-Low)
+        let s_display = SessionId(24); // the box's display session (box-Low), disjoint from s_net
+
+        // Prime the HEAD capability: a box→head display relays to the head and marks s_display active.
+        let display = raw_frame(proto::verb::DISPLAY, b"screen-bytes");
+        let _ = adapter(&mut box_rec, Event::Delivered(s_display, display.clone()));
+        assert_eq!(
+            recv_head_spin(&mut fake_head),
+            HeadFrame { session: s_display, payload: display },
+            "display relayed to the head; s_display now an active pty",
+        );
+
+        // Prime the UPSTREAM capability: net-address then net-payload → the recognizer admits → the
+        // composed loop kicks exactly one upstream call.
+        let _ = adapter(&mut box_rec, Event::Delivered(s_net, net_address_frame()));
+        let _ = adapter(&mut box_rec, Event::Delivered(s_net, net_payload_frame(ADMIT_BODY)));
+        assert_eq!(count.get(), 1, "the composed loop kicked exactly one upstream call");
+        let tx = cell.borrow_mut().take().expect("upstream worker spawned");
+
+        // INTERLEAVE: push an upstream chunk AND a head keystroke intermixed, ticking between — both
+        // ingresses drain through the SAME loop each round (neither is run through the loop in isolation).
+        let up: [&[u8]; 3] = [b"up-1", b"up-2", b"up-3"];
+        let keys: [&[u8]; 3] = [b"k1", b"k2", b"k3"];
+        for i in 0..3 {
+            tx.send(UpstreamFrame::Chunk(up[i].to_vec())).unwrap();
+            let input = raw_frame(proto::verb::KEY, keys[i]);
+            fake_head.write_all(&enc(&HeadFrame { session: s_display, payload: input })).unwrap();
+            for _ in 0..3 {
+                let _ = adapter(&mut box_rec, Event::Idle);
+                std::thread::yield_now();
+            }
+        }
+        drop(tx); // upstream EOF
+
+        // Drain to completion (bounded): every upstream chunk AND every keystroke reaches the box.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while box_rec.net_responses(s_net.0).len() < 3 || box_rec.terminal_inputs(s_display.0).len() < 3 {
+            assert!(std::time::Instant::now() < deadline, "both interleaved streams did not fully arrive");
+            let _ = adapter(&mut box_rec, Event::Idle);
+            std::thread::yield_now();
+        }
+
+        // DISJOINT routing — the upstream response, verbatim + in order, stamped the NET session ONLY.
+        assert_eq!(
+            box_rec.net_responses(s_net.0),
+            vec![b"up-1".to_vec(), b"up-2".to_vec(), b"up-3".to_vec()],
+            "upstream response reached the box verbatim, stamped its own net session",
+        );
+        assert!(
+            box_rec.net_responses(s_display.0).is_empty(),
+            "no upstream response misrouted onto the display session",
+        );
+        // The head input, verbatim, stamped s_display ONLY — never the net session.
+        assert_eq!(
+            box_rec.terminal_inputs(s_display.0),
+            vec![b"k1".to_vec(), b"k2".to_vec(), b"k3".to_vec()],
+            "head input reached the box verbatim, stamped its display session",
+        );
+        assert!(
+            box_rec.terminal_inputs(s_net.0).is_empty(),
+            "no keystroke misrouted onto the net session",
+        );
+
+        // Fail-safety holds UNDER composition: input for an unknown display session is dropped.
+        let before = box_rec.emitted.len();
+        fake_head
+            .write_all(&enc(&HeadFrame { session: SessionId(999), payload: raw_frame(proto::verb::KEY, b"x") }))
+            .unwrap();
+        for _ in 0..200 {
+            let _ = adapter(&mut box_rec, Event::Idle);
+            std::thread::yield_now();
+        }
+        assert_eq!(box_rec.emitted.len(), before, "unknown-display input dropped, never misrouted, under composition");
+    }
+
+    /// **SPRINT 13 SLICE 1.5 — the head half of the data-loss regression**: under a BACKPRESSURING box
+    /// (its wire WouldBlocks), a burst of head input larger than the reply-queue cap must reach the box
+    /// COMPLETE, IN ORDER, NONE LOST. Before the fix, `route_head_input` handed each pulled keystroke to
+    /// a full queue that refused it, dropping it — here every keystroke survives, held across the reply
+    /// queue, the one-slot pending, and the head channel, then flows once the box drains.
+    #[test]
+    fn backpressuring_box_never_loses_a_head_input_keystroke() {
+        use crate::dispatch::REPLY_QUEUE_CAP;
+
+        let (worker_sock, mut fake_head) = UnixStream::pair().unwrap();
+        let conn = HeadConnection::spawn(worker_sock).unwrap();
+        let mut adapter =
+            run_adapter_with_head(Dispatcher::new(), ROUTES, VETTED_TOOLS, conn, |_s, _r| ControlFlow::Continue(()));
+        let mut box_rec = ComposedRec::new();
+        let s = SessionId(24);
+
+        // Box emits a display on S → relayed to the head, marking S an active pty.
+        let display = raw_frame(proto::verb::DISPLAY, b"screen");
+        let _ = adapter(&mut box_rec, Event::Delivered(s, display.clone()));
+        assert_eq!(recv_head_spin(&mut fake_head), HeadFrame { session: s, payload: display });
+
+        // Box WIRE BLOCKED. Send a burst of distinct keystrokes far exceeding the reply-queue cap.
+        const TOTAL: usize = REPLY_QUEUE_CAP * 2 + 5;
+        box_rec.blocked = true;
+        for i in 0..TOTAL {
+            let input = raw_frame(proto::verb::KEY, format!("k{i}").as_bytes());
+            fake_head.write_all(&enc(&HeadFrame { session: s, payload: input })).unwrap();
+        }
+        // Drive many ticks under the block: the reply queue fills, route_head_input returns Backpressure,
+        // the input is RETAINED (pending_head) and the drain stops — the head channel fills and the reader
+        // backpressures the socket. Nothing is lost, nothing spins away.
+        for _ in 0..5_000 {
+            let _ = adapter(&mut box_rec, Event::Idle);
+            std::thread::yield_now();
+        }
+        assert!(
+            box_rec.terminal_inputs(s.0).len() <= 1,
+            "a blocked wire delivered nothing beyond the first frame (open cannot WouldBlock)",
+        );
+
+        // RELEASE the wire. Drive to completion — every keystroke arrives, verbatim + in order.
+        box_rec.blocked = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while box_rec.terminal_inputs(s.0).len() < TOTAL {
+            assert!(std::time::Instant::now() < deadline, "keystrokes did not all arrive after release");
+            let _ = adapter(&mut box_rec, Event::Idle);
+            std::thread::yield_now();
+        }
+        let got = box_rec.terminal_inputs(s.0);
+        let expected: Vec<Vec<u8>> = (0..TOTAL).map(|i| format!("k{i}").into_bytes()).collect();
+        assert_eq!(got, expected, "every keystroke delivered verbatim AND in order — NONE lost to a full queue");
     }
 }

@@ -30,7 +30,7 @@ use directpath::Event;
 use proto::ErrorCode;
 use transport::SessionId;
 
-use crate::dispatch::{Dispatcher, Routed};
+use crate::dispatch::{Dispatcher, Enqueue, Routed};
 use crate::nic::Reply;
 use crate::vocab::{Route, ToolIdentity};
 
@@ -87,6 +87,23 @@ struct InFlight {
     session: SessionId,
     rx: Receiver<UpstreamFrame>,
     join: Option<JoinHandle<()>>,
+    /// One response frame **pulled off the channel but not yet accepted** by the box's queue (Sprint 13
+    /// Slice 1.5) — the single-slot backpressure memory, mirroring [`ReplyStream::pending`] on the wire
+    /// side. While it is `Some`, `drain` does not read the channel, so the mpsc fills and the upstream
+    /// worker blocks on `send` (real TCP flow-control) instead of the chunk being silently dropped.
+    ///
+    /// [`ReplyStream::pending`]: crate::dispatch
+    pending: Option<PendingResponse>,
+}
+
+/// A response frame pulled from the worker channel awaiting room in the box's reply queue (Sprint 13
+/// Slice 1.5). Retained across ticks and retried before any new channel read, so nothing pulled off the
+/// channel is ever lost to a momentarily-full box queue.
+enum PendingResponse {
+    /// A response chunk → re-`enqueue_net_response`.
+    Chunk(Vec<u8>),
+    /// A terminal failure → re-`enqueue_net_error` (also closes the reply once accepted).
+    Failed(ErrorCode),
 }
 
 /// The loop-side upstream ingress (Sprint 11 Slice 1). Holds **at most one** in-flight call. On a
@@ -106,34 +123,44 @@ impl<S: UpstreamSpawn> UpstreamIngress<S> {
     /// A recognizer-admitted request body arrived. If no call is in flight, spawn the upstream worker
     /// (`body` is moved to the worker **verbatim** — bind-the-chain). If one is ALREADY in flight, deny
     /// this one `net-error(Unavailable)` — the serial bound (never a second worker/channel).
-    fn on_admit(&mut self, dispatcher: &mut Dispatcher, session: SessionId, body: Vec<u8>) {
+    pub(crate) fn on_admit(&mut self, dispatcher: &mut Dispatcher, session: SessionId, body: Vec<u8>) {
         if self.inflight.is_some() {
             dispatcher.enqueue_net_error(session, ErrorCode::Unavailable);
             return;
         }
         let handle = self.spawn.spawn(session, body);
-        self.inflight = Some(InFlight { session, rx: handle.rx, join: handle.join });
+        self.inflight = Some(InFlight { session, rx: handle.rx, join: handle.join, pending: None });
     }
 
-    /// Drain any response frames that have arrived from the worker into the push-queue (called **every
+    /// Drain response frames that have arrived from the worker into the push-queue (called **every
     /// tick**). On channel close (the worker dropped its `Sender` = end-of-response), close the reply
     /// stream, **join** the worker thread (no leak), and clear the in-flight slot. **Non-blocking**
     /// (`try_recv`): a slow or hung worker simply yields nothing this tick and never stalls the loop.
-    fn drain(&mut self, dispatcher: &mut Dispatcher) {
+    ///
+    /// **Backpressure, never drop (Sprint 13 Slice 1.5).** A frame pulled off the channel that the box's
+    /// queue **refuses** ([`Enqueue::Full`]) is **retained** in the one-slot [`InFlight::pending`] and
+    /// draining **stops** for this tick — the channel is left unread, so it fills and the worker blocks
+    /// on `send` (real flow-control), resuming next tick once the box drains. A pulled chunk is never
+    /// handed to a full queue and dropped (the original defect: the frame was already off the channel).
+    pub(crate) fn drain(&mut self, dispatcher: &mut Dispatcher) {
         let Some(session) = self.inflight.as_ref().map(|f| f.session) else {
             return;
         };
+        // Resume: retry a frame retained from a prior tick's full queue BEFORE reading the channel again,
+        // so the channel stays unread (worker keeps backpressuring) until the box makes room.
+        if let Some(pending) = self.inflight.as_mut().and_then(|f| f.pending.take())
+            && let Some(unaccepted) = try_enqueue(dispatcher, session, pending)
+        {
+            self.inflight.as_mut().expect("in flight above").pending = Some(unaccepted);
+            return; // still full — stop, keep backpressuring
+        }
         loop {
             // Borrow self.inflight only for the try_recv call (the Result is owned — no held borrow).
             let recv = self.inflight.as_ref().expect("checked above").rx.try_recv();
-            match recv {
+            let frame = match recv {
                 // A response chunk → relayed verbatim (net-response, MB3); a failure → net-error(code).
-                Ok(UpstreamFrame::Chunk(chunk)) => {
-                    dispatcher.enqueue_net_response(session, &chunk);
-                }
-                Ok(UpstreamFrame::Failed(code)) => {
-                    dispatcher.enqueue_net_error(session, code);
-                }
+                Ok(UpstreamFrame::Chunk(chunk)) => PendingResponse::Chunk(chunk),
+                Ok(UpstreamFrame::Failed(code)) => PendingResponse::Failed(code),
                 Err(TryRecvError::Empty) => return, // nothing right now — the worker is still running
                 Err(TryRecvError::Disconnected) => {
                     // End of response: close the reply stream (drains + evicts), reap the worker thread.
@@ -145,6 +172,11 @@ impl<S: UpstreamSpawn> UpstreamIngress<S> {
                     }
                     return;
                 }
+            };
+            // Enqueue; a full box queue RETAINS this (already-pulled) frame and STOPS the drain — no drop.
+            if let Some(unaccepted) = try_enqueue(dispatcher, session, frame) {
+                self.inflight.as_mut().expect("checked above").pending = Some(unaccepted);
+                return;
             }
         }
     }
@@ -153,6 +185,24 @@ impl<S: UpstreamSpawn> UpstreamIngress<S> {
     #[must_use]
     pub fn is_in_flight(&self) -> bool {
         self.inflight.is_some()
+    }
+}
+
+/// Enqueue a pulled response frame into the box's reply queue (Sprint 13 Slice 1.5). Returns `None` when
+/// accepted, or `Some(frame)` — the un-accepted frame handed back for the caller to retain — when the
+/// queue is [`Enqueue::Full`], so a frame already pulled off the channel is never dropped.
+fn try_enqueue(
+    dispatcher: &mut Dispatcher,
+    session: SessionId,
+    frame: PendingResponse,
+) -> Option<PendingResponse> {
+    let outcome = match &frame {
+        PendingResponse::Chunk(chunk) => dispatcher.enqueue_net_response(session, chunk),
+        PendingResponse::Failed(code) => dispatcher.enqueue_net_error(session, *code),
+    };
+    match outcome {
+        Enqueue::Accepted => None,
+        Enqueue::Full => Some(frame),
     }
 }
 
@@ -333,6 +383,7 @@ mod tests {
 
     use proto::{Message, NetAddress, NetPayload, Scheme, decode_message, encode_message, scan_safe};
 
+    use crate::dispatch::REPLY_QUEUE_CAP;
     use crate::register::anthropic::VETTED_TOOLS;
     use crate::register::net::ROUTES;
 
@@ -351,10 +402,13 @@ mod tests {
     }
 
     // A one-frame Reply recorder; decodes net-response / net-error frames (8B in_reply_to + proto msg).
+    // `blocked` makes `send` (the wire) WouldBlock, so a backpressuring box can be simulated (open, the
+    // origination, never WouldBlocks — the ReplyStream contract).
     struct ReplyRec {
         alloc: transport::IdAllocator,
         reply_sid: Option<SessionId>,
         emitted: Vec<Vec<u8>>,
+        blocked: bool,
     }
     impl ReplyRec {
         fn new() -> Self {
@@ -362,6 +416,7 @@ mod tests {
                 alloc: transport::IdAllocator::new(transport::Originator::High),
                 reply_sid: None,
                 emitted: Vec::new(),
+                blocked: false,
             }
         }
         fn net_responses(&self, irt: u64) -> Vec<Vec<u8>> {
@@ -397,6 +452,9 @@ mod tests {
             id
         }
         fn send(&mut self, _id: SessionId, payload: &[u8]) -> Result<(), transport::SendError> {
+            if self.blocked {
+                return Err(transport::SendError::WouldBlock); // the box wire is not draining
+            }
             self.emitted.push(payload.to_vec());
             Ok(())
         }
@@ -594,14 +652,80 @@ mod tests {
             "a fast worker is backpressured at the cap, never buffering unbounded",
         );
 
-        // Drain everything so the worker unblocks, finishes, and is reaped (no leak).
+        // Drain AND pump everything so the worker unblocks, finishes, and is reaped (no leak). The pump
+        // is required now that `drain` is bounded by the reply queue (Sprint 13 Slice 1.5): without a box
+        // draining the replies, `drain` correctly stops at REPLY_QUEUE_CAP and backpressures — it no
+        // longer grows the reply queue unbounded (the old, latent-defect behavior this test relied on).
+        let mut reply = ReplyRec::new();
         let mut ticks = 0;
         while ingress.is_in_flight() {
             ticks += 1;
             assert!(ticks < 100_000);
             ingress.drain(&mut d);
+            d.pump_replies(&mut reply);
         }
-        assert_eq!(sent.load(Ordering::SeqCst), target, "once drained, the worker delivers all frames");
+        assert_eq!(sent.load(Ordering::SeqCst), target, "once drained + pumped, the worker delivers all frames");
+        assert_eq!(reply.net_responses(1).len(), target, "every frame reached the box, none lost");
+    }
+
+    /// **SPRINT 13 SLICE 1.5 — the data-loss regression** (the exact test class that was missing, which
+    /// let the drop hide, checked=0): under a BACKPRESSURING box (its wire WouldBlocks), a response
+    /// larger than the reply-queue cap must be delivered COMPLETE, IN ORDER, with NONE LOST. Before the
+    /// fix, `drain` pulled each chunk off the channel and handed it to a full queue that refused it,
+    /// dropping it — here every chunk survives, held across the reply queue, the one-slot pending, the
+    /// mpsc, and the blocked worker, then flows once the box drains.
+    #[test]
+    fn backpressuring_box_never_loses_a_response_chunk() {
+        const TOTAL: usize = REPLY_QUEUE_CAP * 3 + 7; // >> both the reply-queue cap and the mpsc cap
+        let spawner = ThreadSpawner {
+            body: |tx: SyncSender<UpstreamFrame>| {
+                for i in 0..TOTAL {
+                    // Distinct payloads so an out-of-order or lost chunk is caught, not just a count.
+                    if tx.send(UpstreamFrame::Chunk(alloc_chunk(i))).is_err() {
+                        return;
+                    }
+                }
+                // returns → tx dropped → EOF
+            },
+        };
+        let mut ingress = UpstreamIngress::new(spawner);
+        let mut d = Dispatcher::new();
+        let s = SessionId(1);
+        ingress.on_admit(&mut d, s, ADMIT_BODY.to_vec());
+        let mut reply = ReplyRec::new();
+
+        // Phase 1: the box WIRE is BLOCKED. Drive many drain+pump ticks: the reply queue fills, `drain`
+        // retains + stops, the mpsc fills, the worker blocks on `send` — nothing is lost, nothing spins.
+        reply.blocked = true;
+        for _ in 0..10_000 {
+            ingress.drain(&mut d);
+            d.pump_replies(&mut reply);
+        }
+        assert!(ingress.is_in_flight(), "the response is HELD under backpressure, not completed or lost");
+        assert!(
+            reply.net_responses(s.0).len() <= 1,
+            "a blocked wire delivered nothing beyond the first frame (open cannot WouldBlock)",
+        );
+
+        // Phase 2: RELEASE the wire. Drive to completion — every chunk arrives, verbatim + in order.
+        reply.blocked = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while ingress.is_in_flight() {
+            assert!(std::time::Instant::now() < deadline, "did not complete after releasing backpressure");
+            ingress.drain(&mut d);
+            d.pump_replies(&mut reply);
+        }
+        d.pump_replies(&mut reply); // drain any tail
+
+        let got = reply.net_responses(s.0);
+        let expected: Vec<Vec<u8>> = (0..TOTAL).map(alloc_chunk).collect();
+        assert_eq!(got.len(), TOTAL, "every response chunk delivered — NONE lost to a full queue");
+        assert_eq!(got, expected, "delivered verbatim AND in order across the backpressure");
+    }
+
+    // A distinct per-index chunk payload (order + loss are detectable, not just a count).
+    fn alloc_chunk(i: usize) -> Vec<u8> {
+        format!("chunk-{i}").into_bytes()
     }
 
     /// The ADAPTER wiring: a real admit sequence (`net-address` then `net-payload`) drives on_admit, and

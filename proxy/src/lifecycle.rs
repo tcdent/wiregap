@@ -176,6 +176,28 @@ pub fn validate_authority(
     }
 }
 
+/// The composition-root configuration for [`bring_up`] — every non-closure input the ladder needs,
+/// grouped so the entry takes `(config, on_event)` rather than a wide argument list (already past
+/// clippy's too-many-args threshold once the Sprint-11 credential landed, and Sprint 13 adds more).
+/// **A pure data carrier**: no rung semantics, ordering, or fail-closed behavior lives here — grouping
+/// the arguments changes only their shape, never the ladder's behavior.
+pub struct BringUpConfig<'a> {
+    /// The proxy's own bench card (exact BDF; the caller gates on it — never a device-id scan).
+    pub local: Bdf,
+    /// The exact-BDF allowlist the transport is permitted to touch.
+    pub allowlist: &'a [Bdf],
+    /// The peer (box) MAC the transport targets.
+    pub peer_mac: [u8; 6],
+    /// The unprivileged uid to drop to (supplied by the caller; this entry does not choose it).
+    pub uid: u32,
+    /// The unprivileged gid to drop to.
+    pub gid: u32,
+    /// The compiled-in route register (U5) — the one already-grounded authority.
+    pub register: &'a [Route],
+    /// The upstream credential (Sprint 11) — `None` holds the **whole** proxy closed (all-or-none ladder).
+    pub credential: Option<&'a Credential>,
+}
+
 /// The production bring-up (capture-model — needs the real 82599). Climbs the ladder end to end:
 /// `construct` (rungs 1–2, privileged, atomic) → real privilege drop + IB2 self-observation → the
 /// authority validators → readiness → `run`. `uid`/`gid` are the target unprivileged identity to drop
@@ -184,23 +206,11 @@ pub fn validate_authority(
 ///
 /// Returns `Err` only if the privileged bring-up itself failed (no subsystem); a dropped/closed ladder
 /// is an `Ok(Readiness::{DropFailed,Closed})` — a *reported* fail-closed outcome, not an I/O error.
-// The composition-root entry legitimately takes several distinct config inputs (NIC identity, privilege
-// target, authority register + credential, the run adapter); grouping them into a config struct is a
-// future nicety, not a clarity win today.
-#[allow(clippy::too_many_arguments)]
-pub fn bring_up<F>(
-    local: Bdf,
-    allowlist: &[Bdf],
-    peer_mac: [u8; 6],
-    uid: u32,
-    gid: u32,
-    register: &[Route],
-    credential: Option<&Credential>,
-    on_event: F,
-) -> io::Result<Readiness>
+pub fn bring_up<F>(config: BringUpConfig<'_>, on_event: F) -> io::Result<Readiness>
 where
     F: FnMut(&mut dyn Reply, Event) -> ControlFlow<()>,
 {
+    let BringUpConfig { local, allowlist, peer_mac, uid, gid, register, credential } = config;
     // Rungs 1–2: privileged bring-up + transport up (real hardware). Atomic — `?` yields no subsystem.
     // `Endpoint::Proxy` is the proxy's FIXED identity (it originates response sessions from the high
     // half of the id space; directpath maps it to `Originator::High`) — a constant of what this binary

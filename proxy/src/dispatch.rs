@@ -203,8 +203,12 @@ pub enum TerminalInput {
     /// Enqueued to the box, stamped with the display-session correlation.
     Routed,
     /// The addressed display session is not active (unknown or **stale** after its pty closed) — the
-    /// input was **dropped, never misrouted** (fail-safe).
+    /// input was **dropped, never misrouted** (fail-safe). A *correct* drop, not a loss.
     Dropped,
+    /// The display's box queue is **full** (Sprint 13 Slice 1.5): the input was **not taken** — the
+    /// caller MUST retain it and stop draining the head channel so the channel fills and the reader
+    /// backpressures the socket, resuming next tick once the box drains. Never a dropped keystroke.
+    Backpressure,
 }
 
 /// The outcome of pulling the next frame from a [`ReplySource`].
@@ -874,8 +878,12 @@ impl Dispatcher {
             return TerminalInput::Dropped;
         }
         let frame = task16_terminal_correlation_frame(s_display, input_payload);
-        let _ = self.push_reply_frame(s_display, frame); // keyed by s_display; bounded (Enqueue::Full drops)
-        TerminalInput::Routed
+        match self.push_reply_frame(s_display, frame) {
+            // Keyed by s_display; the push is bounded (backpressure, never a drop — Sprint 13 Slice 1.5).
+            Enqueue::Accepted => TerminalInput::Routed,
+            // Full: NOT taken — the caller retains this input and stops draining so the socket backpressures.
+            Enqueue::Full => TerminalInput::Backpressure,
+        }
     }
 
     /// **Test/observability**: the number of active display sessions (the Slice-2 MB4 resource).
@@ -892,9 +900,16 @@ impl Dispatcher {
     /// evicts).
     pub fn enqueue_net_error(&mut self, session: SessionId, code: ErrorCode) -> Enqueue {
         let frame = task16_stub_reply_frame(session, &net_error(code));
-        let outcome = self.push_reply_frame(session, frame);
-        self.close_reply(session);
-        outcome
+        match self.push_reply_frame(session, frame) {
+            // Enqueued: close (single-frame notification → drains → evicts).
+            Enqueue::Accepted => {
+                self.close_reply(session);
+                Enqueue::Accepted
+            }
+            // Full: NOT enqueued and NOT closed (Sprint 13 Slice 1.5) — the caller retains + retries, so
+            // the error notification is never lost to a full queue (the same backpressure as a chunk).
+            Enqueue::Full => Enqueue::Full,
+        }
     }
 
     /// Enqueue a prepared frame into `box_session`'s push reply queue, bounded by [`REPLY_QUEUE_CAP`]:
