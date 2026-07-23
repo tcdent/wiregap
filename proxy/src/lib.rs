@@ -37,6 +37,9 @@ pub mod nic;
 
 pub mod upstream;
 
+#[cfg(unix)]
+pub mod head;
+
 pub mod lifecycle;
 
 pub mod cloud_relay;

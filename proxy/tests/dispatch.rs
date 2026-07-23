@@ -921,7 +921,7 @@ mod file_read_reply {
     // BOUNDARY HONESTY (gate 4): these prove the box-facing SEND + the push-queue pacing against a
     // FAKE ingress that simulates cloud/head data arriving — NOT the real upstream TLS client or head
     // connection (an explicit follow-on). Same receive-only-style honesty as Sprint 8.
-    use proxy::dispatch::{Enqueue, REPLY_QUEUE_CAP};
+    use proxy::dispatch::{Enqueue, REPLY_QUEUE_CAP, TerminalInput};
 
     fn decode_net_response_frame(frame: &[u8]) -> (u64, Vec<u8>) {
         let irt = u64::from_be_bytes(frame[0..8].try_into().unwrap());
@@ -1026,20 +1026,65 @@ mod file_read_reply {
         assert_eq!(d.replies_count(), 0, "closed + drained → evicted");
     }
 
-    /// Terminal head→box shares the push-fed shape but is relayed VERBATIM — emission (F1: no
-    /// correlation key) + zero-modification relay (MB3): the emitted frame is byte-identical to the
-    /// input, with NO proxy-added in_reply_to prefix.
+    /// Terminal head→box input carries a **pty-routing correlation** (Sprint 12 Slice 2, SUPERSEDING
+    /// Sprint 10's verbatim/no-key model): for an ACTIVE display session S, the input is routed to the
+    /// box **stamped with S** (so the box binds it to the pty that opened display-session S). The stamp
+    /// is the pty-routing correlation the two-session ruling requires — a distinct thing from the F1
+    /// *reply* correlation; the input L2 rides verbatim after it.
     #[test]
-    fn terminal_head_to_box_relayed_verbatim_no_correlation_key() {
+    fn terminal_input_for_active_display_is_stamped_with_the_correlation() {
         let mut d = Dispatcher::new();
-        let s = SessionId(24); // the box terminal session
-        let input = raw_frame(proto::verb::KEY, b"keystroke-bytes"); // an opaque head→box input frame
-        assert_eq!(d.enqueue_terminal_to_box(s, &input), Enqueue::Accepted);
-        d.close_reply(s);
+        let s = SessionId(24); // the display session the head addresses
+        // The box emitted display on S → S is an active display session.
+        assert_eq!(
+            d.route(s, &raw_frame(proto::verb::DISPLAY, b"screen"), ROUTES, VETTED_TOOLS),
+            Routed::Relay(RelayKind::Terminal)
+        );
+        assert_eq!(d.terminal_display_count(), 1);
+        // Head input addressed to S → routed, stamped with S (the pty-routing correlation).
+        let input = raw_frame(proto::verb::KEY, b"keystroke-bytes");
+        assert_eq!(d.route_head_input(s, &input), TerminalInput::Routed);
         let mut reply = FakeReply::new(usize::MAX);
         d.pump_replies(&mut reply);
         assert_eq!(reply.emitted.len(), 1);
-        assert_eq!(reply.emitted[0], input, "terminal input relayed byte-identical — no proxy-added key");
+        let correlation = u64::from_be_bytes(reply.emitted[0][0..8].try_into().unwrap());
+        assert_eq!(correlation, s.0, "stamped with the DISPLAY session as the pty-routing correlation");
+        assert_eq!(&reply.emitted[0][8..], input.as_slice(), "the input L2 rides verbatim after the correlation");
+    }
+
+    /// Fail-safe, never misroute: head input for an UNKNOWN display session (never active) is DROPPED —
+    /// it reaches the box nowhere.
+    #[test]
+    fn terminal_input_for_unknown_display_is_dropped() {
+        let mut d = Dispatcher::new();
+        assert_eq!(
+            d.route_head_input(SessionId(99), &raw_frame(proto::verb::KEY, b"k")),
+            TerminalInput::Dropped
+        );
+        let mut reply = FakeReply::new(usize::MAX);
+        d.pump_replies(&mut reply);
+        assert!(reply.emitted.is_empty(), "input for an unknown display session reaches the box nowhere");
+    }
+
+    /// Fail-safe on a STALE display session (the reviewer's dedicated case): after its pty CLOSES, input
+    /// for S is DROPPED, never misrouted to whatever now holds that id. `close_session` evicting the
+    /// display mark (MB4, no leak) is what makes S stale.
+    #[test]
+    fn terminal_input_for_stale_display_after_close_is_dropped() {
+        let mut d = Dispatcher::new();
+        let s = SessionId(24);
+        let _ = d.route(s, &raw_frame(proto::verb::DISPLAY, b"screen"), ROUTES, VETTED_TOOLS);
+        assert_eq!(d.terminal_display_count(), 1);
+        d.close_session(s); // the pty closed → S evicted from terminal_displays (MB4)
+        assert_eq!(d.terminal_display_count(), 0, "close_session evicts the display mark — no leak");
+        // Late head input for the now-stale S → DROPPED, never routed.
+        assert_eq!(
+            d.route_head_input(s, &raw_frame(proto::verb::KEY, b"k")),
+            TerminalInput::Dropped
+        );
+        let mut reply = FakeReply::new(usize::MAX);
+        d.pump_replies(&mut reply);
+        assert!(reply.emitted.is_empty(), "stale-after-close input is dropped, never misrouted");
     }
 
     /// A push reply stream is evicted on close_session too (fd-lifecycle parity with the pull streams).

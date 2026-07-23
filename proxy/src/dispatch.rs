@@ -180,8 +180,8 @@ pub enum RelayKind {
 /// variant yields the next reply **message body** (proto-encoded) on demand; the shared streaming /
 /// pacing / eviction machinery in [`ReplyStream`] is identical for both. Its fd closes when dropped.
 /// The bounded depth of a **push** reply queue (net-response / terminal head→box), in frames. When a
-/// push stream holds this many un-drained frames, [`Dispatcher::enqueue_net_response`] /
-/// [`enqueue_terminal_to_box`](Dispatcher::enqueue_terminal_to_box) return [`Enqueue::Full`] —
+/// push stream holds this many un-drained frames, [`Dispatcher::enqueue_net_response`] returns
+/// [`Enqueue::Full`] —
 /// **backpressure to the ingress** (it must stop reading upstream/head and retry after the box drains),
 /// never a drop, never unbounded growth. Provisional scalar (marked for review), the outbound analog of
 /// the transport ring depth / `REASSEMBLY_CAP`.
@@ -195,6 +195,16 @@ pub enum Enqueue {
     /// The queue is at [`REPLY_QUEUE_CAP`] — **backpressure**: the ingress must stop reading its source
     /// and retry after the box drains. The frame was **not** taken (never dropped, never grows the queue).
     Full,
+}
+
+/// The outcome of routing a head→box terminal input (Sprint 12 Slice 2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TerminalInput {
+    /// Enqueued to the box, stamped with the display-session correlation.
+    Routed,
+    /// The addressed display session is not active (unknown or **stale** after its pty closed) — the
+    /// input was **dropped, never misrouted** (fail-safe).
+    Dropped,
 }
 
 /// The outcome of pulling the next frame from a [`ReplySource`].
@@ -336,6 +346,20 @@ fn task16_stub_reply_frame(in_reply_to: SessionId, encoded_msg: &[u8]) -> alloc:
     frame
 }
 
+/// **TASK-16 STUB** (Sprint 12 Slice 2) — the terminal input's **pty-routing** correlation. A LOUD,
+/// deliberately non-canonical placeholder: prepend the 8-byte `s_display` session id (the DISPLAY
+/// session the head addressed, big-endian) ahead of the verbatim input payload, so the box binds the
+/// input to the pty that opened that display session. **Distinct in meaning** from
+/// [`task16_stub_reply_frame`]'s `in_reply_to` (a *reply* correlation) — this is a *routing* correlation
+/// the two-session PTY model requires; same byte shape, different semantic. Swaps to proto Task 16's
+/// canonical layout when it lands; **not** a finalized wire format.
+fn task16_terminal_correlation_frame(s_display: SessionId, input_payload: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut frame = alloc::vec::Vec::with_capacity(8 + input_payload.len());
+    frame.extend_from_slice(&s_display.0.to_be_bytes()); // the DISPLAY session id, the pty-routing key
+    frame.extend_from_slice(input_payload);
+    frame
+}
+
 /// Encode a proxy-authored `file-error` body for a JC-3(b) notification — a category `code` only, with
 /// an **empty detail**: no box-supplied name ever enters the body (`file.md` §0; unsafe names are
 /// display-only and physically cannot reach a proxy-authored error).
@@ -408,6 +432,15 @@ pub struct Dispatcher {
     /// reply is mid-stream), and per-entry memory is one pulled-not-yet-sent frame, never the whole
     /// source.
     replies: alloc::collections::BTreeMap<SessionId, ReplyStream>,
+    /// The set of **active display sessions** (Sprint 12 Slice 2) — a box-originated terminal session
+    /// on which the box has emitted a `display`/`pane-state` (a live pty). Head input addressed to a
+    /// display session `S` is routed to the box only if `S ∈ terminal_displays`; input for an unknown or
+    /// **stale** `S` (its pty already closed → evicted here) is **dropped, never misrouted**. This is
+    /// the new per-session resource the two-session PTY model introduces (the bidirectional model would
+    /// have needed none): **bounded per-epoch, evicted on [`close_session`]**, the same shape as the
+    /// binding/reassembler/writers/replies maps — no leak of the correlation state. (The proxy-originated
+    /// input *stream* itself lives in `replies`, keyed by `S`, evicted by the same hook.)
+    terminal_displays: alloc::collections::BTreeSet<SessionId>,
     /// The per-session reassembly capacity bound. In production this is always
     /// `proto::verb::REASSEMBLY_CAP` (set by [`Dispatcher::new`]); a `#[cfg(test)]` constructor may
     /// inject a small cap to exercise the evict-on-overflow path cheaply — the field is otherwise
@@ -436,6 +469,7 @@ impl Dispatcher {
             writers: alloc::collections::BTreeMap::new(),
             readable_root: None,
             replies: alloc::collections::BTreeMap::new(),
+            terminal_displays: alloc::collections::BTreeSet::new(),
             reassembly_cap: verb::REASSEMBLY_CAP,
             dropped: 0,
         }
@@ -616,7 +650,15 @@ impl Dispatcher {
                 Routed::Relay(RelayKind::FileRead)
             }
             verb::DISPLAY | verb::PANE_STATE | verb::KEY | verb::MOUSE | verb::PASTE | verb::FOCUS
-            | verb::CREATE_PTY | verb::RESIZE | verb::VIEWPORT => Routed::Relay(RelayKind::Terminal),
+            | verb::CREATE_PTY | verb::RESIZE | verb::VIEWPORT => {
+                // A box→head `display`/`pane-state` marks `session` an ACTIVE display session (Slice 2):
+                // a live pty the head can now address input to. Only the box→head direction marks it —
+                // head→box input arrives via the head connection, never the box wire.
+                if crate::terminal_relay::direction_of(verb) == Some(crate::terminal_relay::Direction::BoxToHead) {
+                    self.terminal_displays.insert(session);
+                }
+                Routed::Relay(RelayKind::Terminal)
+            }
 
             // An unknown id within a known block — no service supports it.
             _ => {
@@ -812,13 +854,34 @@ impl Dispatcher {
         self.push_reply_frame(box_session, frame)
     }
 
-    /// Enqueue one head→box terminal frame for the box (Sprint 10 Slice 3) — relayed **VERBATIM**, no
-    /// `in_reply_to`: terminal input is *emission* (F1: emission with no originating request carries no
-    /// correlation key), and the terminal relay is zero-modification (MB3, `terminal_relay`). Fed by the
-    /// head ingress (a **fake** in tests; the real head connection is a follow-on). Same bounded
-    /// backpressure as [`enqueue_net_response`](Self::enqueue_net_response).
-    pub fn enqueue_terminal_to_box(&mut self, box_session: SessionId, payload: &[u8]) -> Enqueue {
-        self.push_reply_frame(box_session, payload.to_vec())
+    /// Route a head→box terminal INPUT for display-session `s_display` (Sprint 12 Slice 2) — the head
+    /// addressed its input to the pty it observed on `s_display`. **Fail-safe, never misroute**: if
+    /// `s_display` is not an ACTIVE display session (unknown, or **stale** after its pty closed — evicted
+    /// from `terminal_displays` by `close_session`), the input is **DROPPED** ([`TerminalInput::Dropped`]),
+    /// never routed to whatever session now holds that id. Otherwise it is enqueued to the box on a
+    /// proxy-originated (high-half) input session, **stamped with `s_display`** as the pty-routing
+    /// correlation, and the push stream is **keyed by `s_display`** (not the input session's own id), so
+    /// the box routes it to the pty that opened `s_display`.
+    ///
+    /// **This SUPERSEDES Sprint 10's verbatim `enqueue_terminal_to_box`** (no correlation key): that was
+    /// correct for the *reply* correlation (F1 — input is not a reply), but the two-session PTY ruling
+    /// (2026-07-23: a bidirectional session is impossible — ACK and empty-data frames are byte-identical)
+    /// requires a *pty-routing* correlation, a genuinely different thing. A forced consequence of the
+    /// ruling, not new policy.
+    pub fn route_head_input(&mut self, s_display: SessionId, input_payload: &[u8]) -> TerminalInput {
+        if !self.terminal_displays.contains(&s_display) {
+            // No live pty for this display session (unknown or stale-after-close) → fail safe.
+            return TerminalInput::Dropped;
+        }
+        let frame = task16_terminal_correlation_frame(s_display, input_payload);
+        let _ = self.push_reply_frame(s_display, frame); // keyed by s_display; bounded (Enqueue::Full drops)
+        TerminalInput::Routed
+    }
+
+    /// **Test/observability**: the number of active display sessions (the Slice-2 MB4 resource).
+    #[must_use]
+    pub fn terminal_display_count(&self) -> usize {
+        self.terminal_displays.len()
     }
 
     /// Enqueue a single-frame `net-error(code)` notification to the box (Sprint 11) — the JC-3 net-error
@@ -927,6 +990,10 @@ impl Dispatcher {
         // Drop any in-flight outbound reply stream — its source fd (a FileReader) closes here too. A
         // reply cut short by session-end simply stops mid-stream (fail-safe: the box got a prefix).
         self.replies.remove(&session);
+        // Evict the display-session-active mark (Sprint 12 Slice 2): a closed pty's `S` is no longer a
+        // valid input target — later head input for it fails safe (dropped, never misrouted). The
+        // input stream keyed by `S` in `replies` was already evicted just above.
+        self.terminal_displays.remove(&session);
         self.bindings.remove(&session)
     }
 
