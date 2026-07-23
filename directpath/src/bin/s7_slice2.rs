@@ -83,6 +83,7 @@ fn run() -> io::Result<()> {
         &allow,
         BOX_CORE,
         PROXY_CORE,
+        None, // idle-park cap: uncapped (conservation harnesses)
         // ---- BOX (41): phase A one-directional send→ACK stream, then phase B silent give-up drive ----
         move |mut sys: Subsystem| -> io::Result<BoxReport> {
             // PHASE A: N one-directional send→ACK round-trips, paced on quiescence (box originates, proxy

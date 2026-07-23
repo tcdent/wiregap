@@ -93,6 +93,7 @@ fn run() -> io::Result<()> {
         &allow,
         BOX_CORE,
         PROXY_CORE,
+        None, // idle-park cap: uncapped (conservation harnesses)
         // ---- BOX (41): one-directional throughout. Phase 1 send→ACK RTT (paced on quiescence), then the
         // phase 2 burst storm; the box originates, the proxy only receives + auto-ACKs (sole allocator). ----
         move |mut sys: Subsystem| -> io::Result<BoxReport> {

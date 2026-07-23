@@ -159,7 +159,8 @@ fn err(m: impl Into<String>) -> io::Error {
 /// # fn main() -> std::io::Result<()> {
 /// let local = Bdf::parse("0000:41:00.0").expect("valid BDF");
 /// let peer = Bdf::parse("0000:63:00.0").expect("valid BDF");
-/// let mut sys = Subsystem::construct(local, &[local, peer], Endpoint::Box, |_own_mac| [0x02, 0, 0, 0, 0, 0x63])?;
+/// // `None` idle-park cap = uncapped (park until a NIC event or a retransmit deadline).
+/// let mut sys = Subsystem::construct(local, &[local, peer], Endpoint::Box, None, |_own_mac| [0x02, 0, 0, 0, 0, 0x63])?;
 ///
 /// // Open a session (frame 1), then stream a further frame on it once the prior frame has ACKed
 /// // (stop-and-wait; `send` returns `WouldBlock` while a frame is still in flight on that session).
@@ -274,7 +275,10 @@ impl Subsystem {
     /// Construct the subsystem over `local` (the bench card to own). `allowlist` is the gate's set of
     /// permitted BDFs (production devices refused). `endpoint` selects this side's half of the
     /// originator-partitioned session-id space ([`Endpoint::Box`] → low, [`Endpoint::Proxy`] → high), so both
-    /// ends originate without collision. `resolve_peer` is handed this card's own MAC (read after link-up)
+    /// ends originate without collision. `idle_cap` is the event loop's idle-park CEILING — `None` is
+    /// uncapped (park until a NIC event / retransmit deadline); `Some(d)` bounds each [`run`](Self::run) park
+    /// to at most `d`, so the loop wakes to run its own `Idle` logic even with no NIC event (a park ceiling,
+    /// not a poll). `resolve_peer` is handed this card's own MAC (read after link-up)
     /// and returns the peer MAC to send to — production passes `|_| CONFIGURED_PEER_MAC`; a two-ended harness
     /// exchanges own↔peer over a channel. Assembles gate → pci → mem/pagemap → link → datapath rings →
     /// reactor + `DdWaitHost`.
@@ -282,6 +286,7 @@ impl Subsystem {
         local: Bdf,
         allowlist: &[Bdf],
         endpoint: Endpoint,
+        idle_cap: Option<Duration>,
         resolve_peer: impl FnOnce([u8; 6]) -> [u8; 6],
     ) -> io::Result<Self> {
         // 1. Gate: the un-forgeable token.
@@ -335,7 +340,8 @@ impl Subsystem {
         let host = DdWaitHost::new(layout.rx_desc_base_va(), datapath::rx_tail_ptr(&bar), datapath::DEPTH, tsc_hz, 5.0);
         let sink = EthSink::new(TxPath::new(tx_ring), peer_mac, own_mac);
         let source = EthSource::new(RxDrainAsSource::new(RxPath::new(rx_ring)));
-        let reactor = Reactor::new(SessionTable::new(endpoint.originator()), host, source, sink);
+        let reactor = Reactor::new(SessionTable::new(endpoint.originator()), host, source, sink)
+            .idle_park_cap(idle_cap);
 
         Ok(Self {
             reactor,

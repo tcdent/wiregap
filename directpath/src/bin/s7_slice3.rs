@@ -81,6 +81,7 @@ fn run() -> io::Result<()> {
         &allow,
         BOX_CORE,
         PROXY_CORE,
+        None, // idle-park cap: uncapped (conservation harnesses)
         // ---- BOX (41): burst K, pace to quiescence; then the no-leak window; then the dead-peer give-up ----
         move |mut sys: Subsystem| -> io::Result<BoxReport> {
             // PHASE 1: open all K sessions at once → K frames interleaved on the wire.

@@ -31,7 +31,7 @@ pub mod reactor;
 pub mod rxdrain;
 
 pub use reactor::{
-    Arm, Host, Reactor, RxSource, WakeReason, arm_from_deadline, can_pull_rx,
+    Arm, Host, Reactor, RxSource, WakeReason, arm_from_deadline, can_pull_rx, capped_deadline,
 };
 pub use rxdrain::{RxDrain, RxDrainAsSource};
 

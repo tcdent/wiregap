@@ -6,7 +6,7 @@
 use core::cell::Cell;
 use core::time::Duration;
 use std::collections::VecDeque;
-use reactor::{arm_from_deadline, can_pull_rx, Arm, Host, Reactor, RxSource, WakeReason};
+use reactor::{arm_from_deadline, can_pull_rx, capped_deadline, Arm, Host, Reactor, RxSource, WakeReason};
 use transport::{decode_frame, Instant, Originator, SendError, SessionId, SessionTable, TransmitSink};
 
 // ---- deadline composition (the three edge-facts) ----------------------------------------------
@@ -298,4 +298,66 @@ fn multi_frame_stream_continues_on_one_session() {
     let f2 = decode_frame(&emitted[1]).expect("frame 2 decodes");
     assert_eq!((f1.session, f1.payload), (SessionId(0), b"frame-1".as_slice()), "frame 1 on session 0");
     assert_eq!((f2.session, f2.payload), (SessionId(0), b"frame-2".as_slice()), "frame 2 on the SAME session 0");
+}
+
+// ---- Task 17: the idle-park cap (ADDED) — min(next_deadline, now+cap), fed to the existing park path ----
+
+#[test]
+fn capped_deadline_composes_min_across_all_cases() {
+    // The park CEILING composes with the retransmit `next` deadline as min(next, now+cap). Expected values
+    // follow from the composition (pure), proving all four cases the gate names.
+    let now = Instant(1000);
+    let cap = Duration::from_nanos(50); // → cap deadline = now + 50 = 1050
+    // (cap == None) → next unchanged (today's uncapped behavior, byte-identical).
+    assert_eq!(capped_deadline(Some(Instant(1200)), None, now), Some(Instant(1200)), "cap None → next");
+    assert_eq!(capped_deadline(None, None, now), None, "both None → None (park forever)");
+    // (cap < next) → the cap wins.
+    assert_eq!(capped_deadline(Some(Instant(1200)), Some(cap), now), Some(Instant(1050)), "cap<next → cap");
+    // (cap > next) → the deadline wins.
+    assert_eq!(capped_deadline(Some(Instant(1010)), Some(cap), now), Some(Instant(1010)), "cap>next → next");
+    // (next == None) → the cap alone.
+    assert_eq!(capped_deadline(None, Some(cap), now), Some(Instant(1050)), "next None → cap alone");
+}
+
+/// A Host that records the exact timeout handed to `block()` (to prove park feeds the composed deadline).
+struct RecordingHost {
+    now: u64,
+    last_timeout: Option<Option<Duration>>,
+}
+impl RecordingHost {
+    fn new(now: u64) -> Self {
+        Self { now, last_timeout: None }
+    }
+}
+impl Host for RecordingHost {
+    fn now(&self) -> Instant {
+        Instant(self.now)
+    }
+    fn block(&mut self, timeout: Option<Duration>) -> WakeReason {
+        self.last_timeout = Some(timeout);
+        WakeReason::Timer
+    }
+}
+
+#[test]
+fn park_feeds_the_capped_deadline_to_block() {
+    // No sender in flight (next_deadline == None). With a cap, park must block for the CAP (not forever);
+    // uncapped, it parks forever — proven at the park → host.block seam by the exact timeout recorded.
+    let mut r = Reactor::new(SessionTable::new(Originator::Low), RecordingHost::new(0), StubRx::new([]), CaptureSink::default())
+        .idle_park_cap(Some(Duration::from_nanos(50)));
+    r.park();
+    assert_eq!(
+        r.host().last_timeout,
+        Some(Some(Duration::from_nanos(50))),
+        "no deadline + cap → park blocks for the cap (a ceiling, not forever)"
+    );
+
+    let mut uncapped =
+        Reactor::new(SessionTable::new(Originator::Low), RecordingHost::new(0), StubRx::new([]), CaptureSink::default());
+    uncapped.park();
+    assert_eq!(
+        uncapped.host().last_timeout,
+        Some(None),
+        "no deadline + no cap → park forever (uncapped, today's behavior byte-identical)"
+    );
 }

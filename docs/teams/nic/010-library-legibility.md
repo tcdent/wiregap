@@ -205,6 +205,20 @@ SessionTable::new(Originator) -> IdAllocator::new(Originator)`. **Doc:** `transp
 "the box is the sole allocator" header is stale — update it with this change; no `architecture.md` edit
 (`§1.1`/`§8` already carry the originator-partitioned model).
 
+**Scope addition — Task 17, the reactor idle-park cap (operator-approved, 2026-07-23; a FUNCTIONAL reactor
+change).** The last hard dependency blocking the proxy team's live end-to-end proof. Add an
+`Option<Duration>` idle-park cap to the reactor — **default `None` = today's behavior** (uncapped park,
+byte-identical when unset). When `Some(d)`, the **effective park deadline = `min(transport.next_deadline(),
+cap)`** (with `next_deadline() == None` → the cap alone), feeding the **existing `ParkUntil` path** (no new
+park mechanism). **Knob placement** (a value knob on `construct` or `run`) is the **dev's call** — pick the
+most legible facade surface. This is **distinct from the retired bounded-poll** (a park *ceiling*, not a
+poll loop). **Conservation anchor:** with the cap `None`, the reactor decision logic and the existing
+assertion set are conserved byte-identical; the cap path is **additive**, its tests **flagged**.
+**Host-testable** — pure reactor decision logic over the `Host` seam (`tests/reactor.rs`), no wire/DMA/ring
+mechanism → **no hardware run**; the reviewer gates it host-side. **Doc:** the **designer** adds one sentence
+to `architecture.md §5` when the change lands (the cap vs the retired bounded-poll) and **surfaces it to the
+PM before committing** — not a nic-team edit. Gated as a functional-change slice.
+
 ## Problem
 
 The subsystem works but reads unevenly. `transport`/`driver` curate a private-`mod` + `pub use` surface

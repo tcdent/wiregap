@@ -54,6 +54,21 @@ pub fn arm_from_deadline(deadline: Option<Instant>, now: Instant) -> Arm {
     }
 }
 
+/// Compose the retransmit `next` deadline with an optional idle-park **cap** into the effective park
+/// deadline (pure). The cap is a park CEILING — `now + cap` — and the effective deadline is the **earlier**
+/// of the two: `min(next, now + cap)`. `cap == None` returns `next` unchanged (today's uncapped behavior,
+/// byte-identical); `next == None` returns the cap alone. This feeds the existing [`arm_from_deadline`] path
+/// — it is NOT a poll: with no NIC wake the park still returns at the cap, one park, via the one-shot timer.
+pub fn capped_deadline(next: Option<Instant>, cap: Option<Duration>, now: Instant) -> Option<Instant> {
+    let cap_deadline = cap.map(|d| Instant(now.0.saturating_add(d.as_nanos() as u64)));
+    match (next, cap_deadline) {
+        (Some(a), Some(b)) => Some(Instant(a.0.min(b.0))),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
 /// RX back-pressure (pure): pull the next inbound frame only when a frame is available **and** no
 /// delivery is already in flight to the consumer. While a delivery is held, the RX ring is not advanced
 /// (RDT held) — the hardware back-pressures. Stop-and-wait: at most one in flight.
@@ -95,11 +110,22 @@ pub struct Reactor<H, R, S> {
     pending: Option<(SessionId, Vec<u8>)>,
     parks: u32,
     malformed: u32,
+    /// Optional idle-park CEILING (see [`capped_deadline`]). `None` (the default) = uncapped, today's
+    /// behavior byte-identical. `Some(d)` bounds each park to at most `d` so the loop wakes to run its own
+    /// Idle logic even with no NIC event — a park ceiling, NOT the retired bounded-poll.
+    idle_cap: Option<Duration>,
 }
 
 impl<H: Host, R: RxSource, S: TransmitSink> Reactor<H, R, S> {
     pub fn new(transport: SessionTable, host: H, rx: R, sink: S) -> Self {
-        Self { transport, host, rx, sink, pending: None, parks: 0, malformed: 0 }
+        Self { transport, host, rx, sink, pending: None, parks: 0, malformed: 0, idle_cap: None }
+    }
+
+    /// Set the idle-park cap (a builder; default `None` = uncapped). `Some(d)` bounds each park to at most
+    /// `d` — the effective park deadline becomes `min(next_deadline, now + d)` (see [`capped_deadline`]).
+    pub fn idle_park_cap(mut self, cap: Option<Duration>) -> Self {
+        self.idle_cap = cap;
+        self
     }
 
     /// Originate a session (the app-above role): open-by-emission through the sole sink.
@@ -149,7 +175,8 @@ impl<H: Host, R: RxSource, S: TransmitSink> Reactor<H, R, S> {
     /// already due (no park — the caller re-drains). Only an actual park increments the park counter.
     pub fn park(&mut self) -> Option<WakeReason> {
         let now = self.host.now();
-        match arm_from_deadline(self.transport.next_deadline(), now) {
+        let deadline = capped_deadline(self.transport.next_deadline(), self.idle_cap, now);
+        match arm_from_deadline(deadline, now) {
             Arm::DueNow => None,
             Arm::ParkForever => {
                 self.parks += 1;

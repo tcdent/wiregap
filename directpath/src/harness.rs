@@ -11,6 +11,7 @@ use crate::gate::Bdf;
 use std::io::{self, Read};
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 /// Fresh-nonce length (the un-fakeable per-message tell) and the fixed test payload length.
 pub const NONCE_LEN: usize = 8;
@@ -58,12 +59,16 @@ pub fn pct(sorted: &[f64], p: f64) -> f64 {
 /// Run `role_a` over card `a` (pinned to `core_a`) and `role_b` over card `b` (pinned to `core_b`)
 /// concurrently, each handed a freshly-constructed [`Subsystem`] (MACs exchanged a↔b), and return both
 /// roles' results. Each `Subsystem` is constructed INSIDE its thread (never crosses a thread boundary).
+// A bench-only two-instance scaffold: eight distinct, meaningful parameters (the pair, the two cores, the
+// cap, the two roles) read clearer inline than bundled into a config struct.
+#[allow(clippy::too_many_arguments)]
 pub fn two_facade<A, B, RA, RB>(
     a: Bdf,
     b: Bdf,
     allow: &[Bdf],
     core_a: usize,
     core_b: usize,
+    idle_cap: Option<Duration>,
     role_a: A,
     role_b: B,
 ) -> io::Result<(RA, RB)>
@@ -80,7 +85,7 @@ where
     thread::scope(|s| -> io::Result<(RA, RB)> {
         let ha = s.spawn(move || -> io::Result<RA> {
             benchtools::affinity::pin(core_a)?;
-            let sys = Subsystem::construct(a, &allow_a, Endpoint::Box, |own| {
+            let sys = Subsystem::construct(a, &allow_a, Endpoint::Box, idle_cap, |own| {
                 a_tx.send(own).expect("publish a mac");
                 b_rx.recv().expect("recv b mac")
             })?;
@@ -88,7 +93,7 @@ where
         });
         let hb = s.spawn(move || -> io::Result<RB> {
             benchtools::affinity::pin(core_b)?;
-            let sys = Subsystem::construct(b, &allow_b, Endpoint::Proxy, |own| {
+            let sys = Subsystem::construct(b, &allow_b, Endpoint::Proxy, idle_cap, |own| {
                 b_tx.send(own).expect("publish b mac");
                 a_rx.recv().expect("recv a mac")
             })?;

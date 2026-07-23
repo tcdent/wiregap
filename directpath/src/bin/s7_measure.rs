@@ -87,6 +87,7 @@ fn run() -> io::Result<()> {
         &allow,
         BOX_CORE,
         PROXY_CORE,
+        None, // idle-park cap: uncapped (conservation harnesses)
         // ---- BOX (41): M1 echo throughput, then the one-directional Idle-paced storms ----
         move |mut sys: Subsystem| -> io::Result<BoxReport> {
             // M1: N one-directional send→ACK round-trips (paced on quiescence), wall-clocked.
