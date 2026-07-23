@@ -22,6 +22,7 @@ use proxy::nic::{NicRun, Reply};
 use proxy::privilege::{Credentials, observe};
 use proxy::register::anthropic::VETTED_TOOLS;
 use proxy::register::net::ROUTES;
+use proxy::upstream::Credential;
 use transport::{IdAllocator, Originator};
 
 /// A shared, ordered log of `(session, payload)` pairs the recording [`Reply`] captures.
@@ -153,14 +154,22 @@ fn a_failed_privilege_drop_closes_and_never_serves() {
 /// empty → closed); the config-pending authorities fail closed, never silently pass.
 #[test]
 fn production_validator_placeholders_fail_closed_register_is_real() {
-    assert!(validate_authority(Authority::RouteRegister, ROUTES));
-    assert!(!validate_authority(Authority::RouteRegister, &[]), "an empty register is no authority");
-    for authority in [Authority::FilesystemRoots, Authority::KernelProtections, Authority::Credential] {
+    assert!(validate_authority(Authority::RouteRegister, ROUTES, None));
+    assert!(!validate_authority(Authority::RouteRegister, &[], None), "an empty register is no authority");
+    // Still config-pending → fail closed regardless of the credential.
+    for authority in [Authority::FilesystemRoots, Authority::KernelProtections] {
         assert!(
-            !validate_authority(authority, ROUTES),
+            !validate_authority(authority, ROUTES, None),
             "{authority:?} must fail closed pending config, not silently pass",
         );
     }
+    // Sprint 11: the credential rung is REAL now — present-iff-supplied (no config DSL invented).
+    assert!(!validate_authority(Authority::Credential, ROUTES, None), "a missing credential fails closed");
+    let cred = Credential::new("sk-test-key".into());
+    assert!(
+        validate_authority(Authority::Credential, ROUTES, Some(&cred)),
+        "a supplied credential satisfies the rung",
+    );
 }
 
 /// With the real production validator, the ladder holds closed at the first config-pending authority
@@ -177,7 +186,7 @@ fn production_ladder_holds_closed_pending_config_but_drops_first() {
             drop_log.borrow_mut().push("drop");
             Ok(())
         },
-        |authority| validate_authority(authority, ROUTES),
+        |authority| validate_authority(authority, ROUTES, None),
         |_reply, _ev| ControlFlow::Continue(()),
     );
     assert_eq!(
@@ -187,6 +196,39 @@ fn production_ladder_holds_closed_pending_config_but_drops_first() {
     );
     assert_eq!(*log.borrow(), vec!["drop"], "drop happened; run did not");
     assert_eq!(*deliveries.borrow(), 0);
+}
+
+/// Sprint 11: a MISSING upstream credential holds the **whole** proxy closed (the credential rung is
+/// real now, not always-`false`). With every other authority passing, an absent credential still closes
+/// the ladder at `Credential`; a supplied one satisfies that rung.
+#[test]
+fn missing_credential_closes_the_whole_proxy() {
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let (mut nic, deliveries) = fake_nic(vec![], &log);
+    let drop_log = log.clone();
+    let r = serve(
+        &mut nic,
+        || {
+            drop_log.borrow_mut().push("drop");
+            Ok(())
+        },
+        // Every authority passes EXCEPT the (absent) credential rung.
+        |authority| match authority {
+            Authority::Credential => validate_authority(Authority::Credential, ROUTES, None),
+            _ => true,
+        },
+        |_reply, _ev| ControlFlow::Continue(()),
+    );
+    assert_eq!(
+        r,
+        Readiness::Closed(Authority::Credential),
+        "a missing credential closes the WHOLE proxy",
+    );
+    assert_eq!(*log.borrow(), vec!["drop"], "drop happened; run did not (no box byte processed)");
+    assert_eq!(*deliveries.borrow(), 0);
+    // With the credential supplied, that rung passes.
+    let cred = Credential::new("sk-test".into());
+    assert!(validate_authority(Authority::Credential, ROUTES, Some(&cred)));
 }
 
 // ── Sprint 10 Slice 1: the reply seam (R-c reversal), hardware-free ──────────────────────────────────

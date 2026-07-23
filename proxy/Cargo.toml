@@ -24,6 +24,7 @@ directpath = { path = "../directpath" }
 # Optional, ONLY for the Slice-5 bench-capture bin: benchtools' Provenance (self-hashed bin-sha) +
 # nonce. Off by default — the production lib never links it.
 benchtools = { path = "../benchtools", optional = true }
+ureq = "3.3.0"
 
 [features]
 # The Slice-5 receive-path e2e capture bin (src/bin/s5_capture.rs). Enables directpath's `bench`

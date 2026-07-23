@@ -27,6 +27,7 @@ use directpath::{Bdf, Event, SessionId, Subsystem};
 
 use crate::dispatch::{Dispatcher, Routed};
 use crate::nic::{NicRun, RealNic, Reply};
+use crate::upstream::Credential;
 use crate::vocab::{Route, ToolIdentity};
 
 /// A named authority the proxy must validate before it serves — a channel of trust that, broken, holds
@@ -154,17 +155,24 @@ where
 /// the config DSL lands cleanly without reshaping the ladder. Returns `true` iff the authority is
 /// validated (the *which* of a failure is the [`Authority`] itself, named by the ladder).
 #[must_use]
-pub fn validate_authority(authority: Authority, register: &[Route]) -> bool {
+pub fn validate_authority(
+    authority: Authority,
+    register: &[Route],
+    credential: Option<&Credential>,
+) -> bool {
     match authority {
         // Real now — no external config needed; the register's own presence is its authority.
         Authority::RouteRegister => !register.is_empty(),
         // Pending the config DSL — fail closed (named placeholders). Each is where the config check lands:
         //   FilesystemRoots  → resolve + stat the quarantine/readable roots from cfg.
         //   KernelProtections→ statfs the quarantine (noexec/nosuid/nodev) + probe openat2 RESOLVE.
-        //   Credential       → load the upstream credential from cfg, when proxy-held.
         Authority::FilesystemRoots => false,
         Authority::KernelProtections => false,
-        Authority::Credential => false,
+        // **REAL now (Sprint 11)** — the upstream credential is a composition-root parameter, no config
+        // DSL invented. Present-iff-supplied: a **missing** credential holds the **whole** proxy closed
+        // (all-or-none ladder); a supplied one satisfies this rung (full serving still awaits the other
+        // config-pending authorities above). Supplying a credential does NOT by itself open serving.
+        Authority::Credential => credential.is_some(),
     }
 }
 
@@ -176,6 +184,10 @@ pub fn validate_authority(authority: Authority, register: &[Route]) -> bool {
 ///
 /// Returns `Err` only if the privileged bring-up itself failed (no subsystem); a dropped/closed ladder
 /// is an `Ok(Readiness::{DropFailed,Closed})` — a *reported* fail-closed outcome, not an I/O error.
+// The composition-root entry legitimately takes several distinct config inputs (NIC identity, privilege
+// target, authority register + credential, the run adapter); grouping them into a config struct is a
+// future nicety, not a clarity win today.
+#[allow(clippy::too_many_arguments)]
 pub fn bring_up<F>(
     local: Bdf,
     allowlist: &[Bdf],
@@ -183,6 +195,7 @@ pub fn bring_up<F>(
     uid: u32,
     gid: u32,
     register: &[Route],
+    credential: Option<&Credential>,
     on_event: F,
 ) -> io::Result<Readiness>
 where
@@ -214,7 +227,7 @@ where
     Ok(serve(
         &mut nic,
         drop_privilege,
-        |authority| validate_authority(authority, register),
+        |authority| validate_authority(authority, register, credential),
         on_event,
     ))
 }

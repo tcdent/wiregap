@@ -821,6 +821,19 @@ impl Dispatcher {
         self.push_reply_frame(box_session, payload.to_vec())
     }
 
+    /// Enqueue a single-frame `net-error(code)` notification to the box (Sprint 11) — the JC-3 net-error
+    /// seam reused for a proxy-side net deny that is **not** a route verdict. Its one use this sprint:
+    /// the serial upstream bound (`bound = 1`) — a second `net-payload` admitted while one upstream call
+    /// is already in flight is denied `net-error(Unavailable)`, honest to the box immediately rather
+    /// than silently held. Stamped `in_reply_to = session`, single-frame (enqueue then close → drains →
+    /// evicts).
+    pub fn enqueue_net_error(&mut self, session: SessionId, code: ErrorCode) -> Enqueue {
+        let frame = task16_stub_reply_frame(session, &net_error(code));
+        let outcome = self.push_reply_frame(session, frame);
+        self.close_reply(session);
+        outcome
+    }
+
     /// Enqueue a prepared frame into `box_session`'s push reply queue, bounded by [`REPLY_QUEUE_CAP`]:
     /// **backpressure** ([`Enqueue::Full`]) when full — never drop, never grow. Creates the queue stream
     /// on first use.

@@ -35,6 +35,8 @@ pub mod dispatch;
 
 pub mod nic;
 
+pub mod upstream;
+
 pub mod lifecycle;
 
 pub mod cloud_relay;
