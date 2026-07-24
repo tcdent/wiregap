@@ -56,6 +56,12 @@ trybuild = "1"
 name = "s5_capture"
 required-features = ["bench-capture"]
 
+# The Sprint-14 quiescent-wake liveness-proof bin (src/bin/s14_quiescent_wake.rs) — uses two_facade +
+# benchtools + exact-BDF; gated off the default build by its required-features.
+[[bin]]
+name = "s14_quiescent_wake"
+required-features = ["bench-capture"]
+
 # The Sprint-13 composition-root bin — declared so its required-features gate it off the default build.
 [[bin]]
 name = "serve"

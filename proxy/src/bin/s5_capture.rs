@@ -105,6 +105,11 @@ fn main() -> io::Result<()> {
         &allow,
         PROXY_CORE,
         BOX_CORE,
+        // Idle-park cap (Task 20): None (uncapped) — this receive-only capture is BOX-DRIVEN (the box's
+        // frames wake the reactor on NIC events), with no quiescent-arrival dependency, so the prior
+        // uncapped behavior is preserved exactly. The composed production loop (bring_up) is the one that
+        // needs Some(cap) for a quiescent wake.
+        None,
         // ── PROXY role (41): bring_up's body — observe(before) → drop+observe(after)+negative test →
         //    serve(run_adapter) driving dispatch; capture verdicts + RX counters. ──
         move |sys: Subsystem| -> io::Result<ProxyResult> {
