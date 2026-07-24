@@ -245,14 +245,20 @@ Audit first, in this order:
 
 ## Review Questions
 
-1. **The ~100µs measured cadence vs. the ~5ms guaranteed ceiling** (surfaced
-   by the capture, 2026-07-24; routed to the NIC/reactor team, non-blocking):
-   why does `block(None)` return at ~100µs typical on this bench rather than
-   approaching its ~5ms `max_ebx` ceiling? Dev's inference (not confirmed):
-   ambient interrupt/scheduler activity on this non-isolated core exits the
-   MWAITX monitor well before the timer fires. Does not gate this sprint's
-   liveness discharge — the guarantee (`≤ ~5ms` even with zero ambient
-   wake sources) holds regardless of why the observed typical is faster.
+1. **The ~100µs measured cadence vs. the ~5ms guaranteed ceiling — RESOLVED**
+   (designer's explanation via the PM, 2026-07-24, confirming dev's inference
+   exactly): `MWAITX` returns on the earliest of a NIC frame (~4µs), the EBX
+   timer (~5ms), or *any* interrupt delivered to the core — and on a live
+   multi-core Linux host, ambient interrupts (scheduler ticks, IPIs, RCU work,
+   other device interrupts) land roughly every ~100µs. So `block(None)`
+   almost always returns on an ambient interrupt in practice; the ~5ms EBX
+   only governs the pathological case of a core receiving *no* interrupts at
+   all, which doesn't occur on a running system. Both numbers are correct,
+   describing different things (a worst-case guarantee vs. an always-met
+   practical cadence); spurious ambient-interrupt wakes are benign (no frame,
+   a harmless re-poll), and the CPU is genuinely idle in `MWAITX` between
+   them, not spinning. The liveness proof stood on the ceiling regardless,
+   and still does — this closes the question, not the discharge.
 
 ## Retrospectives
 
