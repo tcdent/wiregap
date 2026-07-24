@@ -34,6 +34,7 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 
 use directpath::Event;
+use proto::verb;
 use transport::SessionId;
 
 use crate::dispatch::{Dispatcher, RelayKind, Routed, TerminalInput, peek_verb};
@@ -216,16 +217,29 @@ fn write_loop(mut sock: UnixStream, rx: &Receiver<HeadFrame>) {
     }
 }
 
-/// Drain head→box input into the dispatcher, NON-BLOCKING, WITH backpressure (Sprint 13 Slice 1.5).
-/// Retry any input **retained** from a prior tick's full box queue first, then drain the head channel
-/// until it is empty OR a display's box queue **fills**. On a full queue ([`TerminalInput::Backpressure`])
-/// the un-routed input is **retained** in the one-slot `pending` and draining **stops** for this tick —
-/// the head channel is left unread, so it fills and the reader thread backpressures the socket, resuming
-/// next tick once the box drains. A fail-safe [`TerminalInput::Dropped`] (unknown/stale display) is a
-/// *correct* drop and does NOT stop the drain. Mirrors the upstream ingress's one-slot backpressure —
-/// a pulled keystroke is never handed to a full queue and lost.
-fn drain_head_input(head: &HeadConnection, dispatcher: &mut Dispatcher, pending: &mut Option<HeadFrame>) {
-    // Resume a retained input before pulling anything new (keep the channel unread while backpressured).
+/// Drain head→box frames into the box, NON-BLOCKING (Sprint 13 Slice 1.5 backpressure; Sprint 15 Slice 1
+/// file-browse relay). Two head→box shapes:
+///
+/// - **`request-file`** (head→box, one-shot, Sprint 15) is relayed **opaquely**: originate a fresh
+///   proxy→box session carrying the payload **verbatim** via [`Reply::open`] — inline, in the same tick
+///   it is drained. `open` is **infallible** (origination cannot `WouldBlock`, unlike a streaming
+///   `send`), so a one-shot needs no reply-queue, no key, no backpressure slot. It NEVER touches the
+///   dispatcher's confined `fs_read`/quarantine service (no confused-deputy path — the relay only
+///   originates).
+/// - **Pty input** (`key`/`resize`/… — Sprint 12) takes the reply-queue-keyed path
+///   ([`Dispatcher::route_head_input`]) WITH backpressure: retry any input **retained** from a prior
+///   tick's full box queue first, then drain until empty OR a display's box queue **fills**, on which
+///   ([`TerminalInput::Backpressure`]) the un-routed input is **retained** in `pending` and draining
+///   **stops** (the head channel fills → the reader backpressures the socket). A fail-safe
+///   [`TerminalInput::Dropped`] (unknown/stale display) does NOT stop the drain. Only pty input ever
+///   backpressures, so `pending` holds only pty input, never a `request-file`.
+fn drain_head_input(
+    head: &HeadConnection,
+    dispatcher: &mut Dispatcher,
+    reply: &mut dyn Reply,
+    pending: &mut Option<HeadFrame>,
+) {
+    // Resume a retained pty input before pulling anything new (keep the channel unread while backpressured).
     if let Some(frame) = pending.take()
         && dispatcher.route_head_input(frame.session, &frame.payload) == TerminalInput::Backpressure
     {
@@ -233,10 +247,47 @@ fn drain_head_input(head: &HeadConnection, dispatcher: &mut Dispatcher, pending:
         return;
     }
     while let Some(frame) = head.try_recv_from_head() {
-        if dispatcher.route_head_input(frame.session, &frame.payload) == TerminalInput::Backpressure {
+        if peek_verb(&frame.payload).is_some_and(is_head_file_verb) {
+            relay_head_file(reply, &frame.payload);
+        } else if dispatcher.route_head_input(frame.session, &frame.payload) == TerminalInput::Backpressure {
             *pending = Some(frame);
             return;
         }
+    }
+}
+
+/// A head→box **file-browse** verb this standalone relay handles (Sprint 15): `request-file` (a
+/// one-shot extraction trigger) or `list` (a one-shot directory-list request, head→box direction).
+fn is_head_file_verb(verb: u32) -> bool {
+    matches!(verb & 0xff, verb::REQUEST_FILE | verb::LIST)
+}
+
+/// **The standalone head→box file-browse relay** (Sprint 15) — relay a head-originated `request-file`/
+/// `list` to the box OPAQUELY by originating a fresh proxy→box session carrying the payload VERBATIM via
+/// [`Reply::open`] (infallible one-shot: no reply queue, no key, no correlation — model.md §9's
+/// fire-and-forget/observe model; the box learns of the answer session by observation, no token).
+///
+/// **Capability-narrowed for the confused-deputy floor** (the security point): this takes ONLY the
+/// [`Reply`] handle, **not** the [`Dispatcher`] — so it has NO name for, and NO reachable path to,
+/// `route_list`/`route_file_read`/the quarantine writer. A head browse can therefore NEVER be turned into
+/// a read of the proxy's own confined TRUSTED-HOST filesystem: the deputy path is **unrepresentable
+/// here**, not merely unused — the code cannot call what it cannot name.
+fn relay_head_file(reply: &mut dyn Reply, payload: &[u8]) {
+    let _ = reply.open(payload);
+}
+
+/// True when a box `Event::Delivered` with this verdict + `payload` is a box→head relay: a
+/// `display`/`pane-state` (Terminal, box→head direction) OR a **box-authored** `list-entry`/`file-error`
+/// answering a head-initiated file-browse ([`RelayKind::FileToHead`] — origination-keyed at `route()`,
+/// so already box→head, no `direction_of` needed). Never a proxy-authored reply (those go to the box via
+/// the reply queue, never through `route()`), so this decision cannot misroute a host-listing to the head.
+fn box_frame_goes_to_head(routed: &Routed, payload: &[u8]) -> bool {
+    match routed {
+        Routed::Relay(RelayKind::Terminal) => {
+            peek_verb(payload).and_then(direction_of) == Some(Direction::BoxToHead)
+        }
+        Routed::Relay(RelayKind::FileToHead) => true,
+        _ => false,
     }
 }
 
@@ -263,18 +314,15 @@ where
 {
     let mut pending_head: Option<HeadFrame> = None;
     move |reply, event| {
-        // 1. Drain head→box input, NON-BLOCKING, WITH backpressure (Sprint 13 Slice 1.5) — route each
-        //    (fail-safe on unknown/stale display S); a full box queue retains the input, never drops it.
-        drain_head_input(&head, &mut dispatcher, &mut pending_head);
+        // 1. Drain head→box frames: request-file opaque-relayed (Sprint 15), pty input routed with
+        //    backpressure (Sprint 13 Slice 1.5, fail-safe on unknown/stale display S).
+        drain_head_input(&head, &mut dispatcher, reply, &mut pending_head);
         // 2. Handle the box event.
         let cf = match event {
             Event::Delivered(session, payload) => {
                 let routed = dispatcher.route(session, &payload, register, vetted);
-                // A box→head display/pane-state → send to the head (non-blocking, drop-on-full).
-                if matches!(routed, Routed::Relay(RelayKind::Terminal))
-                    && let Some(verb) = peek_verb(&payload)
-                    && direction_of(verb) == Some(Direction::BoxToHead)
-                {
+                // A box→head display/pane-state OR a box-authored file-browse answer → the head.
+                if box_frame_goes_to_head(&routed, &payload) {
                     let _ = head.send_to_head(HeadFrame { session, payload: payload.to_vec() });
                 }
                 on_verdict(session, &routed)
@@ -332,9 +380,9 @@ where
         // 1a. Drain the upstream ingress (non-blocking): a response arriving while the box is silent
         //     reaches the box on this tick — given Task 20 woke the tick. Backpressure, never drop.
         ingress.drain(&mut dispatcher);
-        // 1b. Drain head→box input (non-blocking, F3) WITH backpressure: fail-safe on an unknown/stale
-        //     display session; a full box queue retains the input and stops the drain, never a drop.
-        drain_head_input(&head, &mut dispatcher, &mut pending_head);
+        // 1b. Drain head→box frames: request-file opaque-relayed (Sprint 15), pty input routed with
+        //     backpressure (fail-safe on an unknown/stale display; a full box queue retains + stops).
+        drain_head_input(&head, &mut dispatcher, reply, &mut pending_head);
         // 2. Handle the single box event.
         let cf = match event {
             Event::Delivered(session, payload) => {
@@ -345,10 +393,8 @@ where
                     Routed::NetPayloadAdmit(body) => {
                         ingress.on_admit(&mut dispatcher, session, body.clone());
                     }
-                    // A box→head display/pane-state → the head, non-blocking, drop-on-full.
-                    Routed::Relay(RelayKind::Terminal)
-                        if peek_verb(&payload).and_then(direction_of) == Some(Direction::BoxToHead) =>
-                    {
+                    // A box→head display/pane-state OR a box-authored file-browse answer → the head.
+                    r if box_frame_goes_to_head(r, &payload) => {
                         let _ = head.send_to_head(HeadFrame { session, payload: payload.to_vec() });
                     }
                     _ => {}
@@ -661,6 +707,47 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(box_rec.emitted.len(), before, "input for an unknown display session reaches the box nowhere");
+    }
+
+    /// **SPRINT 15 SLICE 1**: a head-socket `request-file` is relayed OPAQUELY to the box — a fresh
+    /// proxy→box origination carrying the payload VERBATIM — and NO proxy action is taken on it beyond
+    /// relaying. It never reaches the dispatcher's route/fs_read: it is handled entirely on the head
+    /// ingress via `reply.open` (one-shot, infallible), not as a box-side dispatch.
+    #[test]
+    fn request_file_is_relayed_opaquely_to_the_box_no_proxy_action() {
+        let (worker_sock, mut fake_head) = UnixStream::pair().unwrap();
+        let conn = HeadConnection::spawn(worker_sock).unwrap();
+        let verdicts: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let v = verdicts.clone();
+        let mut adapter = run_adapter_with_head(Dispatcher::new(), ROUTES, VETTED_TOOLS, conn, move |_s, r| {
+            v.borrow_mut().push(format!("{r:?}")); // any box-side dispatch verdict would land here
+            ControlFlow::Continue(())
+        });
+        let mut box_rec = BoxRec::new();
+
+        // The head names a source on the box (opaque L2: the request-file verb + a segment-stack path).
+        let request_file = raw_frame(proto::verb::REQUEST_FILE, b"\x1fhome\x1fsecret\x1fnote.txt");
+        fake_head
+            .write_all(&enc(&HeadFrame { session: SessionId(7), payload: request_file.clone() }))
+            .unwrap();
+
+        // Drive Idle ticks until the relay originates it to the box (reply.open records into box_rec).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while box_rec.emitted.is_empty() {
+            assert!(std::time::Instant::now() < deadline, "request-file never reached the box");
+            let _ = adapter(&mut box_rec, Event::Idle);
+            std::thread::yield_now();
+        }
+
+        // Relayed VERBATIM (opaque, MB3): the box got exactly the request-file bytes, unmodified.
+        assert_eq!(box_rec.emitted[0], request_file, "request-file relayed opaquely + verbatim to the box");
+        assert_eq!(box_rec.emitted.len(), 1, "one-shot: exactly one origination, no reply-stream/extra frames");
+        // NO proxy action beyond relay: it never entered box-side dispatch (no route verdict produced).
+        assert!(
+            verdicts.borrow().is_empty(),
+            "no proxy action on request-file beyond opaque relay — never dispatched, never a host-read",
+        );
     }
 
     fn recv_head_spin(sock: &mut UnixStream) -> HeadFrame {

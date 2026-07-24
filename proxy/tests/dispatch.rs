@@ -402,14 +402,15 @@ fn jc1_exempts_relayed_verbs_reserved_bits_still_relay() {
         Routed::Relay(RelayKind::Terminal),
         "a relayed display verb with reserved bits must relay (JC-1 exempts relayed messages), not ReservedDeny",
     );
-    // request-file (0x26, FileRead relay) with a reserved byte set → Relay(FileRead), not ReservedDeny.
-    // (file-read AND list now ACT — Sprint 10 Slice 2 — so `request-file` (head→box, never proxy-acted)
-    // is the still-relayed FileRead-kind example.)
+    // list-entry (0x25, FileToHead relay — the box answering a head-initiated list) with a reserved byte
+    // set → Relay(FileToHead), not ReservedDeny. (file-read AND list now ACT — Sprint 10 Slice 2; and
+    // request-file/file-data inbound are now ANOMALOUS → Unsupported — Sprint 15, see the completeness
+    // test — so the still-relayed file-kind example is the box→head answer.)
     let mut d = Dispatcher::new();
     assert_eq!(
-        d.route(SessionId(2), &set_reserved(&raw_frame(proto::verb::REQUEST_FILE, b"src"), 0x0100_0000), ROUTES, VETTED_TOOLS),
-        Routed::Relay(RelayKind::FileRead),
-        "a relayed request-file verb with reserved bits must relay, not ReservedDeny (proxy never acts on it)",
+        d.route(SessionId(2), &set_reserved(&raw_frame(proto::verb::LIST_ENTRY, b"entries"), 0x0100_0000), ROUTES, VETTED_TOOLS),
+        Routed::Relay(RelayKind::FileToHead),
+        "a relayed list-entry (box→head answer) with reserved bits must relay, not ReservedDeny (proxy never acts on it)",
     );
 }
 
@@ -426,6 +427,41 @@ fn jc1_clean_acted_on_verbs_route_by_real_logic_unchanged() {
     assert_eq!(d.route(SessionId(3), &file_chunk(b"x"), ROUTES, VETTED_TOOLS), Routed::ToServiceHandler(Service::File));
     let mut d = Dispatcher::new();
     assert_eq!(d.route(SessionId(4), &net_payload(anthropic, true), ROUTES, VETTED_TOOLS), Routed::NetPayloadAccumulating);
+}
+
+/// **SPRINT 15 SLICE 2 — COMPLETENESS of the origination-keyed split.** The one lumped
+/// `FILE_DATA|FILE_ERROR|LIST_ENTRY|REQUEST_FILE => Relay(FileRead)` arm is split, and EVERY verb it
+/// covered is now classified correctly at `route()` (NIC ingress, box-originated) — proven exhaustively,
+/// not just that the two tested live paths don't cross. Two are box-authored answers to a head-initiated
+/// browse → relayed to the HEAD; two are anomalous inbound (a proxy→box-only / head→box-only verb the box
+/// should never emit) → fail-safe drop. None silently keeps the old no-op `FileRead` disposition.
+#[test]
+fn slice2_origination_split_classifies_every_former_lumped_verb() {
+    let mut d = Dispatcher::new();
+    // Box-authored answers to a head-initiated browse → relayed to the HEAD (origination-keyed).
+    assert_eq!(
+        d.route(SessionId(1), &raw_frame(proto::verb::LIST_ENTRY, b"entries"), ROUTES, VETTED_TOOLS),
+        Routed::Relay(RelayKind::FileToHead),
+        "list-entry (box answering a head-list) → FileToHead",
+    );
+    assert_eq!(
+        d.route(SessionId(2), &raw_frame(proto::verb::FILE_ERROR, b"err"), ROUTES, VETTED_TOOLS),
+        Routed::Relay(RelayKind::FileToHead),
+        "file-error (box serving a head-request) → FileToHead",
+    );
+    // Anomalous inbound: file-data is proxy→box-only, request-file is head→box-only — a box emitting
+    // either box→proxy is protocol noise → fail-safe Unsupported (dropped/logged, never relayed, never a
+    // filesystem touch), the two anomalous-fail-safe verbs (not one).
+    assert_eq!(
+        d.route(SessionId(3), &raw_frame(proto::verb::FILE_DATA, b"x"), ROUTES, VETTED_TOOLS),
+        Routed::Unsupported { verb: proto::verb::FILE_DATA },
+        "file-data inbound (box→proxy) is anomalous → fail-safe drop",
+    );
+    assert_eq!(
+        d.route(SessionId(4), &raw_frame(proto::verb::REQUEST_FILE, b"x"), ROUTES, VETTED_TOOLS),
+        Routed::Unsupported { verb: proto::verb::REQUEST_FILE },
+        "request-file inbound (box→proxy) is anomalous → fail-safe drop",
+    );
 }
 
 /// JC-2 precedence (settled fork): `service_of_verb` on the masked low byte FIRST — an unsupported low

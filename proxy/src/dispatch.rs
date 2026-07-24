@@ -174,6 +174,13 @@ pub enum RelayKind {
     CloudResponse,
     /// `display`/input → the terminal relay (S4).
     Terminal,
+    /// A **box-authored** `list-entry`/`file-error` answering a **head-initiated** file-browse (Sprint 15
+    /// Slice 2) → relayed **to the head** (`send_to_head`). Origination-keyed: this verdict is reached
+    /// only at the NIC-ingress `route()` (a box→proxy frame), so the direction is box→head **by where the
+    /// frame came from**, never by decoding the body. Distinct from a **proxy-authored** `list-entry`
+    /// answering a **box-initiated** host-list, which flows to the box via the reply queue and never
+    /// touches this verdict (the two disjoint paths that must never cross — the confused-deputy floor).
+    FileToHead,
 }
 
 /// The source of an outbound reply stream — a confined fail-safe reader (Sprint 10 Slice 2). Each
@@ -648,11 +655,18 @@ impl Dispatcher {
 
             // ── Relay channels: forward the OPAQUE payload; NO body decode (proxy-head.md §1) ──────
             verb::NET_RESPONSE | verb::NET_ERROR => Routed::Relay(RelayKind::CloudResponse),
-            // `file-data`/`list-entry` are proxy→box REPLY verbs (the proxy emits them, never acts on an
-            // inbound one); `file-error` is JC-3's (Slice 4); `request-file` is head→box. Opaque-relayed.
-            verb::FILE_DATA | verb::FILE_ERROR | verb::LIST_ENTRY | verb::REQUEST_FILE => {
-                Routed::Relay(RelayKind::FileRead)
-            }
+            // ── Origination-keyed split of the box→proxy (NIC-ingress) file verbs (Sprint 15 Slice 2) ──
+            // A `list-entry`/`file-error` arriving here is BOX-AUTHORED — the box answering a
+            // head-initiated file-browse — so it is relayed to the HEAD (by WHERE it came from, not by
+            // decoding the body). A proxy-authored `list-entry`/`file-error` answering a *box*-initiated
+            // op never reaches `route()` (it is emitted straight to the box via the reply queue) — the two
+            // disjoint paths of the confused-deputy floor.
+            verb::LIST_ENTRY | verb::FILE_ERROR => Routed::Relay(RelayKind::FileToHead),
+            // `file-data` and `request-file` arriving box→proxy are ANOMALOUS: `file-data` is
+            // proxy→box-only (the box never emits it), `request-file` is head→box-only. A box emitting
+            // either is protocol noise the proxy acts on in NO direction → fail safe (dropped, logged,
+            // never relayed, never a filesystem touch), exactly like a JC-2 unsupported verb.
+            verb::FILE_DATA | verb::REQUEST_FILE => Routed::Unsupported { verb },
             verb::DISPLAY | verb::PANE_STATE | verb::KEY | verb::MOUSE | verb::PASTE | verb::FOCUS
             | verb::CREATE_PTY | verb::RESIZE | verb::VIEWPORT => {
                 // A box→head `display`/`pane-state` marks `session` an ACTIVE display session (Slice 2):
