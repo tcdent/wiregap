@@ -15,10 +15,10 @@
 //!
 //! **The evidence boundary (Sprint-8-shaped).** Slice 1 proves the loop-side logic with an INJECTED
 //! [`UpstreamSpawn`] (a controllable double); Slice 2 drops in the real `rustls`/`ureq` worker behind
-//! the same seam. The one thing Slice 1 does **not** prove — that the real reactor *wakes* to run a
-//! tick (and thus drain) when a response arrives during a real quiescent park — is held pending Task 20
-//! (the reactor's bounded-park cap). The drain logic *given a wake* is proven here; a test's driving of
-//! an `Idle` tick after a quiescent arrival IS the simulated wake.
+//! the same seam. The one thing these tests do not themselves exercise — that the real reactor runs a
+//! tick (and thus drains) when a response arrives during a real quiescent park — was **proven live on
+//! hardware in Sprint 14**: the reactor's own bounded wait re-checks unaided, so the wake needs no
+//! proxy-side mechanism. Here a test's `Idle` tick after a quiescent arrival stands in for that wake.
 
 use std::io::Read;
 use std::ops::ControlFlow;
@@ -32,7 +32,7 @@ use transport::SessionId;
 
 use crate::dispatch::{Dispatcher, Enqueue, Routed};
 use crate::nic::Reply;
-use crate::vocab::{Route, ToolIdentity};
+use crate::vocab::{CredentialSource, Route, ToolIdentity};
 
 /// The `anthropic-version` header the proxy sends on the upstream call — a proxy-owned constant (the box
 /// cannot influence it; the wire conveys no HTTP headers). Provisional, marked for review.
@@ -181,9 +181,13 @@ impl<S: UpstreamSpawn> UpstreamIngress<S> {
         }
     }
 
-    /// **Test/observability**: is a call currently in flight?
+    /// **Test observability**: is a call currently in flight? Exercised only by this module's own unit
+    /// tests (the serial-bound / worker-lifecycle / backpressure proofs), so it is `#[cfg(test)]`-gated
+    /// and private — it was never public API, and a test-only accessor should not read as one
+    /// (pre-operator cleanup, Sprint 16). The same-file `mod tests` can see it despite being private.
+    #[cfg(test)]
     #[must_use]
-    pub fn is_in_flight(&self) -> bool {
+    fn is_in_flight(&self) -> bool {
         self.inflight.is_some()
     }
 }
@@ -209,7 +213,8 @@ fn try_enqueue(
 /// The box-facing run-loop adapter **with upstream ingress** (Sprint 11 Slice 1) — [`run_adapter`]'s
 /// successor for the net path. Each tick: (1) **drain** the upstream worker's channel into the
 /// push-queue (this runs on `Idle` too, so a response arriving while the box is silent still reaches the
-/// box — *given* the reactor wakes to run the tick, which is Task 20); (2) **route** the box event (a
+/// box — the reactor's own bounded wait guarantees the tick, proven live in Sprint 14); (2) **route**
+/// the box event (a
 /// `NetPayloadAdmit` spawns the upstream call, or denies a second — serial bound); (3) **pump** the
 /// reply streams to the box. The `Dispatcher` and the [`UpstreamIngress`] are owned here; the only
 /// thread boundary is the ingress's channel.
@@ -262,6 +267,38 @@ impl Credential {
     pub fn new(key: String) -> Self {
         Credential(key)
     }
+
+    /// Resolve the credential from its compiled [`CredentialSource`] descriptor (Sprint 16) — read the
+    /// named environment variable at startup. The descriptor fixes *where* to look; this reads it.
+    /// **Empty is absent** (see [`Credential::from_env_value`]).
+    #[must_use]
+    pub fn from_source(source: &CredentialSource) -> Option<Credential> {
+        Self::from_env_value(std::env::var(source.var_name()))
+    }
+
+    /// The resolution **policy**, pure and total over every `env::var` outcome, so it is directly
+    /// testable without mutating the process environment (which under edition 2024 would require
+    /// `unsafe` — forbidden by the crate's `deny(unsafe_code)`).
+    ///
+    /// **Set-but-empty is treated exactly as unset**: an empty string is not a credential, and letting
+    /// one satisfy `Authority::Credential`'s presence check would be a silently-open authority rung —
+    /// the opposite of the fail-closed guarantee the rung exists to make. Non-UTF-8 is likewise absent:
+    /// a value the proxy cannot even read is not a credential it can present.
+    fn from_env_value(value: Result<String, std::env::VarError>) -> Option<Credential> {
+        match value {
+            Ok(v) if !v.is_empty() => Some(Credential(v)),
+            // Unset, set-but-empty, or non-UTF-8 → absent. Fail closed, identically in all three cases.
+            _ => None,
+        }
+    }
+
+    /// Whether this credential is the empty string — the one property of the secret that is safe to
+    /// expose (it reveals no content). Lets the authority rung fail closed on an empty credential
+    /// however it was constructed, not only on one resolved through [`Credential::from_env_value`].
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 impl core::fmt::Debug for Credential {
@@ -305,7 +342,7 @@ impl UpstreamSpawn for AnthropicClient {
 }
 
 /// The blocking upstream call — **the network leg** (the live round-trip is the held item, pending
-/// Task 20 for the reactor wake + a real credential). POSTs `body` **byte-verbatim** (`send(body)` — no
+/// a real credential). POSTs `body` **byte-verbatim** (`send(body)` — no
 /// re-encode between the tier-1 vet and the wire; bind-the-chain) with the credential + version headers,
 /// and returns a streaming reader over the response body, or a mapped [`ErrorCode`].
 fn upstream_call(endpoint: &str, key: &str, body: &[u8]) -> Result<impl Read, ErrorCode> {
@@ -386,6 +423,56 @@ mod tests {
     use crate::dispatch::REPLY_QUEUE_CAP;
     use crate::register::anthropic::VETTED_TOOLS;
     use crate::register::net::ROUTES;
+
+    // ─── Sprint 16 Slice 2 — the credential descriptor's resolution policy ───────────────────────
+
+    /// **THE EMPTY-ENV-VAR GATE**: a set-but-empty variable resolves to *absent*, **identically** to
+    /// unset — and the `Authority::Credential` rung then fails closed on it. Driven through the pure
+    /// policy so it is deterministic and needs no process-environment mutation (which under edition 2024
+    /// would require `unsafe`, forbidden by the crate's `deny(unsafe_code)`).
+    #[test]
+    fn set_but_empty_env_var_is_absent_exactly_like_unset() {
+        use crate::lifecycle::{Authority, validate_authority};
+        use std::env::VarError;
+
+        // The three absent cases — set-but-empty, unset, and unreadable — are one outcome: None.
+        let empty = Credential::from_env_value(Ok(String::new()));
+        let unset = Credential::from_env_value(Err(VarError::NotPresent));
+        let non_utf8 = Credential::from_env_value(Err(VarError::NotUnicode("\u{fffd}".into())));
+        assert!(empty.is_none(), "a set-but-empty variable is NOT a credential");
+        assert!(unset.is_none());
+        assert!(non_utf8.is_none(), "a value the proxy cannot read is not a credential");
+
+        // A real value resolves — so the gate is not vacuously-closed (the success arm).
+        let present = Credential::from_env_value(Ok("sk-test-value".into()));
+        assert!(present.is_some(), "a non-empty value DOES resolve");
+
+        // Chained to the authority rung: empty fails closed EXACTLY as unset does, and only a real
+        // credential validates. This is the property the rung exists to guarantee.
+        assert!(
+            !validate_authority(Authority::Credential, ROUTES, empty.as_ref(), None),
+            "an empty credential must FAIL the authority rung, not satisfy it by mere presence",
+        );
+        assert!(!validate_authority(Authority::Credential, ROUTES, unset.as_ref(), None));
+        assert!(validate_authority(Authority::Credential, ROUTES, present.as_ref(), None));
+
+        // The rung's own second floor: an empty credential constructed DIRECTLY (not through the
+        // resolution policy) also fails — the guarantee does not depend on how it was built.
+        let hand_built_empty = Credential::new(String::new());
+        assert!(
+            !validate_authority(Authority::Credential, ROUTES, Some(&hand_built_empty), None),
+            "empty fails closed however constructed",
+        );
+    }
+
+    /// The descriptor names a variable and carries no value — and the registered one is the variable
+    /// `serve.rs` actually reads. (Its const-validation and the inexpressibility of a literal secret are
+    /// proven at COMPILE time by `tests/ui/*credential_source*`.)
+    #[test]
+    fn registered_credential_source_names_a_variable_never_a_value() {
+        use crate::register::anthropic::CREDENTIAL_SOURCE;
+        assert_eq!(CREDENTIAL_SOURCE.var_name(), "ANTHROPIC_API_KEY");
+    }
 
     // A body the tier-1 recognizer ADMITS (same as the lifecycle receive-path test).
     const ADMIT_BODY: &[u8] =
@@ -489,8 +576,12 @@ mod tests {
     }
 
     /// THE QUIESCENT-ARRIVAL GATE: box goes silent, THEN the response arrives, THEN a simulated wake
-    /// (an `Idle` tick) drains it to the box — the deadlock case Task 20 exists to fix, with the wake
-    /// simulated (the real wake is the held item). Not merely "drain while the box is still sending."
+    /// (an `Idle` tick) drains it to the box. Not merely "drain while the box is still sending".
+    ///
+    /// The `Idle` tick here stands in for the reactor's own re-check. **There was never a deadlock to
+    /// fix**: Sprint 14 established that the reactor's bounded wait already services a quiescent arrival
+    /// unaided (~100µs live, inside its ~5ms ceiling). This test pins the DRAIN behaviour given a tick;
+    /// that the tick actually happens is the reactor's, proven separately on hardware.
     #[test]
     fn quiescent_arrival_reaches_the_box_on_a_simulated_wake() {
         let cell = Rc::new(RefCell::new(None));
@@ -783,7 +874,7 @@ mod tests {
 
     /// Error mapping (real ureq): a connection to a closed port maps to `net-error(Unreachable)` over the
     /// seam — the real ureq transport-error path, no mock. (The live round-trip to Anthropic itself stays
-    /// held pending Task 20 + a real credential.)
+    /// pending a real credential.)
     #[test]
     fn upstream_connection_refused_maps_to_net_error_unreachable() {
         // 127.0.0.1:1 — nothing listens; connect is refused immediately.

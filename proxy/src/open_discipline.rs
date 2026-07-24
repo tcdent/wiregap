@@ -150,3 +150,80 @@ pub fn confined_create_leaf(
     )
     .map_err(|errno| OpenDenial::Denied { errno })
 }
+
+// ─── Sprint 16 Slice 4 — the KernelProtections probes ────────────────────────────────────────────
+//
+// The startup ladder's `KernelProtections` rung asks whether the kernel-enforced floor this design
+// leans on is ACTUALLY in effect on this host, rather than trusting it unchecked. Both probes live
+// here, beside `pin_root`, because both need raw syscalls — keeping MB6's `{open_discipline,
+// privilege}` allow-list unchanged rather than opening a second unsafe module.
+
+/// The mount protections the quarantine root must carry (`filesystem.md` §2's kernel-enforced floor):
+/// box-written bytes must be unexecutable, and unable to confer privilege or act as a device node.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MountProtections {
+    /// `noexec` — nothing deposited in the quarantine can be executed.
+    pub noexec: bool,
+    /// `nosuid` — a set-uid bit deposited there confers nothing.
+    pub nosuid: bool,
+    /// `nodev` — a device node deposited there is inert.
+    pub nodev: bool,
+}
+
+impl MountProtections {
+    /// All three present — the floor holds.
+    #[must_use]
+    pub fn all_present(&self) -> bool {
+        self.noexec && self.nosuid && self.nodev
+    }
+}
+
+/// Read the mount protections of the filesystem a **pinned directory** sits on, via `fstatfs` **on that
+/// fd** — never a fresh path-based `statfs`. Bind-the-chain: the mount reported here is the mount the
+/// proxy will actually write to, because the descriptor is the one `pin_root` produced and the
+/// dispatcher writes beneath. Re-resolving the path to probe it would describe a directory that could
+/// have been swapped since.
+///
+/// `fstatfs` is permitted on an `O_PATH` descriptor (Linux ≥ 3.12) — verified live on the deploy kernel
+/// (6.12), per this module's probe-don't-assume discipline. Note `libc::statfs` on this target carries no
+/// `f_flags` field; the 64-bit pair is the one that does.
+pub fn mount_protections(dir: BorrowedFd<'_>) -> std::io::Result<MountProtections> {
+    // SAFETY: a plain repr(C) struct of integers — all-zero is a valid, well-defined value.
+    let mut sb: libc::statfs64 = unsafe { std::mem::zeroed() };
+    // SAFETY: `dir` is a caller-owned live descriptor; `&mut sb` is a fully-owned, correctly-sized
+    // `statfs64`. The call returns 0 or -1 (errno set), both handled below.
+    let ret = unsafe { libc::fstatfs64(dir.as_raw_fd(), &mut sb) };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let flags = sb.f_flags as u64;
+    Ok(MountProtections {
+        noexec: flags & libc::ST_NOEXEC != 0,
+        nosuid: flags & libc::ST_NOSUID != 0,
+        nodev: flags & libc::ST_NODEV != 0,
+    })
+}
+
+/// Probe that `openat2`'s **`RESOLVE_*` confinement is actually available** under `dir` — the mechanism
+/// every confined write depends on. Attempts one `openat2` under the real [`RESOLVE_MASK`] for a name
+/// that cannot exist, and reads the errno:
+///
+/// - `ENOENT` — the syscall ran and the mask was accepted; only the name was missing. **Available.**
+/// - `ENOSYS` — no `openat2` on this kernel (< 5.6). **Absent** — the floor would be unenforced.
+/// - `EINVAL` — the kernel rejected the `open_how`/resolve mask. **Absent.**
+///
+/// Creates nothing and opens nothing: the probe is the resolution itself, which is exactly the step
+/// whose availability is in question. Any other errno is treated as absent — fail closed.
+#[must_use]
+pub fn openat2_resolve_available(dir: BorrowedFd<'_>) -> bool {
+    // A name that cannot collide with real quarantine content, and is a valid single component.
+    let probe = c".zerotrust-openat2-resolve-probe";
+    match openat2(dir.as_raw_fd(), probe, libc::O_RDONLY as u64, 0) {
+        // The mask resolved; the file simply is not there — the confinement mechanism works.
+        Err(e) if e == libc::ENOENT => true,
+        // It somehow exists and opened under the mask — the mechanism equally works.
+        Ok(_) => true,
+        // ENOSYS / EINVAL / anything else: the confinement cannot be relied on. Fail closed.
+        Err(_) => false,
+    }
+}

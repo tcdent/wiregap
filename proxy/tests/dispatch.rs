@@ -32,7 +32,7 @@ impl Scratch {
         Scratch { dir }
     }
     fn dispatcher(&self) -> Dispatcher {
-        Dispatcher::with_quarantine_root(pin_root(self.dir.to_str().unwrap()).unwrap())
+        Dispatcher::new().with_quarantine_root(pin_root(self.dir.to_str().unwrap()).unwrap())
     }
 }
 impl Drop for Scratch {
@@ -699,7 +699,7 @@ mod file_read_reply {
         let sc = Scratch::new();
         let content = three_chunk_content();
         std::fs::write(sc.dir.join("src.txt"), &content).unwrap();
-        let mut d = Dispatcher::with_readable_root(sc.dir.clone());
+        let mut d = Dispatcher::new().with_readable_root(sc.dir.clone());
         let s_req = SessionId(7); // a low-half request session
         assert_eq!(d.route(s_req, &file_read("src.txt"), ROUTES, VETTED_TOOLS), Routed::FileReadStreaming);
         assert_eq!(d.replies_count(), 1, "an admitted file-read registers one outbound stream");
@@ -730,7 +730,7 @@ mod file_read_reply {
         let sc = Scratch::new();
         let content = three_chunk_content();
         std::fs::write(sc.dir.join("src.txt"), &content).unwrap();
-        let mut d = Dispatcher::with_readable_root(sc.dir.clone());
+        let mut d = Dispatcher::new().with_readable_root(sc.dir.clone());
         let s_req = SessionId(9);
         assert_eq!(d.route(s_req, &file_read("src.txt"), ROUTES, VETTED_TOOLS), Routed::FileReadStreaming);
 
@@ -762,7 +762,7 @@ mod file_read_reply {
     #[test]
     fn file_read_reserved_bits_deny_whole_no_stream() {
         let sc = Scratch::new();
-        let mut d = Dispatcher::with_readable_root(sc.dir.clone());
+        let mut d = Dispatcher::new().with_readable_root(sc.dir.clone());
         let frame = set_reserved(&file_read("whatever.txt"), 0x0100_0000);
         assert!(matches!(
             d.route(SessionId(1), &frame, ROUTES, VETTED_TOOLS),
@@ -779,7 +779,7 @@ mod file_read_reply {
     #[test]
     fn file_read_missing_source_fails_safe_no_stream() {
         let sc = Scratch::new();
-        let mut d = Dispatcher::with_readable_root(sc.dir.clone());
+        let mut d = Dispatcher::new().with_readable_root(sc.dir.clone());
         match d.route(SessionId(1), &file_read("does-not-exist.txt"), ROUTES, VETTED_TOOLS) {
             Routed::FileReadError { code } => assert_eq!(code, proto::ErrorCode::NotFound),
             other => panic!("expected a fail-safe FileReadError, got {other:?}"),
@@ -795,7 +795,7 @@ mod file_read_reply {
     fn close_session_evicts_an_in_flight_reply_stream() {
         let sc = Scratch::new();
         std::fs::write(sc.dir.join("src.txt"), vec![0u8; READ_CHUNK * 2]).unwrap();
-        let mut d = Dispatcher::with_readable_root(sc.dir.clone());
+        let mut d = Dispatcher::new().with_readable_root(sc.dir.clone());
         let s = SessionId(3);
         assert_eq!(d.route(s, &file_read("src.txt"), ROUTES, VETTED_TOOLS), Routed::FileReadStreaming);
         let mut reply = FakeReply::new(0);
@@ -843,7 +843,7 @@ mod file_read_reply {
         std::fs::write(sc.dir.join("d/alpha.txt"), b"a").unwrap();
         std::fs::write(sc.dir.join("d/beta.txt"), b"bb").unwrap();
         std::fs::create_dir(sc.dir.join("d/sub")).unwrap();
-        let mut d = Dispatcher::with_readable_root(sc.dir.clone());
+        let mut d = Dispatcher::new().with_readable_root(sc.dir.clone());
         let s_req = SessionId(11);
         assert_eq!(d.route(s_req, &list_frame("d"), ROUTES, VETTED_TOOLS), Routed::ListStreaming);
         assert_eq!(d.replies_count(), 1);
@@ -877,7 +877,7 @@ mod file_read_reply {
         std::fs::create_dir(sc.dir.join("real")).unwrap();
         std::fs::write(sc.dir.join("real/inside.txt"), b"x").unwrap();
         std::os::unix::fs::symlink(sc.dir.join("real"), sc.dir.join("link")).unwrap();
-        let mut d = Dispatcher::with_readable_root(sc.dir.clone());
+        let mut d = Dispatcher::new().with_readable_root(sc.dir.clone());
         assert_eq!(d.route(SessionId(1), &list_frame("link"), ROUTES, VETTED_TOOLS), Routed::ListStreaming);
         let mut reply = FakeReply::new(usize::MAX);
         d.pump_replies(&mut reply);
@@ -897,7 +897,7 @@ mod file_read_reply {
     fn list_non_directory_fails_safe_no_stream() {
         let sc = Scratch::new();
         std::fs::write(sc.dir.join("afile"), b"x").unwrap();
-        let mut d = Dispatcher::with_readable_root(sc.dir.clone());
+        let mut d = Dispatcher::new().with_readable_root(sc.dir.clone());
         match d.route(SessionId(1), &list_frame("afile"), ROUTES, VETTED_TOOLS) {
             Routed::ListError { .. } => {}
             other => panic!("expected a fail-safe ListError on a non-directory, got {other:?}"),
@@ -909,7 +909,7 @@ mod file_read_reply {
     #[test]
     fn list_missing_source_fails_safe() {
         let sc = Scratch::new();
-        let mut d = Dispatcher::with_readable_root(sc.dir.clone());
+        let mut d = Dispatcher::new().with_readable_root(sc.dir.clone());
         match d.route(SessionId(1), &list_frame("nope"), ROUTES, VETTED_TOOLS) {
             Routed::ListError { code } => assert_eq!(code, proto::ErrorCode::NotFound),
             other => panic!("expected ListError NotFound, got {other:?}"),
@@ -931,7 +931,7 @@ mod file_read_reply {
     fn list_reserved_bits_deny_whole_no_stream() {
         let sc = Scratch::new();
         std::fs::create_dir(sc.dir.join("d")).unwrap();
-        let mut d = Dispatcher::with_readable_root(sc.dir.clone());
+        let mut d = Dispatcher::new().with_readable_root(sc.dir.clone());
         let frame = set_reserved(&list_frame("d"), 0x0100_0000);
         assert!(matches!(
             d.route(SessionId(1), &frame, ROUTES, VETTED_TOOLS),
@@ -1177,7 +1177,7 @@ mod file_read_reply {
 
         // file verb (file-read): file-error(Malformed).
         let sc = Scratch::new();
-        let mut d = Dispatcher::with_readable_root(sc.dir.clone());
+        let mut d = Dispatcher::new().with_readable_root(sc.dir.clone());
         let s = SessionId(32);
         assert!(matches!(
             d.route(s, &set_reserved(&file_read("x.txt"), 0x0100_0000), ROUTES, VETTED_TOOLS),
@@ -1190,7 +1190,7 @@ mod file_read_reply {
     #[test]
     fn jc3_file_read_failsafe_notifies_file_error_code() {
         let sc = Scratch::new();
-        let mut d = Dispatcher::with_readable_root(sc.dir.clone());
+        let mut d = Dispatcher::new().with_readable_root(sc.dir.clone());
         let s = SessionId(33);
         assert!(matches!(
             d.route(s, &file_read("nope.txt"), ROUTES, VETTED_TOOLS),

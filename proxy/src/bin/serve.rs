@@ -3,9 +3,41 @@
 //! Wires the real components — the `RealNic` (82599, constructed inside `bring_up`) + an
 //! `AnthropicClient` (upstream) + a real `HeadConnection` (accepted from a `UnixListener`) + the
 //! credential + the register — through `bring_up` (the fail-closed ladder) and `run_adapter_composed`
-//! (the one production loop, Slice 1). This makes a proxy **visible**; it does **not** prove a live
-//! round-trip: that is HELD on Task 20 (the reactor's bounded park, still with the NIC team), a real
-//! operator credential, and a real head — none present in a normal environment.
+//! (the one production loop, Slice 1). This makes a proxy **visible**, not yet **servable**.
+//!
+//! **ALL FOUR AUTHORITY RUNGS ARE REAL.** None is a placeholder any more: `RouteRegister` is the
+//! compiled register; `FilesystemRoots` resolves the compiled root paths (the quarantine *pinned*, the
+//! readable root proven a readable directory); `KernelProtections` probes **that same pinned fd** for
+//! `noexec,nosuid,nodev` plus `openat2` RESOLVE availability; `Credential` requires a non-empty value
+//! from the environment variable the compiled descriptor names. So `Readiness::Served` is now reachable
+//! — and the ladder still closes, all-or-none and named, on whatever is missing.
+//!
+//! **WHAT THE ENVIRONMENT MUST PROVIDE** (each of these, or the proxy fails closed and says which):
+//!   * the quarantine root exists, is a directory, and sits on a mount carrying `noexec,nosuid,nodev`;
+//!   * **and is WRITABLE BY THE UID THIS PROCESS DROPS TO** — see the warning below;
+//!   * the readable root exists and is a readable directory;
+//!   * the credential variable is set to a non-empty value.
+//!
+//! **WRITABILITY IS NOT AN AUTHORITY — the one gap to know about.** The rungs prove the quarantine is
+//! pinned and properly mounted; they do **not** prove the dropped uid can write into it, and no rung
+//! can: `pin_root` runs *before* the privilege drop, as root, and root bypasses ordinary permission
+//! checks — so a probe there would pass on exactly the case it exists to catch. A quarantine that is
+//! root-owned `0755` therefore satisfies every rung, reports `Served`, and still fails at the **first
+//! `file-chunk`** (fail-safe: denied, nothing written, the box told). Provisioning must close this:
+//! whatever creates the runtime directory must also give it to the drop-target uid. Note `systemd`'s
+//! `RuntimeDirectory=` alone does **not** suffice here — it takes ownership from `User=`, which must be
+//! `root` for the privileged NIC bring-up, so the directory would land root-owned. Pair it with an
+//! explicit ownership step (an `ExecStartPre=+/bin/chown <uid>:<gid> /run/zerotrust-proxy`, or the same
+//! `chown` done by the operator's provisioning). Choosing and implementing that mechanism is the
+//! operator's deployment call, deliberately not built into this binary.
+//!
+//! **STILL HELD:** the live end-to-end round-trip — a real 82599 on the bench, a connected head, a real
+//! upstream call. Reaching `Served` means every authority *validated*, not that traffic has flowed.
+//!
+//! Beyond that, the live end-to-end round-trip additionally needs a real operator credential and a real
+//! head — neither present in a normal environment. (The quiescent-wake liveness this once listed as held
+//! on "Task 20" is **discharged**: Sprint 14 proved on real hardware that the unmodified reactor already
+//! services a quiescent arrival, and the proxy-side `idle_cap` was dropped as counterproductive.)
 //!
 //! SAFETY (reuses `s5_capture`'s exact posture): the ONLY device touched is the bench proxy card by
 //! EXACT BDF (`Bdf::parse` literal). NEVER device-id enumeration — the production NIC at 0000:61:00.0 is
@@ -14,11 +46,11 @@
 //! Feature-gated (`--features serve`) so `cargo build` (the production/TCB build) never compiles this
 //! hardware-touching binary. Operator paste-and-confirm the BDF before any run.
 //!
-//! CREDENTIAL: a thin, clearly-marked **interim** env-var read (`ANTHROPIC_API_KEY`) handed straight to
-//! `Credential::new` — NOT a config loader/parser/DSL (Sprint 8's config surface is still queued). The
-//! raw key is never printed, logged, or echoed to the box (`Credential`'s `Debug` is redacted). A
-//! MISSING credential holds the WHOLE proxy closed at the authority rung (all-or-none ladder), never a
-//! silent open.
+//! CREDENTIAL: read at startup from the environment variable named by the compiled, const-validated
+//! `register::anthropic::CREDENTIAL_SOURCE` descriptor — the *custody* is configured, the secret itself
+//! never enters source (`architecture.md` §8). The raw key is never printed, logged, or echoed to the
+//! box (`Credential`'s `Debug` is redacted). A MISSING credential — unset, set-but-empty, or non-UTF-8,
+//! all identically — holds the WHOLE proxy closed at the authority rung, never a silent open.
 //!
 //! Build (bench only): `cargo run --features serve --bin serve` (needs privilege + the bench card + a
 //! head on the socket + the credential env var).
@@ -28,10 +60,10 @@ use std::ops::ControlFlow;
 use std::os::unix::net::UnixListener;
 
 use directpath::Bdf;
-use proxy::dispatch::Dispatcher;
 use proxy::head::{HeadConnection, run_adapter_composed};
-use proxy::lifecycle::{BringUpConfig, Readiness, bring_up};
-use proxy::register::anthropic::VETTED_TOOLS;
+use proxy::lifecycle::{Assembly, BringUpConfig, Readiness, assemble, bring_up};
+use proxy::register::anthropic::{CREDENTIAL_SOURCE, VETTED_TOOLS};
+use proxy::register::filesystem::{QUARANTINE_ROOT, READABLE_ROOT};
 use proxy::register::net::ROUTES;
 use proxy::upstream::{AnthropicClient, Credential};
 
@@ -48,9 +80,11 @@ const DROP_GID: u32 = 65534;
 const PEER_BOX_MAC: [u8; 6] = [0u8; 6];
 // The head-connection rendezvous socket (config hook) — the operator's head connects here.
 const HEAD_SOCKET_PATH: &str = "/run/zerotrust-proxy/head.sock";
-// The upstream endpoint (production Anthropic Messages API) and the interim credential env var.
+// The upstream endpoint (production Anthropic Messages API). The credential's SOURCE is no longer a
+// bare constant here — it is `register::anthropic::CREDENTIAL_SOURCE`, a const-validated descriptor in
+// the compiled register (Sprint 16), so *where* the secret comes from is reviewed with the rest of the
+// operator's authority data rather than buried in the binary.
 const ANTHROPIC_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
-const CREDENTIAL_ENV: &str = "ANTHROPIC_API_KEY";
 
 fn main() -> io::Result<()> {
     // Exact-BDF gate (never enumeration): parse the literal; the allowlist is THIS card only.
@@ -58,20 +92,26 @@ fn main() -> io::Result<()> {
     let allowlist: [Bdf; 1] = [local];
     eprintln!("proxy: local={PROXY_BDF} (exact BDF; production 61:00.0 NEVER touched)");
 
-    // Thin, INTERIM credential read — env var only, never a config loader/DSL. The raw key is handed
-    // straight to `Credential::new` and never printed/logged/echoed (redacted `Debug`). Absent → `None`
-    // → the ladder holds the WHOLE proxy closed at the authority rung (all-or-none, fail-closed).
-    let key = std::env::var(CREDENTIAL_ENV).ok();
-    let ladder_credential = key.as_deref().map(|k| Credential::new(k.to_string()));
+    // Resolve the credential from its COMPILED DESCRIPTOR — the register names the variable, this reads
+    // it. The raw key is never printed/logged/echoed (redacted `Debug`; the line below prints only
+    // presence and the variable's NAME, never its contents). Absent — unset, set-but-empty, or non-UTF-8,
+    // all identically — yields `None`, and the ladder then holds the WHOLE proxy closed at the authority
+    // rung (all-or-none, fail-closed).
+    let ladder_credential = Credential::from_source(&CREDENTIAL_SOURCE);
     eprintln!(
-        "proxy: credential {}",
+        "proxy: credential from ${} — {}",
+        CREDENTIAL_SOURCE.var_name(),
         if ladder_credential.is_some() { "present (redacted)" } else { "ABSENT — proxy will fail closed" },
     );
 
-    // The real upstream client, built from the same interim key. When the key is absent this client is
-    // unusable — but `run()` is never entered (the ladder closes the proxy at the authority rung first),
-    // so its `spawn` is never called and the empty key is never used.
-    let client = AnthropicClient::new(Credential::new(key.unwrap_or_default()), ANTHROPIC_ENDPOINT.to_string());
+    // The real upstream client. When the credential is absent this client holds an empty key and is
+    // unusable — but `run()` is never entered (the ladder closes the proxy at the authority rung first,
+    // and an empty credential fails that rung), so its `spawn` is never called and the empty key is
+    // never used.
+    let client = AnthropicClient::new(
+        Credential::from_source(&CREDENTIAL_SOURCE).unwrap_or_else(|| Credential::new(String::new())),
+        ANTHROPIC_ENDPOINT.to_string(),
+    );
 
     // The real head connection: bind the rendezvous socket and accept ONE head (the operator's terminal).
     // Blocks until a head connects — a real proxy waits for its head. The composed adapter owns it. (The
@@ -85,8 +125,22 @@ fn main() -> io::Result<()> {
 
     // The one production loop (Slice 1): one Dispatcher, the upstream + head ingresses, one pump.
     // `on_verdict` returns `Continue` — production runs until the subsystem stops (no e2e break).
+    // THE ONE ASSEMBLY (Sprint 16): compiled root paths → validated, pinned roots → the Dispatcher.
+    // This is the same function the sprint's tests drive, so what they prove is what this binary runs.
+    // A root failure does not abort here: it yields a rootless dispatcher plus the named reason, and the
+    // ladder reports `Closed(FilesystemRoots)` in the ordinary all-or-none way.
+    let Assembly { dispatcher, roots } = assemble(QUARANTINE_ROOT.as_str(), READABLE_ROOT.as_str());
+    match &roots {
+        Ok(_) => eprintln!(
+            "proxy: filesystem roots validated (quarantine={}, readable={})",
+            QUARANTINE_ROOT.as_str(),
+            READABLE_ROOT.as_str(),
+        ),
+        Err(why) => eprintln!("proxy: filesystem roots FAILED — {why} (proxy will fail closed)"),
+    }
+
     let adapter = run_adapter_composed(
-        Dispatcher::new(),
+        dispatcher,
         ROUTES,
         VETTED_TOOLS,
         client,
@@ -96,7 +150,7 @@ fn main() -> io::Result<()> {
 
     // `bring_up`: construct (privileged, exact-BDF) → real privilege drop (+ IB2 self-check) → the
     // authority ladder (a missing credential closes the WHOLE proxy, all-or-none) → run the composed
-    // loop. HELD: the live round-trip needs Task 20 (the reactor wake), a real credential, a real head.
+    // loop. HELD: the live round-trip needs a real credential, a real head, and the bench card.
     let config = BringUpConfig {
         local,
         allowlist: &allowlist,
@@ -105,6 +159,7 @@ fn main() -> io::Result<()> {
         gid: DROP_GID,
         register: ROUTES,
         credential: ladder_credential.as_ref(),
+        roots: roots.as_ref().ok(),
     };
     let readiness = bring_up(config, adapter)?;
     eprintln!("proxy: readiness={readiness:?}");

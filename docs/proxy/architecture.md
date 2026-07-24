@@ -78,7 +78,8 @@ The taxonomy has a single sorting axis (design ruling, 2026-07-18). Components w
 adversary is not the box — upstream-facing code, operator-input-only code — are not given
 new tiers; each row's placement note names its **adversary class** (box / upstream / device
 / none) as an attribute, and the two edges that attribute exposes are carried in §4–§5
-(the upstream TLS stack — since ruled by policy, §11 L10; the config loader — still open).
+(the upstream TLS stack — since ruled by policy, §11 L10; the config loader — since
+dissolved, there being no loader to place: §5, ledger L9).
 
 ## 3. The placement — the whole proxy against the taxonomy
 
@@ -117,14 +118,14 @@ new tiers; each row's placement note names its **adversary class** (box / upstre
 
 | Component | Subsystem | Tier | Capability over box bytes | Grounding | Placement note |
 |---|---|---|---|---|---|
-| Cloud originator | cloud | 3 | Encapsulates an already-admitted request verbatim inside the proxy's own authenticated TLS; owns transport, credential, and the upstream call; zero signing code | `terminal.md` §5.3; `cloud/approach.md` §1; `containment-by-construction.md` §3.2–§3.3 | Adversary class: none on input (receives only what the tier-1 gate admitted). Credential attachment is operational (`containment-by-construction.md` §3.3). |
+| Cloud originator | cloud | 3 | Encapsulates an already-admitted request verbatim inside the proxy's own authenticated TLS; owns transport, credential, and the upstream call; zero signing code | `terminal.md` §5.3; `cloud/approach.md` §1; `containment-by-construction.md` §3.2–§3.3 | Adversary class: none on input (receives only what the tier-1 gate admitted). Proxy-held as built — loaded from a configured environment variable (§8); custody itself remains an operational decision (`containment-by-construction.md` §3.3; §8). |
 | Upstream TLS stack (library dependency) | cloud | 3 | None — parses upstream-authored bytes on trusted ground, both directions | `containment-by-construction.md` §3.3 (cite-through) | Adversary class: **upstream** — off the box-byte axis entirely; sharpest instance of the adversary-class attribute (design ruling 2026-07-18: attribute note, no new tier). RESOLVED (zero.policy, 2026-07-18): outside the box-reachable surface and outside the §15/§16 budget — box bytes reach TLS only as opaque plaintext to encrypt; its parser sees only the cloud's records (§4, cloud walk; §11, L10). |
 | Cloud response relay | cloud | 3 | Relays the upstream response opaquely to the box; never inspects, neutralizes, modifies, or sanitizes | `cloud/approach.md` §5 | Adversary class: upstream (framing); box-influenced content rides opaque inside and is never parsed. Safe direction — the payload lands on untrusted ground, so a relay bug fails the feature; hardening this direction would re-import the confidentiality worldview the spine discards. |
 | Quarantine writer | filesystem | 3 | Writes verbatim bytes at the gated destination — appended in order at the running cursor (the wire carries no offset — `file.md` §1); interprets nothing | `terminal.md` §5.3; `filesystem.md` §1, §4 | Adversary class: box — but the bytes are already-safe when they arrive: the destination is confined by the two tier-1 floors, and writing interprets nothing. Explicit tier-3 source label (`terminal.md` §5.3). |
 | Head renderer / pane multiplexer | terminal | 3 | Renders the grid, multiplexes panes, captures input — the tmux replacement | `terminal.md` §3, §5.3 | A bug is a misread or a crash, never an interpretation (`terminal.md` §3). |
 | Input path (head → box) | terminal | 3 | Operator keystrokes and resize flow onto untrusted ground, well-formed but unsanitized — the box may be sent anything | `terminal.md` §4 | Adversary class: none (operator-authored). Off the box-reachable surface entirely; no reflection — channels split and one-directional, no query frame. |
 | Audit log writer | cloud (cross-cutting) | 3 | Writes the audit trail: "request to [safe address] — allowed or denied, and why"; draws only from the safe representation, so no box payload can reach a log line | `cloud/approach.md` §7 | Adversary class: none — the dangerous content is structurally absent from the representation logs are drawn from. The log *viewing* path is a cross-cutting mechanics question (§11, L13), not settled here. |
-| Config / route-register loader | cross-cutting | 3 (provisional) | None — loads operator-authored configuration: the route register (`approach.md` §6), quarantine root and readable root (`filesystem.md` §4); the box can author no rule, and config is never sourced from quarantine (`filesystem.md` §2) | `cloud/approach.md` §6; `filesystem.md` §2, §4; `principles.md` §14 | **Open placement, provisionally tier 3 by elimination** (adversary class: none → not box-reachable tiers 1–2; not untrusted-contained). Tier 3's severity clause is *not* satisfiable from source: a register-load defect alters the tier-1 gate's input, so "fails the feature, never containment" does not hold. Cannot be fully defended from source → carried as an open question per the sprint method, not coin-flipped. |
+| ~~Config / route-register loader~~ *(no such component)* | cross-cutting | — | None — **there is no loader**: the whole configured surface is compiled-in `const` data (the route register and vetted tool identities, the filesystem roots, and the credential's source descriptor), structurally validated at build time, never loaded or parsed at runtime | `cloud/approach.md` §6; `filesystem.md` §2, §4; `principles.md` §14 | **Placement question dissolved, not answered** (ledger L9): the row is kept, struck through, so a reader who remembers this component learns it was removed by construction rather than finding it silently absent. The one runtime read that remains — the credential's secret value from its named environment variable — has no format and no parser, and an absent or empty value fails the startup ladder closed (§8, §9). |
 
 ### Tier 4 — Untrusted-contained
 
@@ -285,12 +286,19 @@ single axis is honestly strained rather than silently stretched:
   only from the safe representation, so the dangerous content is structurally absent from
   everything it writes. How the operator *views* logs without creating an interpretation
   surface is an open mechanics question (§11, L13).
-- **The config / route-register loader** (tier 3, provisional — open placement) touches no
-  adversary bytes at all: it loads what the operator authored, the box can author no rule,
-  and config is never sourced from the quarantine. But its correctness is
-  containment-relevant — a register-load defect alters the tier-1 gate's input — so tier 3's
-  "fails the feature, never containment" clause does not honestly hold. The placement is
-  provisional by elimination and carried as an open question for design.
+- **There is no config / route-register loader** — the component this section once carried as
+  a provisionally-placed tier-3 open question **does not exist**, and the question it posed
+  is dissolved rather than answered. The whole configured surface is compiled-in Rust
+  `const` data, structurally validated at build time: the route register and vetted tool
+  identities (§8; U5, `approach.md` §6 "the register is Rust, not a config file"), and, since
+  the configuration DSL landed, the filesystem roots and the credential's *source descriptor*
+  as well. Nothing is loaded, parsed, or deserialized at runtime, so there is no loader whose
+  defect could alter the tier-1 gate's input — the gate's input is source the operator
+  reviews and recompiles. What *is* read at runtime is the credential's secret **value**,
+  from the environment variable the compiled descriptor names; that read has no format and no
+  parser, and an absent or empty value fails the startup ladder closed rather than yielding a
+  malformed rule. (Ledger: L9 resolved by construction; the residual is L12's config
+  *mechanics*, below.)
 - **The Linux kernel under the proxy host** is unplaced, deliberately. The sources both
   exclude it from the reviewable trusted path (`principles.md` §16; the NIC link bypasses
   it entirely) and lean on it as the enforcement substrate for the quarantine floor
@@ -313,9 +321,10 @@ The durable set, enumerated:
   their rules (`cloud/approach.md` §6; `principles.md` §14).
 - **The filesystem roots** — the quarantine root and the readable root; explicitly "config"
   and explicitly the whole of the filesystem subsystem's state (`filesystem.md` §4).
-- **The upstream credential** — held by the proxy (or on the box, an operational choice);
-  revocable, and revocation is the whole answer to its theft (`cloud/approach.md` §1;
-  `containment-by-construction.md` §3.3; `principles.md` §7).
+- **The upstream credential** — proxy-held as built, loaded from a configured environment
+  variable (§8); custody remains an operational decision (§8) should the operator choose
+  otherwise. Revocable, and revocation is the whole answer to its theft
+  (`cloud/approach.md` §1; `containment-by-construction.md` §3.3; `principles.md` §7).
 - **The audit trail** — append-only output, drawn solely from the safe representation
   (`cloud/approach.md` §7; this document, §7).
 
@@ -331,9 +340,15 @@ below the copy boundary (`nic/architecture.md` §3.1).
 
 Two structural absences complete the picture. The terminal path holds **no interpretation
 state on the proxy**: the grid is resolved on the box (the emulator) and held at the head
-(`terminal.md` §1, §3; `docs/proto/display.md`) — the relay in between keeps nothing but
-the frame in flight, which is the console posture ("less for the proxy to interpret",
-`console-and-protocol-design.md` §1.2) in state form. And there is **no box-attributed
+(`terminal.md` §1, §3; `docs/proto/display.md`) — the relay in between keeps nothing *of the
+frame's content*, which is the console posture ("less for the proxy to interpret",
+`console-and-protocol-design.md` §1.2) in state form. As built, the relay does keep one
+purely **routing** datum, and the distinction is the point: a bounded set of the session ids
+on which a live display is currently open, so that head-originated input can be bound to the
+pty it names — and so that input naming a *closed* or unknown session is **dropped rather
+than misrouted** to whatever session later holds that id. It is per-epoch bounded and evicted
+on session close, it is ids and never content, and nothing in it is interpretable — the
+absence that matters (no grid, no scrollback, no box bytes on trusted ground) is untouched. And there is **no box-attributed
 history**: transfers are unattributed by source, and the log holds decisions about safe
 addresses, not box content — so no accumulation of box bytes anywhere on trusted ground
 that a later feature could be tempted to interpret.
@@ -409,12 +424,17 @@ Three placement constraints on configuration are source-firm, whatever mechanism
    deliberate act after reviewing a legible refusal (`cloud/approach.md` §6). Fail-closed
    is the default state of every gap.
 
-The unresolved half is real and named rather than absorbed: format, location on disk,
-load/validation semantics, whether the config parser itself owes total-function discipline
-(it is operator-authored input, so the taxonomy does not force it — but the config
-loader's open placement in §5 shows the stakes), and how a register change takes effect
-(restart vs reload). All of it is §11 ledger material with the config-loader row (§3
-tier 3, provisional) as its placement anchor.
+The unresolved half is now **much smaller than it was, and smaller by construction rather
+than by decision**. Choosing compiled-in `const` data for the whole configured surface
+*dissolves* most of what this paragraph once listed as open: there is no format, no location
+on disk, and no load/validation semantics to settle, and the question of whether the config
+parser owes total-function discipline does not arise because there is no parser (§5). How a
+change takes effect is likewise settled by the same choice: edit, recompile, re-review,
+restart — the register's own promotion pattern. What genuinely remains is **reload without
+restart** — whether a running proxy can ever adopt new authority data without being
+restarted — which the compiled-in model does not answer and deliberately does not attempt.
+That, and nothing else from this list, is the live §11 ledger residual (L12); its anchor is
+this section, not a config-loader row (there is no loader — L9).
 
 ## 9. Lifecycle
 
@@ -448,7 +468,8 @@ and no box byte is served until every rung a channel depends on is up:
    byte can be received (`nic/architecture.md` §3).
 3. **Authority and environment validated** — the route register parsed and validated; the
    filesystem roots resolved and checked (quarantine root present and on its inert mount,
-   readable root resolved); the credential loaded if proxy-held (§6, §8). And, as a standing
+   readable root resolved); the credential loaded from its configured environment variable,
+   proxy-held as built (§6, §8). And, as a standing
    convention, the proxy **verifies at boot that the kernel-enforced protections it relies on
    are actually in effect** — the quarantine truly mounted `noexec,nosuid,nodev`, the `openat2`
    resolve-flag confinement available (§3 tier 1; L6; the kernel-standing question, L11) —
@@ -546,8 +567,22 @@ Two reasons *can* justify a boundary, and neither is containment: **least privil
 a privileged bring-up distinct from the unprivileged relay) and **review-surface
 organization** (L4 — whether the attacker-JSON recognizer is a module or an in-budget
 isolated service, the cloud subsystem's call). Absent a specific such reason, the composition
-is one process: the reactor, the three channel services, and the recognizers, single-threaded
-per the transport's committed shape.
+is one process: the reactor, the three channel services, and the recognizers.
+
+**Threading, as built** *(current to the composed production loop)*. The box-facing core is
+single-threaded, per the transport's committed shape: one reactor, and **one `Dispatcher`**
+holding all per-session state, borrowed sequentially — never concurrently — by the one event
+loop. That single-threadedness is the containment-relevant property, and it is preserved by
+construction: no `Arc`, no `Mutex`, no second thread touching the `Dispatcher`. Around it the
+process owns exactly **three auxiliary threads, all for blocking I/O the core must not block
+on**, each isolated behind a bounded channel that is its *only* boundary with the core: the
+**upstream worker** (one per in-flight call — the blocking TLS request/response, so a slow or
+hung upstream cannot stall the box-facing loop) and the head connection's **reader and
+writer** (a long-lived socket the loop drains and feeds non-blocking). None of the three
+touches the `Dispatcher` or any proxy state; they move owned bytes across a channel and
+nothing else. So "one process, single-threaded" remains true of *the reviewable core*, which
+is what the claim was ever about — the auxiliary threads add no shared mutable state and no
+new review surface beyond their channels.
 
 - **L4 — Recognizer placement** *(source-open, `cloud/anthropic-api.md` §8; routed to cloud
   subsystem design)*. Whether the Anthropic-request recognizer is a module bound to the
@@ -601,10 +636,10 @@ resolved so the ledger numbering stays stable.
 | L6 | **CLOSED (spec Sprint 2; BUILT + certified Sprint 5)** — FS open-discipline primitives are specified in `spec/filesystem-write-path.md` §1 (pinned `O_PATH` root descriptor + per-component `openat2` with `RESOLVE_BENEATH\|RESOLVE_NO_SYMLINKS\|RESOLVE_NO_MAGICLINKS\|RESOLVE_NO_XDEV` + `O_CREAT\|O_EXCL` leaf; the earlier `O_NOFOLLOW`-only sketch was corrected) **and now exist as certified running code** in `proxy::open_discipline` (+ the leaf-validator in `proxy::leaf`), certified by a live deploy-kernel probe (the symlink-intermediate→`ELOOP` gap-closer observed at runtime). | §3 tier 1; §4 filesystem walk | `spec/filesystem-write-path.md` §1; built `proxy::open_discipline`/`proxy::leaf` (Sprint 5) | closed — spec + built |
 | L7 | **CLOSED (Sprint 2, gate-accepted; reconciled here Sprint 4)** — quarantine inertness is specified in `spec/filesystem-write-path.md` §2: dedicated mount `noexec,nosuid,nodev,nosymfollow` + a `statvfs` startup assertion + the no-auto-processor host checklist (kernel-enforced floor vs. operational invariant, honestly split). | §3 tier 1; §4 filesystem walk | `spec/filesystem-write-path.md` §2 (accepted) | closed — spec |
 | L8 | NIC DMA-reach residual — does the threat model tolerate un-contained firmware DMA on the trusted side | §3 tier 4; §4 NIC walk | `nic/architecture.md` §2.1 (source-open) | policy layer, audited after the PoC |
-| L9 | **RESOLVED by construction (Sprint 5's U5; confirmed Sprint 6)** — the config/route-register *loader* whose tier placement this asked about **no longer exists**: U5 (`approach.md` §6, "the register is Rust, not a config file") made the register compiled-in `const` TCB source (`proxy::register`, no `File`/load/parse/`Deserialize`), so L9's exact concern — "a register-*load* defect alters the tier-1 gate's input" — has no loader to apply to; the input to the tier-1 gate is now source the operator reviews, not a runtime load. The residual (filesystem roots + credential *values* still needing a runtime mechanism) is a *different* question — config mechanics, ledger **L12** — not a route-register loader feeding the gate. | §3 tier 3; §5 | this document (placement) | resolved — U5 removed the loader; residual → L12 |
+| L9 | **RESOLVED by construction (Sprint 5's U5; confirmed Sprint 6)** — the config/route-register *loader* whose tier placement this asked about **no longer exists**: U5 (`approach.md` §6, "the register is Rust, not a config file") made the register compiled-in `const` TCB source (`proxy::register`, no `File`/load/parse/`Deserialize`), so L9's exact concern — "a register-*load* defect alters the tier-1 gate's input" — has no loader to apply to; the input to the tier-1 gate is now source the operator reviews, not a runtime load. **Extended to the whole configured surface (Sprint 16)**: the filesystem roots are now compiled-in `const` `RootPath`s too, and the credential is compiled as a *source descriptor* (the environment variable's name, const-validated) rather than a value — so no part of the configured surface is loaded or parsed at runtime. The one runtime read left is the credential's secret **value** from its named variable: no format, no parser, and absent-or-empty fails the ladder closed. The residual is now narrower than this row once described — reload-vs-restart alone, ledger **L12** — not a route-register loader feeding the gate. | §3 tier 3; §5 | this document (placement) | resolved — U5 removed the loader; residual → L12 |
 | L10 | **RESOLVED (zero.policy, 2026-07-18, via the PM)** — the upstream TLS library does not count against the §15/§16 reviewability budget: the budget scopes to the box-reachable surface; box bytes reach TLS only as opaque plaintext to encrypt (its parser sees only the cloud's records); a TLS bug fails the feature or leaks undefended content (`principles.md` §7), never grants the box reachable execution. Off-surface, out of budget. | §3 tier 3; §4 cloud walk | this document (placement; adversary-class attribute) | resolved — policy ruling; see addendum below |
 | L11 | Linux kernel standing — excluded from the reviewable path yet the quarantine floor's substrate | §3 unplaced; §5 | this document (placement) | design + policy |
-| L12 | Configuration mechanics — format, location, load/validation, reload vs restart take-effect, whether the parser owes total-function discipline | §8 | this document (composition) | design |
+| L12 | Configuration mechanics — **most of this row is dissolved, not answered** (Sprint 16): the configured surface is compiled-in `const` data, so there is no format, no on-disk location, no load/validation semantics, and no parser to owe total-function discipline (§5, §8; L9). Take-effect is the register's own promotion pattern — edit, recompile, re-review, restart. **What remains open is reload-without-restart**: whether a running proxy can ever adopt new authority data without being restarted. The compiled-in model does not answer that and deliberately does not attempt it. | §8 | this document (composition) | design — narrowed to reload-vs-restart |
 | L13 | Observability mechanics — log transport, storage, rotation, the safe viewing path, metrics/health; inherits "box content is never rendered on trusted ground" | §7 | this document (composition) | design |
 | L14 | **RESOLVED (design, 2026-07-18)** — one process by default; splitting-for-containment is theater (a compromised gate originates regardless; the real boundary is the NIC/DMA below the process). A boundary is justified only by least privilege (L15) or review-surface organization (L4), never containment. | §10 | this document (composition) | resolved — design; see §10 |
 | L15 | **RESOLVED (design + nic-team confirmation, 2026-07-18)** — spend privilege at bring-up, drop to an unprivileged uid before the link serves box traffic; the box-facing relay runs unprivileged (least privilege by construction, in-process). Nic team verified against code: steady-state makes zero syscalls (mapped-BAR MMIO + MWAITX park + unprivileged clock), mappings persist across the drop, device DMAs independently. No steady-state recovery exists today; if one is added, a device-reset's bus-master re-enable is the one privileged op, isolated to a tiny helper then. | §10 | this document (composition) | resolved — design + nic team |

@@ -491,12 +491,17 @@ impl Dispatcher {
     /// [`with_quarantine_root`](Self::with_quarantine_root)). Without it, a `file-read` routes as
     /// relayed (its pre-Slice-2 disposition); a serving proxy always sets it (the ladder validates FS
     /// roots first).
+    /// **A builder method, taking `self`** — deliberately, and this is a bug fix, not a style change
+    /// (Sprint 16). Both root setters used to be *associated constructors* that filled their own field
+    /// and defaulted every other one (`..Dispatcher::new()`), so calling both left only the second:
+    /// **no dispatcher could hold both roots at once**, and a servable proxy needs both (readable for
+    /// `file-read`/`list`, quarantine for `file-chunk` writes). Taking and returning `self` composes —
+    /// `Dispatcher::new().with_readable_root(r).with_quarantine_root(q)` — and removes the hazard
+    /// structurally: a method that consumes `self` has nothing to reset.
     #[must_use]
-    pub fn with_readable_root(root: PathBuf) -> Self {
-        Dispatcher {
-            readable_root: Some(root),
-            ..Dispatcher::new()
-        }
+    pub fn with_readable_root(mut self, root: PathBuf) -> Self {
+        self.readable_root = Some(root);
+        self
     }
 
     /// Configure the quarantine write path (Sprint 9 Slice 2): `root` is the pinned quarantine root fd
@@ -504,12 +509,12 @@ impl Dispatcher {
     /// the same shape as `fs_read`'s `readable_root`). Every `file-chunk`'s confined open resolves
     /// BENEATH this fd. Without it, the write path is inert (a `file-chunk` routes to the handler
     /// unchanged); a serving proxy always sets it (the lifecycle ladder validates the FS roots first).
+    /// A builder method taking `self` — see [`Dispatcher::with_readable_root`] for why both setters
+    /// compose rather than each defaulting the other away.
     #[must_use]
-    pub fn with_quarantine_root(root: OwnedFd) -> Self {
-        Dispatcher {
-            quarantine_root: Some(root),
-            ..Dispatcher::new()
-        }
+    pub fn with_quarantine_root(mut self, root: OwnedFd) -> Self {
+        self.quarantine_root = Some(root);
+        self
     }
 
     /// **Test-only** ([`cfg(test)`]): a dispatcher whose net-payload reassembly is bounded by an

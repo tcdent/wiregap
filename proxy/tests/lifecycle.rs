@@ -154,20 +154,23 @@ fn a_failed_privilege_drop_closes_and_never_serves() {
 /// empty → closed); the config-pending authorities fail closed, never silently pass.
 #[test]
 fn production_validator_placeholders_fail_closed_register_is_real() {
-    assert!(validate_authority(Authority::RouteRegister, ROUTES, None));
-    assert!(!validate_authority(Authority::RouteRegister, &[], None), "an empty register is no authority");
-    // Still config-pending → fail closed regardless of the credential.
-    for authority in [Authority::FilesystemRoots, Authority::KernelProtections] {
-        assert!(
-            !validate_authority(authority, ROUTES, None),
-            "{authority:?} must fail closed pending config, not silently pass",
-        );
-    }
+    assert!(validate_authority(Authority::RouteRegister, ROUTES, None, None));
+    assert!(!validate_authority(Authority::RouteRegister, &[], None, None), "an empty register is no authority");
+    // Sprint 16: FilesystemRoots is REAL now — it derives from the resolved roots, so `None`
+    // (a failed or absent resolution) fails closed. KernelProtections is still config-pending.
+    assert!(
+        !validate_authority(Authority::FilesystemRoots, ROUTES, None, None),
+        "unresolved filesystem roots must fail closed, not silently pass",
+    );
+    assert!(
+        !validate_authority(Authority::KernelProtections, ROUTES, None, None),
+        "KernelProtections must fail closed pending its probe, not silently pass",
+    );
     // Sprint 11: the credential rung is REAL now — present-iff-supplied (no config DSL invented).
-    assert!(!validate_authority(Authority::Credential, ROUTES, None), "a missing credential fails closed");
+    assert!(!validate_authority(Authority::Credential, ROUTES, None, None), "a missing credential fails closed");
     let cred = Credential::new("sk-test-key".into());
     assert!(
-        validate_authority(Authority::Credential, ROUTES, Some(&cred)),
+        validate_authority(Authority::Credential, ROUTES, Some(&cred), None),
         "a supplied credential satisfies the rung",
     );
 }
@@ -186,7 +189,7 @@ fn production_ladder_holds_closed_pending_config_but_drops_first() {
             drop_log.borrow_mut().push("drop");
             Ok(())
         },
-        |authority| validate_authority(authority, ROUTES, None),
+        |authority| validate_authority(authority, ROUTES, None, None),
         |_reply, _ev| ControlFlow::Continue(()),
     );
     assert_eq!(
@@ -214,7 +217,7 @@ fn missing_credential_closes_the_whole_proxy() {
         },
         // Every authority passes EXCEPT the (absent) credential rung.
         |authority| match authority {
-            Authority::Credential => validate_authority(Authority::Credential, ROUTES, None),
+            Authority::Credential => validate_authority(Authority::Credential, ROUTES, None, None),
             _ => true,
         },
         |_reply, _ev| ControlFlow::Continue(()),
@@ -228,7 +231,7 @@ fn missing_credential_closes_the_whole_proxy() {
     assert_eq!(*deliveries.borrow(), 0);
     // With the credential supplied, that rung passes.
     let cred = Credential::new("sk-test".into());
-    assert!(validate_authority(Authority::Credential, ROUTES, Some(&cred)));
+    assert!(validate_authority(Authority::Credential, ROUTES, Some(&cred), None));
 }
 
 // ── Sprint 10 Slice 1: the reply seam (R-c reversal), hardware-free ──────────────────────────────────
@@ -446,4 +449,75 @@ fn run_adapter_observer_can_break_the_loop() {
         adapter,
     );
     assert_eq!(*count.borrow(), 1, "the loop stopped after the observer broke — the second delivery was not processed");
+}
+
+// ─── Sprint 16 Slice 4 — the milestone ───────────────────────────────────────────────────────────
+
+/// **THE MILESTONE (Sprint 16, claim (i)): all four authority rungs validate for real, and the ladder
+/// reaches `Served`.** Until this sprint two rungs were hardcoded `false`, so `Served` was unreachable
+/// by construction no matter how correct the environment.
+///
+/// Every rung here is its **real, sprint-built validator** against a **real configured value** — the
+/// compiled register; roots resolved by the same `assemble` the binary calls (the quarantine genuinely
+/// pinned, the readable root a genuinely readable directory); `KernelProtections` genuinely probing that
+/// pinned fd's mount for `noexec,nosuid,nodev` plus `openat2` RESOLVE availability; a genuinely non-empty
+/// credential. **Only the NIC leg is faked**, and only because it was already discharged live on real
+/// hardware in Sprints 8 and 14 — this claim is hardware-independent, so proving it hardware-free keeps
+/// it fresh-re-runnable forever rather than resting on a capture.
+///
+/// **WHAT THIS DOES NOT CLAIM.** Reaching `Served` means every authority *validated*, not that the proxy
+/// is serving traffic end-to-end. Two things stay outside it, deliberately:
+///
+/// 1. **The live round-trip** (claim (ii)) — a real 82599, a connected head, a real upstream call — is a
+///    separate hardware capture this sprint does not require.
+/// 2. **Quarantine WRITABILITY is not an authority.** The rungs prove the quarantine is pinned and sits
+///    on a properly-protected mount; they do **not** prove the dropped uid can write into it. A
+///    directory that is root-owned `0755` satisfies every rung above and still fails at the first
+///    `file-chunk`. So "all four rungs validate" must never be reported as "the proxy is servable" or
+///    "writes will work" — whichever mechanism provisions the quarantine (systemd `RuntimeDirectory=`
+///    with `User=`/`Group=`/`RuntimeDirectoryMode=`, or an explicit `chown`) must make it writable by
+///    the drop-target uid, and that is a **provisioning** obligation this ladder cannot check.
+///
+/// This test uses `/run` as the quarantine — a real mount carrying all three flags, pinned read-only —
+/// precisely because the rungs need a *protected* mount and nothing more. That it is not writable by
+/// this user is the point of the hedge above, not a flaw in the fixture.
+#[test]
+fn milestone_all_four_authority_rungs_validate_for_real_and_the_ladder_serves() {
+    use proxy::lifecycle::assemble;
+    use proxy::register::net::ROUTES as REAL_ROUTES;
+
+    let readable = std::env::temp_dir().join(format!("proxy-s16-milestone-{}", std::process::id()));
+    std::fs::create_dir_all(&readable).unwrap();
+
+    // The REAL assembly — the same function `serve.rs`'s `main` calls.
+    let assembly = assemble("/run", readable.to_str().unwrap());
+    let roots = assembly.roots.expect("a protected quarantine mount and a readable root");
+    let credential = Credential::new("sk-milestone-value".into());
+
+    // Every rung, its real validator, against these real values — asserted individually first so a
+    // failure names WHICH rung, then driven through the ladder itself.
+    for authority in AUTHORITIES {
+        assert!(
+            validate_authority(*authority, REAL_ROUTES, Some(&credential), Some(&roots)),
+            "{authority:?} must validate for real — it is no longer a placeholder",
+        );
+    }
+
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let (mut nic, _deliveries) = fake_nic(vec![], &log);
+    let readiness = serve(
+        &mut nic,
+        || Ok(()), // the real drop is exercised on hardware (Sprint 8's IB2); not this claim's subject
+        |authority| validate_authority(authority, REAL_ROUTES, Some(&credential), Some(&roots)),
+        |_reply, _event| ControlFlow::Continue(()),
+    );
+
+    assert_eq!(
+        readiness,
+        Readiness::Served,
+        "with all four authorities real and satisfied, the ladder must reach Served",
+    );
+    assert_eq!(log.borrow().as_slice(), &["run"], "run was entered — rung 4 opened");
+
+    let _ = std::fs::remove_dir_all(&readable);
 }

@@ -358,10 +358,12 @@ where
 /// `&mut Dispatcher` sequentially within this single-threaded closure — never an `Arc`/`Mutex`, never a
 /// second thread touching the `Dispatcher`.
 ///
-/// **Held (Task 20):** the live quiescent-arrival liveness of **both** ingresses — a head keystroke on
-/// an idle pty and an upstream response during box-silence deadlock identically absent the reactor's
-/// bounded park. The composition makes the head's share of that dependency explicit; it does not add a
-/// new one.
+/// **Quiescent-arrival liveness: DISCHARGED** (Sprint 14, on real hardware). A head keystroke on an idle
+/// pty and an upstream response during box-silence both reach the box without any proxy-side mechanism:
+/// the reactor's own bounded wait re-checks on its own, so a quiescent arrival is drained on the very
+/// next tick. Measured live at ~100µs, far inside the ~5ms worst-case ceiling. The proxy-side `idle_cap`
+/// this once depended on was dropped as counterproductive — it was *above* the reactor's native
+/// ceiling, so it only ever raised the worst-case wake.
 pub fn run_adapter_composed<S, O>(
     mut dispatcher: Dispatcher,
     register: &'static [Route],
@@ -378,7 +380,8 @@ where
     let mut pending_head: Option<HeadFrame> = None;
     move |reply, event| {
         // 1a. Drain the upstream ingress (non-blocking): a response arriving while the box is silent
-        //     reaches the box on this tick — given Task 20 woke the tick. Backpressure, never drop.
+        //     reaches the box on this tick — the reactor's own bounded wait guarantees the tick runs
+        //     (Sprint 14, proven live). Backpressure, never drop.
         ingress.drain(&mut dispatcher);
         // 1b. Drain head→box frames: request-file opaque-relayed (Sprint 15), pty input routed with
         //     backpressure (fail-safe on an unknown/stale display; a full box queue retains + stops).

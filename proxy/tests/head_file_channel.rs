@@ -118,7 +118,7 @@ fn proxy_authored_host_listing_reaches_the_box_never_the_head() {
     let (worker_sock, mut fake_head) = UnixStream::pair().unwrap();
     let conn = HeadConnection::spawn(worker_sock).unwrap();
     let mut adapter = run_adapter_with_head(
-        Dispatcher::with_readable_root(sc.dir.clone()),
+        Dispatcher::new().with_readable_root(sc.dir.clone()),
         ROUTES,
         VETTED_TOOLS,
         conn,
@@ -156,7 +156,7 @@ fn head_origin_list_of_the_trusted_host_never_reaches_the_confined_reader() {
     let (worker_sock, mut fake_head) = UnixStream::pair().unwrap();
     let conn = HeadConnection::spawn(worker_sock).unwrap();
     let mut adapter = run_adapter_with_head(
-        Dispatcher::with_readable_root(sc.dir.clone()),
+        Dispatcher::new().with_readable_root(sc.dir.clone()),
         ROUTES,
         VETTED_TOOLS,
         conn,

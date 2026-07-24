@@ -59,10 +59,20 @@ acts on, which is net + file addressing on the *box* boundary, not here.)
   untrusted ground; input structure is **not a trusted surface** (`CITE(proto: model.md`
   §8 Input events; `proxy: terminal.md` §4`)`). No reflection: the display and input
   channels are split and one-directional; no query frame exists.
-- **Proxy-authored toward the head:** `file-data`/`file-error`/`list-entry` per
-  `library.md` §7's consumer table — cited **with that table's own status: illustrative,
-  "for the team to refine against the actual binaries"** (GB3: the head-decodes-
-  `file-data` leg is not hardened here beyond what the source claims).
+- **Proxy-authored toward the head: none — and this is now a proven disjointness, not an
+  omission.** `library.md` §7's consumer table (cited **with its own status: illustrative,
+  "for the team to refine against the actual binaries"**) reads as though the proxy authors
+  `file-data`/`file-error`/`list-entry` *toward the head*; the built system refines that
+  against the actual binaries, as the table invites. Proxy-authored `file-data`/
+  `list-entry`/`file-error` are answers to **box**-initiated operations — a `file-read` or
+  `list` of the *trusted host's* readable root, served by the proxy's own confined reader —
+  and they flow **to the box**, never to the head. That direction is a **security floor**,
+  not a routing detail: a proxy-authored host listing reaching the head would expose the
+  trusted-host filesystem the head must never see. Sprint 15 built the head-browse channel
+  on exactly this split — origination-keyed routing, with the head-facing relay
+  capability-narrowed so it cannot reach the confined reader at all — and proved both
+  directions disjoint with distinguishing canaries. What the head *does* receive under
+  these verbs is **box-authored and relayed opaquely** (the box→head bullet above).
 
 ## 2. Head-side policies — cited as the head's, never owned here
 

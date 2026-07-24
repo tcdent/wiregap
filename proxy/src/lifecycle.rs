@@ -22,6 +22,8 @@
 
 use std::io;
 use std::ops::ControlFlow;
+use std::os::fd::{AsFd, OwnedFd};
+use std::path::PathBuf;
 
 use directpath::{Bdf, Event, SessionId, Subsystem};
 
@@ -159,21 +161,167 @@ pub fn validate_authority(
     authority: Authority,
     register: &[Route],
     credential: Option<&Credential>,
+    roots: Option<&ValidatedRoots>,
 ) -> bool {
     match authority {
         // Real now — no external config needed; the register's own presence is its authority.
         Authority::RouteRegister => !register.is_empty(),
-        // Pending the config DSL — fail closed (named placeholders). Each is where the config check lands:
-        //   FilesystemRoots  → resolve + stat the quarantine/readable roots from cfg.
-        //   KernelProtections→ statfs the quarantine (noexec/nosuid/nodev) + probe openat2 RESOLVE.
-        Authority::FilesystemRoots => false,
-        Authority::KernelProtections => false,
-        // **REAL now (Sprint 11)** — the upstream credential is a composition-root parameter, no config
-        // DSL invented. Present-iff-supplied: a **missing** credential holds the **whole** proxy closed
+        // **REAL now (Sprint 16)** — the roots were resolved ONCE by `assemble` from the compiled
+        // `RootPath` constants: the quarantine pinned via `pin_root`, the readable root proven a
+        // readable directory. `Some` means that resolution succeeded and the pinned fd the proxy will
+        // serve from is in hand; `None` means it failed (named by `RootFailure`) and the whole proxy
+        // stays closed. The check derives entirely from the configured value — it cannot pass on a bad
+        // root, and it cannot fail on a good one.
+        Authority::FilesystemRoots => roots.is_some(),
+        // **REAL now (Sprint 16)** — the kernel-enforced floor this design leans on is verified to be
+        // actually in effect, rather than trusted unchecked (`architecture.md` §9's standing "verify at
+        // boot" convention). Two probes, both against the SAME pinned quarantine fd `FilesystemRoots`
+        // obtained (bind-the-chain: the mount probed is the mount written to):
+        //   1. `fstatfs` on that fd → the mount carries `noexec`, `nosuid`, AND `nodev`.
+        //   2. an `openat2` under the real RESOLVE mask → the confinement mechanism every confined
+        //      write depends on is available on this kernel.
+        // The required flags are compile-time constants with no config surface: a configurable security
+        // floor is a weakenable one. No roots (a failed resolution) → no fd to probe → closed.
+        Authority::KernelProtections => roots.is_some_and(|r| kernel_protections_hold(r.quarantine())),
+        // **REAL** — the upstream credential, resolved from its compiled `CredentialSource` descriptor
+        // (Sprint 16; the descriptor names the env var, never the value — `architecture.md` §8's
+        // custody-is-the-configured-thing). A **missing** credential holds the **whole** proxy closed
         // (all-or-none ladder); a supplied one satisfies this rung (full serving still awaits the other
         // config-pending authorities above). Supplying a credential does NOT by itself open serving.
-        Authority::Credential => credential.is_some(),
+        //
+        // **Present AND non-empty.** `Credential::from_env_value` already treats a set-but-empty
+        // variable as absent, so this is the rung's own second floor: an empty credential fails closed
+        // however it was constructed, not only when it came through that path. An authority that
+        // accepted an empty secret would be open while reporting itself validated.
+        Authority::Credential => credential.is_some_and(|c| !c.is_empty()),
     }
+}
+
+/// **The two filesystem roots, resolved once and validated** (Sprint 16) — the artifact the
+/// `FilesystemRoots` authority rung reports on, and the one the serving proxy actually uses.
+///
+/// **Bind-the-chain: resolved ONCE.** The quarantine root is pinned a single time, here; the resulting
+/// open file description is what the `Dispatcher` writes beneath and what `KernelProtections` probes.
+/// Re-deriving it from the path at each step would mean the directory validated, the directory probed,
+/// and the directory served from are three separate resolutions of a mutable path — a TOCTOU window on
+/// the exact ground the box writes to. The same discipline as `recognized == reassembled == forwarded`
+/// on the net path: **validated == probed == used**.
+#[derive(Debug)]
+pub struct ValidatedRoots {
+    /// The pinned quarantine root — an `O_PATH|O_DIRECTORY|O_NOFOLLOW` fd from the certified
+    /// [`pin_root`](crate::open_discipline::pin_root). Held so `KernelProtections` can probe *this* fd.
+    quarantine: OwnedFd,
+    /// The resolved readable root. A plain path by design (below).
+    readable: PathBuf,
+}
+
+impl ValidatedRoots {
+    /// A borrow of the pinned quarantine root, for probing **the same** fd that will be served from.
+    #[must_use]
+    pub fn quarantine(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.quarantine.as_fd()
+    }
+
+    /// The resolved readable root.
+    #[must_use]
+    pub fn readable(&self) -> &std::path::Path {
+        &self.readable
+    }
+}
+
+/// Why a filesystem root failed to validate — named, so the operator learns *which* root and *why*
+/// rather than only that the proxy closed (`§7`, refusal-is-the-signal). The ladder still reports the
+/// rung as `Closed(FilesystemRoots)`; this is the detail alongside it.
+#[derive(Debug)]
+pub enum RootFailure {
+    /// The quarantine root could not be pinned: absent, not a directory, a symlink at the final
+    /// component, or otherwise unopenable.
+    Quarantine(io::Error),
+    /// The readable root could not be resolved or read as a directory.
+    Readable(io::Error),
+}
+
+impl core::fmt::Display for RootFailure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            RootFailure::Quarantine(e) => write!(f, "quarantine root: {e}"),
+            RootFailure::Readable(e) => write!(f, "readable root: {e}"),
+        }
+    }
+}
+
+/// Resolve and validate both filesystem roots — **asymmetrically, by design** (Sprint 16).
+///
+/// The two roots carry different risk and so get different floors; symmetrizing them would be
+/// over-specification, not extra safety:
+/// - **The quarantine root is PINNED** via the certified `pin_root`
+///   (`O_PATH|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`). This is the ground the box's bytes land on, so its
+///   validation *is* the confinement anchor: the flags reject a missing path, a non-directory, and a
+///   symlink at the final component in one syscall, and the surviving fd is what every confined write
+///   resolves beneath.
+/// - **The readable root is plainly resolved** and checked to be a readable directory. Reading is
+///   harmless (`filesystem.md` §4–§5: its breadth is "sanity, not safety"), so it needs no pinned-fd
+///   confinement — a `read_dir` both proves directory-ness and catches the unreadable/unsearchable case
+///   that a bare `stat` would miss.
+///
+/// Fail-closed and total: any failure returns [`RootFailure`], never a partially-validated pair.
+pub fn resolve_roots(quarantine: &str, readable: &str) -> Result<ValidatedRoots, RootFailure> {
+    // Pin the quarantine ONCE — this fd is the one that gets probed and served from.
+    let quarantine = crate::open_discipline::pin_root(quarantine).map_err(RootFailure::Quarantine)?;
+    // The readable root: resolve + prove it is a directory we can actually read.
+    let readable_path = PathBuf::from(readable);
+    std::fs::read_dir(&readable_path).map_err(RootFailure::Readable)?;
+    Ok(ValidatedRoots { quarantine, readable: readable_path })
+}
+
+/// Do the kernel-enforced protections hold for this **pinned** quarantine directory? Both halves must:
+/// the mount carries `noexec,nosuid,nodev`, and `openat2`'s RESOLVE confinement is available. Fail
+/// closed on any probe error — an unreadable answer is not a satisfied authority.
+#[must_use]
+pub fn kernel_protections_hold(quarantine: std::os::fd::BorrowedFd<'_>) -> bool {
+    let protections_ok = crate::open_discipline::mount_protections(quarantine)
+        .map(|p| p.all_present())
+        .unwrap_or(false);
+    protections_ok && crate::open_discipline::openat2_resolve_available(quarantine)
+}
+
+/// **The one composition-root assembly** (Sprint 16): compiled root paths → validated, pinned roots →
+/// a `Dispatcher` holding both. `serve.rs`'s `main` calls this, and so do this sprint's tests — there is
+/// no test replica of the wiring, so what the tests prove is what the binary runs.
+///
+/// Total by construction: a root failure does **not** abort here. It yields a rootless `Dispatcher`
+/// (both file channels inert) plus the named failure, so the startup ladder can report
+/// `Closed(FilesystemRoots)` in the ordinary way instead of the binary dying with an unnamed error and
+/// losing the all-or-none ladder's whole point.
+///
+/// The `Dispatcher` receives a **duplicate descriptor of the same pinned directory** (`dup(2)`, one open
+/// file description) — not a second `pin_root` of the path. Two descriptors, one resolution: the chain
+/// stays bound.
+#[must_use]
+pub fn assemble(quarantine: &str, readable: &str) -> Assembly {
+    match resolve_roots(quarantine, readable) {
+        Ok(roots) => match roots.quarantine.try_clone() {
+            Ok(for_dispatcher) => {
+                let dispatcher = Dispatcher::new()
+                    .with_quarantine_root(for_dispatcher)
+                    .with_readable_root(roots.readable.clone());
+                Assembly { dispatcher, roots: Ok(roots) }
+            }
+            // Duplicating an already-pinned fd essentially cannot fail (no path lookup, no permissions);
+            // if the process is out of descriptors, fail closed like any other root failure.
+            Err(e) => Assembly { dispatcher: Dispatcher::new(), roots: Err(RootFailure::Quarantine(e)) },
+        },
+        Err(why) => Assembly { dispatcher: Dispatcher::new(), roots: Err(why) },
+    }
+}
+
+/// What [`assemble`] produces: the `Dispatcher` the proxy serves with, and the validated roots the
+/// `FilesystemRoots` rung reports on (or the named failure that closes it).
+pub struct Assembly {
+    /// The dispatcher, holding **both** roots on success; rootless (file channels inert) on failure.
+    pub dispatcher: Dispatcher,
+    /// The validated roots, or why they failed.
+    pub roots: Result<ValidatedRoots, RootFailure>,
 }
 
 /// The composition-root configuration for [`bring_up`] — every non-closure input the ladder needs,
@@ -196,6 +344,9 @@ pub struct BringUpConfig<'a> {
     pub register: &'a [Route],
     /// The upstream credential (Sprint 11) — `None` holds the **whole** proxy closed (all-or-none ladder).
     pub credential: Option<&'a Credential>,
+    /// The validated filesystem roots from [`assemble`] (Sprint 16) — `None` (a failed resolution) holds
+    /// the **whole** proxy closed at the `FilesystemRoots` rung, same all-or-none rule.
+    pub roots: Option<&'a ValidatedRoots>,
 }
 
 /// The production bring-up (capture-model — needs the real 82599). Climbs the ladder end to end:
@@ -210,7 +361,7 @@ pub fn bring_up<F>(config: BringUpConfig<'_>, on_event: F) -> io::Result<Readine
 where
     F: FnMut(&mut dyn Reply, Event) -> ControlFlow<()>,
 {
-    let BringUpConfig { local, allowlist, peer_mac, uid, gid, register, credential } = config;
+    let BringUpConfig { local, allowlist, peer_mac, uid, gid, register, credential, roots } = config;
     // Rungs 1–2: privileged bring-up + transport up (real hardware). Atomic — `?` yields no subsystem.
     // `Endpoint::Proxy` is the proxy's FIXED identity (it originates response sessions from the high
     // half of the id space; directpath maps it to `Originator::High`) — a constant of what this binary
@@ -241,7 +392,7 @@ where
     Ok(serve(
         &mut nic,
         drop_privilege,
-        |authority| validate_authority(authority, register, credential),
+        |authority| validate_authority(authority, register, credential, roots),
         on_event,
     ))
 }
