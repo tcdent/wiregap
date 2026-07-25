@@ -47,6 +47,49 @@ pub fn assemble(addr: &Address) -> Option<String> {
     Some(out)
 }
 
+
+// ─── RULING: the four validated newtypes stay four separate blocks (Sprint 20 Slice 7) ───────────────
+//
+// The audit's candidate: `Route`, `RootPath`, `ToolIdentity` (here) and `CredentialSource`
+// (`credential.rs`) are each `pub struct X(&'static str)` + a `const fn` constructor whose `assert!`
+// runs a validator + a `const fn` accessor. Same shape ~4 times, written across different sprints. The
+// question was whether to unify behind a shared generic or macro. **Decision: no. Confirmed as four
+// separate blocks.** Recorded here rather than in a sprint doc so the next person tempted by it is
+// standing in front of the reasoning.
+//
+// **1. It would not save meaningfully, and would cost auditability.** The shared skeleton is ~8 lines of
+// body per type — ~32 lines total. A macro definition plus four invocations lands at roughly break-even
+// on line count. What it is NOT break-even on is the bypass audit.
+//
+// **2. C1 and the U5 bypass audit would change CHARACTER, which is the decisive point.** Both rest on
+// "`new`/`env` is the only constructor". Today that is verifiable by *reading the impl block* — the field
+// is private, one constructor is present, nothing else can build the type, and
+// `tests/ui/credential_source_no_literal_bypass.rs` pins it with a compile-fail (`E0603`). Behind a
+// macro the same property becomes "true by macro expansion": an auditor must reason that the macro
+// *cannot* generate an additional constructor, for every invocation, instead of reading four short
+// blocks. That is a harder audit of the crate's most security-relevant compile-time guarantee, traded
+// for ~nothing. `C5` ("boring, not clever") applies — and here it is not merely taste, it is what keeps
+// the security audit cheap.
+//
+// **3. Two of the four deliberately differ in NAMES, for reasons the audit depends on.**
+// `CredentialSource` uses `env` (not `new`) and `var_name` (not `as_str`). Those names carry the type's
+// whole story: it names a *location*, not a value, and its accessor returns something *safe to log*.
+// "There is no value-carrying constructor" reads much weaker if the constructor is called `new`. A macro
+// either flattens those names — losing the semantics — or takes them as parameters, which puts the
+// per-type text back that the macro existed to remove.
+//
+// **4. The premise moved under the candidate.** Sprint 20 Slice 3 relocated `CredentialSource` (and its
+// validator) to `credential.rs`. They are no longer co-located: three here, one there. A macro would now
+// need exporting across a module boundary to serve a pattern that is not even in one file. `Route` also
+// grew `split` (the crate's one route decomposition), which no sibling has — so it is "the same shape
+// 3.5 times", not four.
+//
+// **WHAT WOULD REOPEN THIS.** Not a general "if it gets bigger": specifically, if several MORE such
+// types appear *and* they genuinely share the constructor/accessor names (i.e. the `CredentialSource`
+// divergence turns out to be the exception rather than the pattern), the line-count and
+// consistency-drift arguments start to outweigh the audit cost. At four — two of which differ by
+// design — they do not.
+
 /// A canonical route the register (U5) holds and the matcher (U3) byte-exact compares an
 /// assembled [`Address`] against. Its interior is the canonical [`assemble`] form.
 ///
@@ -141,51 +184,6 @@ impl RootPath {
     }
 }
 
-/// **Where the upstream credential comes from** — never the credential itself (Sprint 16).
-///
-/// `architecture.md` §8 makes the credential's **custody** the configured thing ("proxy-attached vs
-/// on-box is explicitly an operational decision"), not its value. So this descriptor names an
-/// **environment variable**, compiled in and structurally validated like every other register entry;
-/// the secret itself is read from that variable at startup and **never appears in source** (Sprint 11's
-/// standing rule: a live secret is not committed, independent of anything proxy-specific).
-///
-/// What compiling the *descriptor* buys — stated plainly, because it is real but modest: it fixes **the
-/// one place the proxy will ever look**, so no runtime input can redirect the credential's source, and
-/// the register's C1/C3 properties hold (the box cannot author it; a malformed name will not compile).
-/// It is deliberately **not** the same security weight as [`Route`], which fixes an effect boundary —
-/// this fixes a lookup location.
-///
-/// The interior is **private** and holds only a variable *name*; the **only** constructor is
-/// [`CredentialSource::env`]. There is no constructor, field, or variant that can carry a secret
-/// **value**, so "a literal secret compiled into the register" is not merely discouraged — it is
-/// *inexpressible* (bypass audit, `tests/ui/credential_source_no_literal_bypass.rs`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct CredentialSource(&'static str);
-
-impl CredentialSource {
-    /// Name the environment variable the upstream credential is read from, **structure-validated at
-    /// compile time** in a `const` context: an empty or malformed variable name is a compile error.
-    /// Validity is the POSIX environment-variable-name shape, `[A-Za-z_][A-Za-z0-9_]*` — structural
-    /// only; *which* variable (and what it holds) stays the operator's call.
-    ///
-    /// # Panics
-    /// Panics (→ compile error in a `const`) if `var_name` is not a well-formed env-var name.
-    #[must_use]
-    pub const fn env(var_name: &'static str) -> Self {
-        assert!(
-            is_env_var_name(var_name),
-            "malformed credential source: expected a non-empty [A-Za-z_][A-Za-z0-9_]* env var name",
-        );
-        CredentialSource(var_name)
-    }
-
-    /// The environment variable's name — the only thing this descriptor carries. Safe to log: it is a
-    /// variable *name*, never the secret it holds.
-    #[must_use]
-    pub const fn var_name(&self) -> &'static str {
-        self.0
-    }
-}
 
 /// A vetted client-side tool identity (JA-1) as a typed newtype, so a raw `&str` **never** reaches
 /// U4's recognizer — the recognizer consumes `ToolIdentity`, not an unchecked string.
@@ -312,30 +310,6 @@ const fn is_absolute_root_path(s: &str) -> bool {
     true
 }
 
-/// An environment-variable-name validator: the POSIX shape `[A-Za-z_][A-Za-z0-9_]*` — non-empty, no
-/// leading digit, no `=`, no whitespace, no punctuation. Const, flat byte-walk, total on every `&str`.
-/// Structural only; *which* variable is the operator's call. A name outside this shape could not name
-/// a real variable, so rejecting it at compile time turns a silently-never-resolving credential source
-/// into a build failure.
-const fn is_env_var_name(s: &str) -> bool {
-    let b = s.as_bytes();
-    if b.is_empty() {
-        return false;
-    }
-    // First byte: a letter or underscore — never a digit (a leading digit is not a valid name).
-    if !(b[0].is_ascii_alphabetic() || b[0] == b'_') {
-        return false;
-    }
-    let mut i = 1;
-    while i < b.len() {
-        let c = b[i];
-        if !(c.is_ascii_alphanumeric() || c == b'_') {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
 
 /// A tool-identity validator: a non-empty token over `[A-Za-z0-9_]` (the tool-type charset —
 /// `text_editor_20250728`, `bash_20250124`). Const, flat byte-walk. Structural only; trust is the
@@ -363,7 +337,7 @@ mod validator_proof {
     //! that closes the one real risk of a const twin: `classify_safe_byte` must agree with
     //! `proto::scan_safe`'s alphabet over all 256 bytes, or a route could be compile-valid yet
     //! never match a runtime address (or vice-versa). Oracle = `proto::scan_safe` (independent).
-    use super::{classify_safe_byte, is_absolute_root_path, is_canonical_route, is_env_var_name, is_tool_identity};
+    use super::{classify_safe_byte, is_absolute_root_path, is_canonical_route, is_tool_identity};
 
     const US: u8 = 0x1F;
 
@@ -414,26 +388,6 @@ mod validator_proof {
         assert!(!is_absolute_root_path("/a\0b")); // interior NUL — no C path can carry one
     }
 
-    /// The env-var-name validator's own boundaries (Sprint 16) — the compile-time gate on the credential
-    /// SOURCE is only as sound as this check. Both arms proven: well-formed names accept (so the gate is
-    /// not vacuously-closed), malformed ones reject.
-    #[test]
-    fn env_var_name_validator_boundaries() {
-        assert!(is_env_var_name("ANTHROPIC_API_KEY")); // the registered one
-        assert!(is_env_var_name("_")); // bare underscore is a legal name
-        assert!(is_env_var_name("_x9")); // leading underscore, digits after the first byte
-        assert!(is_env_var_name("a")); // single letter
-        assert!(!is_env_var_name("")); // empty — the case the const gate must reject
-        assert!(!is_env_var_name("1KEY")); // leading digit
-        assert!(!is_env_var_name("ANTHROPIC-API-KEY")); // '-' — a plausible typo, cannot name a var
-        assert!(!is_env_var_name("A B")); // space
-        assert!(!is_env_var_name("A=B")); // '=' — the env-string separator
-        assert!(!is_env_var_name("KEY$")); // punctuation
-        assert!(!is_env_var_name("clé")); // non-ASCII
-        // A pasted SECRET does not look like a variable name — the gate catches the paste-in-the-wrong-
-        // -place mistake structurally, on top of the value being inexpressible at all (bypass audit).
-        assert!(!is_env_var_name("sk-ant-api03-XXXX"));
-    }
 
     /// STACKS-LEVEL agreement (reviewer's Slice-3b finding, closed here): `is_canonical_route`
     /// twins `proto::scan_safe`'s **structure** (empty-segment, traversal, ≥1-alnum) as well as its

@@ -23,6 +23,11 @@ extern crate alloc;
 
 pub mod vocab;
 
+/// Sprint 20 — the upstream credential in one place: the compile-time descriptor
+/// (`CredentialSource`) and the runtime value (`Credential`) with its resolution policy, co-located
+/// so the one secret in the system is readable in a single sitting.
+pub mod credential;
+
 pub mod register;
 
 pub mod address;
@@ -41,6 +46,10 @@ pub mod upstream;
 /// knowledge, so the response can be relayed verbatim (`net.md` §3) rather than parsed and re-shaped.
 /// **Outbound, client-side only** — the proxy is a TLS client to the upstream and never a TLS server;
 /// the box terminates its own TLS and the project wire carries plaintext (`cloud/approach.md`).
+/// Sprint 20 — the dial: the concrete Anthropic client implementing `upstream`'s seam over
+/// `upstream_tls`'s verified pipe. Depends on `upstream`; `upstream` does not depend on it.
+pub mod upstream_dial;
+
 pub mod upstream_tls;
 
 #[cfg(unix)]

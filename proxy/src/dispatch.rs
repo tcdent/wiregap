@@ -190,8 +190,25 @@ pub enum RelayKind {
 /// push stream holds this many un-drained frames, [`Dispatcher::enqueue_net_response`] returns
 /// [`Enqueue::Full`] —
 /// **backpressure to the ingress** (it must stop reading upstream/head and retry after the box drains),
-/// never a drop, never unbounded growth. Provisional scalar (marked for review), the outbound analog of
-/// the transport ring depth / `REASSEMBLY_CAP`.
+/// never a drop, never unbounded growth. The outbound analog of the transport ring depth /
+/// `REASSEMBLY_CAP`.
+///
+/// **Reviewed and confirmed at 64 (2026-07-25),** with its memory product stated rather than left
+/// implicit — and the product has **three** terms, not two:
+///
+/// - a queued frame is bounded by its source: `upstream::RESPONSE_CHUNK` (16 KiB) for a net-response,
+///   `head::HEAD_FRAME_MAX` (1 MiB) for a head frame relayed by `route_head_input`;
+/// - this cap bounds one queue at 64 frames, so **64 MiB** per session in the worst case;
+/// - but `replies` is keyed **by session**, so the crate-level bound is 64 MiB ×
+///   *sessions-with-live-reply-streams-per-epoch*.
+///
+/// **That third multiplier is a known, still-open residual, not a new gap.** [`close_session`](Dispatcher::close_session)
+/// is the eviction hook and it is never called from `src/` — only from `tests/dispatch.rs` — because the
+/// transport session-close signal that would drive it does not exist yet (the standing Sprint-7 `MB4`
+/// residual, documented at [`Dispatcher`]'s own binding-map note). Confirmed still current at this
+/// review. The finding here is not the residual, which was already known; it is that nobody had landed
+/// it *on top of a cap* before, so "64 MiB per session" was being read as the bound when it is only one
+/// factor of it. See `head::HEAD_CHANNEL_CAP` for the sibling cross-cap observation.
 pub const REPLY_QUEUE_CAP: usize = 64;
 
 /// The result of enqueuing a push-reply frame — the flow-control signal to the ingress.
@@ -252,7 +269,7 @@ impl ReplySource {
     fn next_frame(&mut self) -> Pull {
         match self {
             ReplySource::File { reader, in_reply_to } => match reader.next_chunk() {
-                ReadStep::Data(chunk) => {
+                ReadStep::Item(chunk) => {
                     let body = encode_message(&Message::FileData(FileData(chunk)));
                     Pull::Body(task16_stub_reply_frame(*in_reply_to, &body))
                 }
@@ -260,7 +277,7 @@ impl ReplySource {
                 ReadStep::Eof | ReadStep::Error(_) => Pull::Done,
             },
             ReplySource::Dir { reader, in_reply_to } => match reader.next_entry() {
-                DirStep::Entry(e) => {
+                DirStep::Item(e) => {
                     let body = encode_message(&Message::ListEntries(ListEntries(alloc::vec![e])));
                     Pull::Body(task16_stub_reply_frame(*in_reply_to, &body))
                 }
@@ -999,6 +1016,43 @@ impl Dispatcher {
     ///   silent structural noise ([`Routed::FileChunkNoWriter`]) → no notification.
     /// - **No notification**: unsupported/mismatched verbs (JC-2, never bound to a service — ruling C),
     ///   other structural rejects (JC-3a), `file-chunk`-no-writer noise, and every non-deny verdict.
+    ///
+    /// **WHY THE `Enqueue` IS DISCARDED HERE — the reachability property, written down (Sprint 20).**
+    ///
+    /// This is the only one of the four [`push_reply_frame`](Self::push_reply_frame) callers that does
+    /// not act on the returned [`Enqueue`]. The other three either backpressure their producer
+    /// ([`route_head_input`](Self::route_head_input)) or propagate the condition to their caller
+    /// ([`enqueue_net_response`](Self::enqueue_net_response),
+    /// [`enqueue_net_error`](Self::enqueue_net_error)). Discarding it means that on `Full` the deny
+    /// notification is **silently dropped** and nobody is told — so it is correct only under a property,
+    /// and the property was previously unwritten and untested. Both are fixed here.
+    ///
+    /// **THE PROPERTY:**
+    ///
+    /// > *No session receives a deny verdict while its reply queue is already at
+    /// > [`REPLY_QUEUE_CAP`].*
+    ///
+    /// **Why `Full` is otherwise unreachable, precisely:** `push_reply_frame` resolves the stream with
+    /// `self.replies.entry(session).or_insert_with(...)`, and the inserted `ReplySource::Queue` starts
+    /// with an **empty** `frames`. So a session with no prior reply stream can never return `Full` on
+    /// its first push — `frames.len() >= REPLY_QUEUE_CAP` is `0 >= 64`, false. `Full` is reachable
+    /// **only** on a session that already carries an existing queue holding at least `REPLY_QUEUE_CAP`
+    /// frames.
+    ///
+    /// **WHAT WOULD INVALIDATE IT** — this is the part worth watching, because none of it is enforced
+    /// by the type system:
+    /// - any change letting a deny verdict fire on a session that already carries a *populated* reply
+    ///   queue (today the populating paths are `enqueue_net_response` and `route_head_input`);
+    /// - lowering `REPLY_QUEUE_CAP` toward the number of frames a live stream holds;
+    /// - a new caller of `notify_deny` reached from a context where replies are already in flight.
+    ///
+    /// The property depends on a transport-level invariant *outside this module* (what the wire permits
+    /// the box to send while a reply streams), so it cannot be discharged by reading `dispatch.rs`
+    /// alone. `notify_deny_on_a_full_queue_drops_the_notification` pins the observable behaviour.
+    ///
+    /// **Deliberately NOT fixed by making this propagate like its siblings.** That needs an answer to
+    /// "backpressure to whom" first — `route` would need a backpressure-aware return and the composed
+    /// adapter would need to retain-and-retry a deny. A seam change, named and not scoped (Sprint 20).
     fn notify_deny(&mut self, session: SessionId, routed: &Routed) {
         let body = match routed {
             Routed::FileWriteDeny => Some(file_error(ErrorCode::Denied)),
@@ -1050,6 +1104,31 @@ impl Dispatcher {
     #[must_use]
     pub fn replies_count(&self) -> usize {
         self.replies.len()
+    }
+
+    /// Test-only: the number of frames currently queued for `session`'s push reply stream, or 0 if it
+    /// has none. Exists so the reachability test can assert on real queue depth rather than inferring
+    /// it from drained output.
+    #[cfg(test)]
+    pub(crate) fn queued_frames(&self, session: SessionId) -> usize {
+        match self.replies.get(&session).map(|s| &s.source) {
+            Some(ReplySource::Queue { frames, .. }) => frames.len(),
+            _ => 0,
+        }
+    }
+
+    /// Test-only: the frame at `index` in `session`'s push queue — front is 0. Reads the **real**
+    /// `VecDeque` that [`push_reply_frame`](Self::push_reply_frame) writes, never a shadow a test keeps
+    /// alongside it, so an assertion over it cannot agree with a broken implementation by construction.
+    ///
+    /// Exists because a depth check alone cannot distinguish "not taken" from "taken, something
+    /// displaced" — both leave the depth at the cap. Contents can.
+    #[cfg(test)]
+    pub(crate) fn frame_at(&self, session: SessionId, index: usize) -> Option<alloc::vec::Vec<u8>> {
+        match self.replies.get(&session).map(|s| &s.source) {
+            Some(ReplySource::Queue { frames, .. }) => frames.get(index).cloned(),
+            _ => None,
+        }
     }
 
     /// The number of live session bindings — the O(sessions-per-epoch) resource the residual names.
@@ -1178,5 +1257,107 @@ mod tests {
             Routed::NetPayloadAccumulating,
         );
         assert_eq!(d.reassembling_count(), 1, "a post-overflow chunk begins a fresh, empty buffer");
+    }
+
+    /// **The reachability property's own test (Sprint 20 Slice 6).** Documents the CURRENT behaviour of
+    /// [`Dispatcher::notify_deny`] when its discarded `Enqueue` would have been `Full` — the case the
+    /// property above asserts is unreachable in practice.
+    ///
+    /// This test does **not** claim the case is reachable on the real wire; it constructs it directly to
+    /// pin what happens *if* it ever becomes reachable, which is exactly what was previously unknown.
+    /// The assertion is deliberately on the observed behaviour (the notification is dropped), not on a
+    /// behaviour someone would prefer — changing it is a seam question, not a local fix.
+    #[test]
+    fn notify_deny_on_a_full_queue_drops_the_notification() {
+        let mut d = Dispatcher::new();
+        let s = SessionId(7);
+
+        // Fill the session's reply queue to exactly REPLY_QUEUE_CAP through a legitimate push path.
+        for i in 0..REPLY_QUEUE_CAP {
+            assert_eq!(
+                d.enqueue_net_response(s, &[i as u8]),
+                Enqueue::Accepted,
+                "chunk {i} should be accepted below the cap",
+            );
+        }
+        // Precondition, proven rather than assumed: the queue really is at cap.
+        assert_eq!(
+            d.enqueue_net_response(s, b"one-too-many"),
+            Enqueue::Full,
+            "the queue must actually be full, or this test proves nothing",
+        );
+        let queued_before = d.queued_frames(s);
+        assert_eq!(queued_before, REPLY_QUEUE_CAP, "cap reached exactly");
+        // What the fill loop put at each end, rebuilt from the SAME inputs it used — independently
+        // known before the deny happens, not a snapshot taken across the event.
+        let expect_front = task16_stub_reply_frame(s, &crate::cloud_relay::relay_response(&[0u8]));
+        let expect_back =
+            task16_stub_reply_frame(s, &crate::cloud_relay::relay_response(&[(REPLY_QUEUE_CAP - 1) as u8]));
+        assert_eq!(d.frame_at(s, 0).as_ref(), Some(&expect_front), "front is chunk 0 before the deny");
+        assert_eq!(
+            d.frame_at(s, REPLY_QUEUE_CAP - 1).as_ref(),
+            Some(&expect_back),
+            "back is chunk 63 before the deny",
+        );
+
+        // Now fire a deny on that SAME session: a net-payload carrying a reserved verb byte
+        // (JC-1 ReservedDeny) — a real route() verdict, not an injected call to the private fn.
+        let mut frame = net_payload_frame(b"x", false);
+        let verb = u32::from_le_bytes(frame[0..4].try_into().unwrap()) | 0x0000_0100;
+        frame[0..4].copy_from_slice(&verb.to_le_bytes());
+        let routed = d.route(s, &frame, crate::register::net::ROUTES, crate::register::anthropic::VETTED_TOOLS);
+        assert!(matches!(routed, Routed::ReservedDeny { .. }), "expected a reserved-verb deny: {routed:?}");
+
+        // OBSERVED BEHAVIOUR: the deny notification is silently dropped. The queue is unchanged — the
+        // frame was neither enqueued nor did it displace anything, and no signal reached the caller.
+        assert_eq!(
+            d.queued_frames(s),
+            queued_before,
+            "the deny notification was DROPPED on a full queue — the box is never told its frame was \
+             refused. This is today's behaviour; the property above is what keeps it unreachable.",
+        );
+        // Depth alone does NOT establish "not taken": a queue that accepted the deny and evicted its
+        // oldest frame would also sit at exactly the cap. `push_reply_frame`'s documented contract is
+        // backpressure — never drop, never grow — and until now nothing tested the *never drop* half;
+        // it held only by reading the `Full` branch and seeing no displacement path. Assert it instead.
+        assert_eq!(
+            d.frame_at(s, 0).as_ref(),
+            Some(&expect_front),
+            "the queue's OLDEST frame is no longer chunk 0 — the deny was taken and displaced an \
+             already-accepted response chunk. Silent data loss on the reply path, not backpressure.",
+        );
+        // BACK CHECK — a deliberate addition, not a default. Front alone catches drop-oldest, which is
+        // the realistic ring-buffer regression and what the contract is most exposed to. But the
+        // mutation test that proved the front assertion discriminates exercised only THAT direction; it
+        // says nothing about replace-newest (`pop_back` + `push_back`), which front cannot see at all.
+        // Asserting only the direction already mutation-tested would leave the untested one unguarded,
+        // so both ends are pinned and both directions were mutation-tested.
+        assert_eq!(
+            d.frame_at(s, REPLY_QUEUE_CAP - 1).as_ref(),
+            Some(&expect_back),
+            "the queue's NEWEST frame is no longer chunk 63 — the deny replaced it rather than being \
+             refused. Also silent data loss, in the other direction.",
+        );
+
+        // ── NON-VACUITY CONTROL ──────────────────────────────────────────────────────────────────
+        // The assertion above passes just as happily if `notify_deny` never ran at all — if the verdict
+        // produced no body, or the deny path were never reached. That would be a test proving nothing
+        // while looking green, which is the failure shape this project keeps re-learning. So: fire the
+        // IDENTICAL deny on a FRESH session and prove it DOES enqueue exactly one frame. The only
+        // difference between the two arms is whether the queue was full.
+        let fresh = SessionId(8);
+        assert_eq!(d.queued_frames(fresh), 0, "the control session starts empty");
+        let mut frame2 = net_payload_frame(b"x", false);
+        let verb2 = u32::from_le_bytes(frame2[0..4].try_into().unwrap()) | 0x0000_0100;
+        frame2[0..4].copy_from_slice(&verb2.to_le_bytes());
+        let routed2 =
+            d.route(fresh, &frame2, crate::register::net::ROUTES, crate::register::anthropic::VETTED_TOOLS);
+        assert!(matches!(routed2, Routed::ReservedDeny { .. }), "same verdict on the control arm");
+        assert_eq!(
+            d.queued_frames(fresh),
+            1,
+            "the SAME deny enqueues a notification on a non-full queue — so the drop above is caused by \
+             the queue being full, not by the deny path being unreachable or bodyless",
+        );
     }
 }

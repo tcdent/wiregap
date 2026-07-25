@@ -61,8 +61,11 @@ pub mod filesystem {
 
     /// The **readable root** — the scope the box may read *from* the trusted host. Its breadth is
     /// "sanity, not safety" (`filesystem.md` §4–§5): reading is harmless, the validator confines either
-    /// way. **Provisional default, marked for review** — unlike the quarantine root it carries no
-    /// mount-flag requirement, so the operator sets it to whatever they intend to expose.
+    /// way. **A sample value, not a provisional one** (reviewed 2026-07-25). This module is a
+    /// *sample reviewed register* (see the header) — the operator edits these entries and recompiles,
+    /// so this path is an example of the shape, not a number awaiting a decision. Unlike the quarantine
+    /// root it carries no mount-flag requirement: the operator sets it to whatever they intend to
+    /// expose, and the validator confines either way. Nothing here is pending review.
     pub const READABLE_ROOT: RootPath = RootPath::new("/srv/zerotrust-proxy/readable");
 }
 
@@ -70,7 +73,8 @@ pub mod filesystem {
 /// string (JA-1, pinned to the 2026-06-20 snapshot; fail-closed on drift — a new date stamp is a
 /// different string and is not on this list until the operator adds it and recompiles).
 pub mod anthropic {
-    use crate::vocab::{CredentialSource, ToolIdentity};
+    use crate::credential::CredentialSource;
+    use crate::vocab::ToolIdentity;
 
     /// The operator's vetted client-side tool identities (a sample set). Structural validity is
     /// compile-checked; *which* identities are trusted is expressed by this list (JA-1).

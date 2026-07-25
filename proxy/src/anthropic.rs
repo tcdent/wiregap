@@ -16,8 +16,11 @@
 
 use crate::vocab::ToolIdentity;
 
-/// Maximum structural nesting depth. **Provisional** (JA-3: the *shape* — bounded, fail-closed — is
-/// settled; the number is marked). As shallow as the whitelisted Messages shape needs; deeper
+/// Maximum structural nesting depth. **Reviewed and confirmed at 32 (2026-07-25).** JA-3 settled the
+/// *shape* (bounded, fail-closed); this reviews the number. It is conservative in **both** directions,
+/// which is why it needs no tuning: too low would only over-deny (fail-safe, and 32 is far deeper than
+/// the whitelisted Messages shape reaches), while too high would risk the recursion's own stack depth.
+/// 32 sits clear of both. As shallow as the whitelisted Messages shape needs; deeper
 /// denies (`TooDeep`). This is what makes "recurse to full depth" finite and the recursion
 /// terminate.
 pub const MAX_DEPTH: usize = 32;

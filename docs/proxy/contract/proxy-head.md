@@ -139,8 +139,24 @@ routed to its owner, not a fork this contract recommends on.
 
 ## 6. Currency pins (2026-07-18)
 
-`docs/proxy/terminal.md` @ `da6c63c` (committed); `docs/proxy/architecture.md` @
-`dec2453` (committed); `contract/box-proxy.md` gate-accepted this sprint (working tree);
-committed-clean: `display.md` and `head/architecture.md` @ `3f060c7` (sha-256 prefixes
-`4fd403788b7b4533`, `1f0f8d275b63ede8`); working-tree sha-256 prefixes: `model.md`
-`4a468afae792e6e3`, `library.md` `c8cb29b87665e60e`. Re-pin at the gate.
+**Re-pinned 2026-07-25** (Sprint 20 audit — currency-pin sweep). Verified each artifact
+against the repository rather than carried forward:
+
+| artifact | status | note |
+|---|---|---|
+| `docs/proxy/terminal.md` @ `da6c63c` | **current** | unchanged since the original pin |
+| `display.md` @ `3f060c7`, sha-256 `4fd403788b7b4533` | **current** | commit and hash both still match |
+| `head/architecture.md` @ `3f060c7`, sha-256 `1f0f8d275b63ede8` | **current** | commit and hash both still match |
+| `proto/model.md` sha-256 `4a468afae792e6e3` | **committed** @ `c6c2b5e` (2026-07-22) | was pinned as working-tree; **same bytes**, now has a commit identity |
+| `proto/library.md` sha-256 `c8cb29b87665e60e` | **committed** @ `c6c2b5e` (2026-07-22) | same, byte-identical to the pin |
+| `contract/box-proxy.md` | **committed** @ `ae094cd` (2026-07-22) | was "gate-accepted this sprint (working tree)"; also working-tree-modified again by this sprint's pin correction |
+| `docs/proxy/architecture.md` | **RE-PINNED** `dec2453` → `e22f7f1` (2026-07-24) | see the flag below |
+
+**Flagged, not resolved here:** `architecture.md` advanced through four commits since the
+original pin (Sprints 4, 5, 6, and 16's compiled-in config DSL). The identity above is
+re-pinned mechanically; whether anything this contract *relies on* in `architecture.md`
+drifted across those four commits is a **content** question, not a pin question, and is
+not answered by this sweep. Raised as a candidate for the audit's cold-docs work rather
+than resolved inside a re-pin.
+
+Re-pin at the gate.

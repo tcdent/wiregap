@@ -14,10 +14,11 @@ use proto::{Reject, SafeSegmentStack, scan_safe};
 
 /// The array-level element-count bound.
 ///
-/// **Provisional** (`spec/leaf-validator.md` R-1): the *shape* (a bounded upper count,
-/// fail-closed on exceed) is settled; the *number* is marked for review. Any value ≥ the
-/// deepest legitimate quarantine path is safe — too low only *over-denies* (fails safe),
-/// never over-admits.
+/// **Reviewed and confirmed at 64 (2026-07-25).** `spec/leaf-validator.md` R-1 settled the *shape*
+/// (a bounded upper count, fail-closed on exceed); this reviews the number. Any value ≥ the deepest
+/// legitimate quarantine path is correct, and the error direction is one-sided: too low only
+/// *over-denies* (fails safe), never over-admits. 64 is far beyond any real quarantine path depth,
+/// so the fail-safe direction is not reachable in practice either.
 pub const MAX_ELEMENTS: usize = 64;
 
 /// Why a destination was denied. Exactly the two arms of the total function.

@@ -33,7 +33,7 @@ fn drain(mut r: FileReader) -> Result<Vec<u8>, ErrorCode> {
     let mut out = Vec::new();
     loop {
         match r.next_chunk() {
-            ReadStep::Data(chunk) => {
+            ReadStep::Item(chunk) => {
                 assert!(chunk.len() <= READ_CHUNK, "each streamed chunk is bounded by READ_CHUNK");
                 out.extend_from_slice(&chunk);
             }
@@ -65,7 +65,7 @@ fn large_file_streams_in_bounded_chunks() {
     let mut chunks = 0;
     loop {
         match r.next_chunk() {
-            ReadStep::Data(c) => { assert!(c.len() <= READ_CHUNK); total += c.len(); chunks += 1; }
+            ReadStep::Item(c) => { assert!(c.len() <= READ_CHUNK); total += c.len(); chunks += 1; }
             ReadStep::Eof => break,
             ReadStep::Error(e) => panic!("unexpected error {:?}", e.code),
         }

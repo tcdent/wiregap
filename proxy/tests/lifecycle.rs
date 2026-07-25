@@ -22,7 +22,7 @@ use proxy::nic::{NicRun, Reply};
 use proxy::privilege::{Credentials, observe};
 use proxy::register::anthropic::VETTED_TOOLS;
 use proxy::register::net::ROUTES;
-use proxy::upstream::Credential;
+use proxy::credential::Credential;
 use transport::{IdAllocator, Originator};
 
 /// A shared, ordered log of `(session, payload)` pairs the recording [`Reply`] captures.

@@ -2,7 +2,7 @@
 // credential SOURCE. (Dashes are a plausible typo: `ANTHROPIC-API-KEY` cannot name a real variable, so
 // it would silently never resolve at runtime; the const gate turns that into a build failure.)
 fn main() {
-    const _BAD: proxy::vocab::CredentialSource =
-        proxy::vocab::CredentialSource::env("ANTHROPIC-API-KEY");
+    const _BAD: proxy::credential::CredentialSource =
+        proxy::credential::CredentialSource::env("ANTHROPIC-API-KEY");
     let _ = _BAD;
 }

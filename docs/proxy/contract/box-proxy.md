@@ -178,11 +178,16 @@ body)`). Kind: CITE.
 
 ## 7. Currency pins (2026-07-18)
 
-Committed: `proto/src/segment.rs` @ `a7ccd6c`; `docs/proxy/architecture.md` @ `dec2453`
-(L14/L15 resolved); `docs/proxy/filesystem.md` §4 no-offset fix @ `7f7de0b`;
+Committed: `proto/src/segment.rs` @ `a7ccd6c`; `docs/proxy/architecture.md`
+**re-pinned 2026-07-25** `dec2453` → `e22f7f1` (L14/L15 resolved) — the identity moved
+across four commits (Sprints 4, 5, 6, 16); the **L14 and L15 rows this contract cites are
+byte-unchanged** across all four, verified row-by-row rather than assumed, so nothing
+cited here drifted; `docs/proxy/filesystem.md` §4 no-offset fix @ `7f7de0b`;
 `docs/proxy/terminal.md` §5 @ `da6c63c`; Sprint-2 specs @ `c4690bf` (+ the authorized
 offset-wording amendment, working tree, `filesystem-write-path.md` sha-256
 `940ee9de64bc35cf…`). Working-tree (uncommitted), sha-256 prefixes: `model.md`
 `4a468afae792e6e3`, `file.md` `5461602d24cf8b4e`, `net.md` `02c8ca7a58202bda`,
-`library.md` `c8cb29b87665e60e`, `trusted-address.md` `72478d48cb11a980`. Re-pin at the
-gate.
+`library.md` `c8cb29b87665e60e`. **`trusted-address.md` re-pinned 2026-07-25** to
+`0a1d8f53e12e761f` (was `72478d48cb11a980`) — that spec was corrected during the Sprint 20
+audit, which staled this pin by construction: correcting a document is exactly the act that
+invalidates every currency pin to it. Re-pin at the gate.

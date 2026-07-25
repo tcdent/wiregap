@@ -24,9 +24,13 @@ use crate::open_discipline::{OpenDenial, confined_create_leaf};
 
 /// The per-session/per-file quarantine write cap (bytes) — the disk-fill floor. **Reject-before-grow**:
 /// a chunk that would push the file past the cap is denied BEFORE any open/write, so the file never
-/// grows past it (the same shape as `proto`'s `REASSEMBLY_CAP` for reads). Provisional scalar (32 MiB),
-/// marked for review — a cheap per-file DoS floor; a real per-mount disk quota is the config layer's
-/// (Sprint-8 L12 residual), not this handler's.
+/// grows past it (the same shape as `proto`'s `REASSEMBLY_CAP` for reads).
+///
+/// **Reviewed and confirmed at 32 MiB (2026-07-25).** This is a cheap per-file DoS *floor*, deliberately
+/// not a disk quota: it bounds one file, not the mount, and a box writing many files is still bounded
+/// only by the filesystem. That is by design — the real per-mount quota is the config layer's (Sprint-8
+/// L12 residual), not this handler's, and raising or lowering this number does not change which of the
+/// two problems is solved here. 32 MiB is comfortably above any legitimate quarantine artifact.
 pub const QUARANTINE_WRITE_CAP: u64 = 32 * 1024 * 1024;
 
 /// The outcome of appending one `file-chunk`.

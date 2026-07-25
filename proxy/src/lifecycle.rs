@@ -29,7 +29,7 @@ use directpath::{Bdf, Event, SessionId, Subsystem};
 
 use crate::dispatch::{Dispatcher, Routed};
 use crate::nic::{NicRun, RealNic, Reply};
-use crate::upstream::Credential;
+use crate::credential::Credential;
 use crate::vocab::{Route, ToolIdentity};
 
 /// A named authority the proxy must validate before it serves — a channel of trust that, broken, holds

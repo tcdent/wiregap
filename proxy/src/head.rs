@@ -44,13 +44,52 @@ use crate::upstream::{UpstreamIngress, UpstreamSpawn};
 use crate::vocab::{Route, ToolIdentity};
 
 /// The bounded depth (frames) of each head↔loop channel. A full channel backpressures the producer (the
-/// reader thread, and thus the socket) — never an unbounded buffer. Provisional, marked for review.
+/// reader thread, and thus the socket) — never an unbounded buffer.
+///
+/// **Reviewed and confirmed at 256 (2026-07-25) — and this is where the audit's one cross-cap finding
+/// lives, so it is recorded here rather than left to be re-derived.**
+///
+/// Each cap in this crate is individually bounded and individually documented as such. Nobody had
+/// written down what they multiply to — and the two channels do **not** multiply the same way.
+///
+/// **Symmetric container, asymmetric contents.** [`HeadConnection`] constructs both channels
+/// identically (`sync_channel(HEAD_CHANNEL_CAP)` twice), which makes them *look* like one term doubled.
+/// What bounds a queued frame differs by direction:
+///
+/// - **Ingress: 256 × 1 MiB = 256 MiB.** [`HEAD_FRAME_MAX`] genuinely applies *before* the channel here
+///   — `decode_head_frame` rejects an oversized length before allocating, in the reader thread, and only
+///   then does the frame reach `tx.send`. The bound is real and decoder-enforced.
+/// - **Egress: 256 × (transport-framing bound — currently unstated).** [`HEAD_FRAME_MAX`] does **not**
+///   bound this queue. [`HeadConnection::send_to_head`] is a bare `try_send` with no size check;
+///   `encode_head_frame`'s `HEAD_FRAME_MAX` filter runs in `write_loop`, on the **writer** thread,
+///   strictly *after* `rx.recv()` has already dequeued the frame. So that cap bounds what gets
+///   **written**, not what gets **queued** — an oversized frame can occupy a channel slot and only be
+///   dropped at write time. What actually bounds egress frame size is the transport's own framing
+///   upstream of here, which no comment in this crate currently states.
+///
+/// `MB4` asks for *bounded*, and both terms are bounded — this is not a defect. The finding is that the
+/// product was never written down, and that writing it down exposed the asymmetry.
+///
+/// **The egress term is uncomputed, not merely unproven.** An earlier version of this note stated a
+/// symmetric `× 2` product and hedged only on *reachability*. That hedge was on the wrong axis: the
+/// arithmetic itself was wrong, because it assumed a cap applied before a queue when it applies after.
+/// Stating the term as unknown is the honest form.
 pub const HEAD_CHANNEL_CAP: usize = 256;
 
 /// The maximum accepted frame length (`SessionId` + payload), in bytes — **reject-before-alloc**: a
 /// decoded length beyond this is refused before any buffer is allocated, so a malicious/garbage length
 /// cannot drive an unbounded allocation. A terminal frame (a screen update, a keystroke) is far under
-/// this. Provisional (1 MiB), marked for review.
+/// this.
+///
+/// **Reviewed and confirmed at 1 MiB (2026-07-25).** The security property is the *reject-before-alloc*
+/// discipline, not the number: whatever the cap, a garbage length is refused before a buffer exists.
+/// 1 MiB is orders of magnitude above any real terminal frame, so it never over-denies in practice.
+///
+/// **It is the multiplier for the INGRESS term only** ([`HEAD_CHANNEL_CAP`]). Lowering it would shrink
+/// ingress worst-case memory and would **not move the egress term at all**, because on that side this
+/// cap is applied by the writer thread *after* the frame has already been queued. An earlier version of
+/// this comment called it "the cheaper of the two levers" — that was actionable and wrong, and is
+/// corrected here rather than left for someone to act on.
 pub const HEAD_FRAME_MAX: usize = 1024 * 1024;
 
 /// One head-connection frame: the box↔proxy `session` it pertains to, and its opaque L2 `payload`

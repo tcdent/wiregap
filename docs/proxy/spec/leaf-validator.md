@@ -146,6 +146,10 @@ bounded-count check gets. Whole-set human-holdable check runs at Slice 4's gate.
 `scan-safe.md` (Slice 1, gate-accepted); `filesystem-write-path.md` @ `bf56dc6` (committed
 clean — the authorized offset amendment landed in that commit, verified on disk this
 session; **not** working-tree as an earlier draft of this pin assumed) — cited for the
-confine-write mechanism and the seam it consumes; `filesystem.md` §1 @ `dec2453`/committed —
-the array-of-leaves requirement; committed `segment.rs` @ `a7ccd6c` for
-`SafeSegmentStack::len`. Re-pin at the gate.
+confine-write mechanism and the seam it consumes; `filesystem.md` §1 — **re-pinned 2026-07-25** `dec2453` → `7f7de0b`
+(2026-07-18), the array-of-leaves requirement; committed `segment.rs` @ `a7ccd6c` for
+`SafeSegmentStack::len` (**still current**). Re-pin at the gate.
+
+On the `filesystem.md` re-pin: the intervening commit is the §4 no-offset reconciliation
+to `proto/file.md` §1. This spec cites **§1**, which that commit did not touch — so the
+identity moved while the cited content did not.

@@ -27,19 +27,41 @@ use std::path::{Path, PathBuf};
 use proto::{ErrorBody, ErrorCode, FileType, ListEntry, UnsafeSegmentStack, scan_unsafe};
 
 /// The bounded read/stream chunk: at most this many bytes are held in memory per step, and each
-/// becomes one `file-data` frame. Provisional (a buffering knob, not a security bound).
+/// becomes one `file-data` frame. **Reviewed and confirmed at 64 KiB (2026-07-25):** a pure buffering
+/// knob with no security property resting on it — the confinement is the validator's and the open
+/// discipline's, not this number's. Any value trades syscall count against per-step memory; 64 KiB is
+/// an ordinary I/O chunk. Change it freely for performance; no gate depends on it.
 pub const READ_CHUNK: usize = 64 * 1024;
 
-/// One step of the stream: up to [`READ_CHUNK`] bytes, end-of-file, or a fail-safe error.
+/// **One step of any proxy-side stream** — the single contract `ReadStep` and `DirStep` were each
+/// spelling out separately (Sprint 20 Slice 4).
+///
+/// They were structurally identical: an item, exhaustion, or a fail-safe error, differing only in the
+/// item's type. Written twice, they were two things to keep in agreement; written once, the next
+/// streaming source conforms to a named contract instead of inventing a third variant of it.
+///
+/// **`WriteStep` deliberately does NOT unify with this** (`fs_write.rs`, proven not-parallel during
+/// this sprint's planning, and it is a genuine difference rather than a near-miss):
+/// - it has **no `Eof`** and can have none — a write has no exhaustion; completion is session-end
+///   (`file.md` §1, Sprint 9's Fork-B);
+/// - it carries **three distinct failure arms with three different payloads** (`Denied(OpenDenial)`,
+///   `Capped`, `WriteFailed(i32)`), where this contract has one;
+/// - it answers *"what happened to this chunk"*, not *"what is the next item in a stream"*.
+///
+/// Forcing those into one type would have produced a shape with an uninhabitable variant and a
+/// collapsed error taxonomy — the parallel-vs-layered rule exists to catch exactly that.
 #[derive(Debug)]
-pub enum ReadStep {
-    /// Up to `READ_CHUNK` bytes of file content — the caller frames this as one `file-data`.
-    Data(Vec<u8>),
-    /// The file is fully read — the stream is done.
+pub enum StreamStep<T> {
+    /// The next item: file content for a read, a directory entry for a listing. The caller frames it.
+    Item(T),
+    /// The source is exhausted — the stream is done.
     Eof,
     /// A fail-safe error mid-stream (i/o). Carries the proxy's own category, **no** box name.
     Error(ErrorBody),
 }
+
+/// One step of a file read: up to [`READ_CHUNK`] bytes, end-of-file, or a fail-safe error.
+pub type ReadStep = StreamStep<Vec<u8>>;
 
 /// A streaming reader over one box-named source. Holds the open fd and yields bounded chunks —
 /// memory stays at `READ_CHUNK` regardless of file size.
@@ -85,7 +107,7 @@ impl FileReader {
             Ok(0) => ReadStep::Eof,
             Ok(n) => {
                 buf.truncate(n);
-                ReadStep::Data(buf)
+                ReadStep::Item(buf)
             }
             Err(e) => ReadStep::Error(error_for(&e)),
         }
@@ -113,17 +135,8 @@ pub struct DirReader {
     entries: std::fs::ReadDir,
 }
 
-/// One step of the directory stream: the next entry, end-of-directory, or a fail-safe error.
-#[derive(Debug)]
-pub enum DirStep {
-    /// The next directory entry — the caller frames this as one `list-entry` record.
-    Entry(ListEntry),
-    /// The directory is fully listed — the stream is done.
-    Eof,
-    /// A fail-safe error (non-directory / missing / i-o). Carries the proxy's own category, **no** box
-    /// name (`file.md` §0).
-    Error(ErrorBody),
-}
+/// One step of a directory listing: the next entry, end-of-directory, or a fail-safe error.
+pub type DirStep = StreamStep<ListEntry>;
 
 impl DirReader {
     /// Open a box-named directory under the readable root, **fail-safe**. `read_dir` opens *and* confirms
@@ -184,7 +197,7 @@ impl DirReader {
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map_or((0, 0), |d| (d.as_secs(), d.subsec_nanos()));
-            return DirStep::Entry(ListEntry {
+            return DirStep::Item(ListEntry {
                 size: md.len(),
                 mtime_secs,
                 mtime_nanos,

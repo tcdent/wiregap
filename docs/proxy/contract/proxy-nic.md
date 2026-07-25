@@ -184,4 +184,4 @@ question is R-1, already ledgered.
 `endpoint: Endpoint` originator-partition arg) @ commit `a5a215c` — **committed pin (R-7 discharged
 2026-07-22)**; the interim content anchor (`3c69e5dd…`) is retired now that the facade is committed.
 `docs/nic/architecture.md` @ `6580d82` (§2.1/§3.1/§5,
-§8); `docs/proxy/architecture.md` @ `dec2453` (L8/L11/L15 rows); `docs/proxy/terminal.md` @ `da6c63c`.
+§8); `docs/proxy/architecture.md` **re-pinned 2026-07-25** `dec2453` → `e22f7f1` (L8/L11/L15 rows) — identity moved across four commits, but the **L8, L11 and L15 rows cited here are byte-unchanged** across all four, verified row-by-row; `docs/proxy/terminal.md` @ `da6c63c`.

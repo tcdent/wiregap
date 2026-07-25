@@ -61,7 +61,8 @@ use proxy::lifecycle::{Assembly, BringUpConfig, Readiness, assemble, body_finger
 use proxy::register::anthropic::{CREDENTIAL_SOURCE, VETTED_TOOLS};
 use proxy::register::filesystem::{QUARANTINE_ROOT, READABLE_ROOT};
 use proxy::register::net::ROUTES;
-use proxy::upstream::{AnthropicClient, Credential};
+use proxy::credential::Credential;
+use proxy::upstream_dial::AnthropicClient;
 
 // ── SAFETY: exact bench BDF only — never a device-id scan (61:00.0 production is also 0x10fb). ──────
 const PROXY_BDF: &str = "0000:41:00.0"; // the proxy's bench card — the ONLY device this binary touches

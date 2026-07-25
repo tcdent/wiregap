@@ -95,7 +95,7 @@ Slice 2.
 | 3 | Case shadow (`Example.com` for registered `example.com`) | byte-exact, no fold → `Deny(NoRoute)`, legible — a *correct* deny (residual RT-1) | §5; RT-1 |
 | 4 | Two distinct addresses colliding into one register match | impossible — `assemble` injective (`trusted-address.md` §3) | §2.2 |
 | 5 | Non-canonical would-be match (`//`, trailing `/`, empty segment) | not in the image of `assemble` → matches nothing → deny | §5; `trusted-address.md` §5 |
-| 6 | Dead register key (a key outside `assemble`'s image) | can never match any box request; a config-lint concern, fails safe (deny) | RT-2; `trusted-address.md` JT-3 (cited) |
+| 6 | Dead register key (a key outside `assemble`'s image) | **cannot be written** — `Route::new`'s `const` `assert!` makes it a compile error, so this is no longer a config-lint concern (JT-3, resolved 2026-07-25); had one existed it could never match any box request, failing safe (deny) | RT-2; `trusted-address.md` §5, §9 JT-3 |
 | 7 | Redirect / box-influenced destination at runtime | the register is proxy-owned and never widened at runtime (no redirect-following) | `approach.md` §6 (cited); `box-proxy.md` route-matcher row |
 
 Rows 1 and 3–5 resolve by the committed representation + injectivity; row 2 is the scheme
@@ -109,16 +109,25 @@ policy; rows 6–7 are cited config/register invariants, fail-safe.
   the denial is legible, its log line carries the exact non-matching spelling (both
   log-safe); the remedy is the box emitting the registered spelling or the operator
   registering the variant — never a proxy fold.
-- **RT-2 — dead register keys.** A key outside `assemble`'s image never matches; silent
-  until traffic fails legibly. Bound: `trusted-address.md`'s JT-3 load-time lint (cited); the
-  failure mode is deny-and-surface regardless, never admit.
+- **RT-2 — dead register keys. CLOSED (2026-07-25).** A key outside `assemble`'s image
+  never matches. This was bounded on `trusted-address.md`'s JT-3 load-time lint; JT-3 has
+  since been resolved by a **stronger** mechanism — `Route::new`'s `const` `assert!` makes
+  a dead key a **compile error**, so one cannot be written rather than being detected at
+  load (`trusted-address.md` §5, §9). The fallback bound (deny-and-surface regardless,
+  never admit) held throughout and still holds.
 - **RT-3 — scheme policy is accepted-not-frozen.** `scheme==0`-only rides the Sprint-2
   ratification packet (`trusted-address.md` JT-2); a ruling that admits a second scheme
   changes the cited policy, not this proof's totality (the scheme branch stays exhaustive
   over `u32` whatever the admit-set). Coupling stated, not re-opened.
-- **RT-4 — provisional caps** (assembled length, segment count) — the *shape*
-  (bounded, fail-closed) settled, the *numbers* provisional (`trusted-address.md` §6),
-  assign-mark-proceed.
+- **RT-4 — proxy-side caps: WITHDRAWN (2026-07-25).** This residual recorded the caps'
+  *shape* (bounded, fail-closed) as settled with the *numbers* provisional. Both are
+  superseded: `trusted-address.md` §6 now imposes **no proxy-side cap at all**. The
+  assembled-length and segment-count caps were never implemented and the requirement was
+  deleted rather than assigned — the wire frame already bounds the whole stack, so the
+  caps would be operational sanity with no security value, and adding box-facing
+  validation to satisfy a stale spec line runs against the off-by-construction
+  preference. There is no longer a number to assign. Resource exhaustion is answered by
+  the frame bound alone (`trusted-address.md` §6, §7 row 13).
 
 ## 6. Primitive-semantics grounding (SA5)
 
@@ -132,10 +141,21 @@ policy; rows 6–7 are cited config/register invariants, fail-safe.
 
 ## 7. Judgment calls (SA7) — none new
 
-Every choice here — scheme policy, match discipline, injectivity, caps — is
-`trusted-address.md`'s, cited with its accepted-not-frozen status (RT-3, RT-4). This member
-introduces no new fork; it proves the composition total. (Sprint 2's JT-1/JT-2/JT-3 remain
-that spec's routed calls; this proof does not re-route or settle them.)
+Every choice here — scheme policy, match discipline, injectivity — is
+`trusted-address.md`'s. This member introduces no new fork; it proves the composition
+total.
+
+Statuses, kept distinct because they are not interchangeable (updated 2026-07-25):
+
+- **Scheme policy is accepted-not-frozen** (RT-3), riding the Sprint-2 ratification packet.
+  That is the only inherited call still carrying that status here.
+- **Caps are WITHDRAWN** (RT-4), not accepted-not-frozen. Withdrawn is a *different*
+  status, not a softer one: `trusted-address.md` §6 imposes no proxy-side cap at all, so
+  there is no longer a choice to inherit, ratify, or re-open. "Caps" is dropped from the
+  list above for the same reason.
+- **JT-3 is RESOLVED** (at compile time — `Route::new`'s `const` `assert!`), no longer a
+  routed call. Sprint 2's **JT-1 and JT-2** do remain that spec's routed calls; this proof
+  does not re-route or settle them.
 
 ## 8. Budget ledger (updated)
 
@@ -153,9 +173,14 @@ firms to a real count when the build lands. Recorded as a simplicity data point,
 
 ## 9. Currency pins (2026-07-19)
 
-`scan-safe.md`, `leaf-validator.md` (Slices 1–2, gate-accepted); `trusted-address.md` @
-`c4690bf` (committed Sprint-2 spec; §2–§6 cited — verified on disk this session);
-`box-proxy.md` @ `bf56dc6` (Sprint-3 net-address row, verified); committed `segment.rs` @
-`a7ccd6c`. The
-scheme policy and caps are cited at `trusted-address.md`'s accepted-not-frozen status
-(Sprint-2 ratification packet pending). Re-pin at the gate.
+`scan-safe.md`, `leaf-validator.md` (Slices 1–2, gate-accepted); `box-proxy.md` @
+`bf56dc6` (Sprint-3 net-address row, verified); committed `segment.rs` @ `a7ccd6c`.
+
+**`trusted-address.md` re-pinned 2026-07-25** — was `c4690bf`; that spec was corrected
+during the Sprint 20 audit (§5, §6, §7, §8 RT-2/RT-5, §9 JT-3, §10) and is
+**working-tree-modified, uncommitted** at this pin, sha-256 prefix `0a1d8f53e12e761f`.
+Re-pin to its commit once landed.
+
+The **scheme policy** is still cited at `trusted-address.md`'s accepted-not-frozen status
+(Sprint-2 ratification packet pending). The **caps** are no longer cited at any status:
+they were withdrawn outright (RT-4 above). Re-pin at the gate.

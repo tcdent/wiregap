@@ -177,7 +177,13 @@ one sitting, that is a scope question for the PM, not a number to squeeze under.
 
 ## 9. Currency pins (2026-07-19)
 
-`proto/src/segment.rs` @ `a7ccd6c` (committed clean; `scan_safe` lines 169–208, verified on
-disk this session). `proto/library.md` §8 (residence) and `file.md` §0 / `model.md` §6
-(alphabet) are the normative prose, working-tree state as read. The proof binds to the
-committed function; re-pin at the gate.
+`proto/src/segment.rs` @ `a7ccd6c` (committed clean; `scan_safe` lines 169–208) —
+**still current, verified 2026-07-25**.
+
+`proto/library.md` §8 (residence) and `file.md` §0 / `model.md` §6 (alphabet) are the
+normative prose. **Re-pinned 2026-07-25:** all three were cited as working-tree state and
+are now committed @ `c6c2b5e` (2026-07-22), **byte-identical** to when they were read
+(sha-256 prefixes `c8cb29b87665e60e`, `5461602d24cf8b4e`, `4a468afae792e6e3`) — a status
+upgrade, not a content change, so nothing this proof cites has moved.
+
+The proof binds to the committed function; re-pin at the gate.

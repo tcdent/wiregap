@@ -292,7 +292,17 @@ but the design as specified is enumerable.
 
 Anthropic capability surface: **snapshot 2026-06-20** (`anthropic-api.md`, §4/§6 — the vintage
 JA-1 is pinned to; fail-closed on drift). `anthropic-api.md` §1/§2/§6/§8 and `approach.md`
-§1/§3 (working-tree state, cited for the admit-mechanism and verify-and-deny). `library.md`
-§8 for `REASSEMBLY_CAP`. Slices 1–3 (`scan-safe.md`, `leaf-validator.md`,
-`address-recognizer.md`) gate-accepted. Re-pin at the gate; the JA-1 set re-pins whenever
-the operator ratifies.
+§1/§3 — **re-pinned 2026-07-25**: both were cited as working-tree state and are now
+committed @ `f6a0ad3` (2026-07-24). `library.md` §8 for `REASSEMBLY_CAP` — committed @
+`c6c2b5e` (2026-07-22), byte-identical to when cited. Slices 1–3 (`scan-safe.md`,
+`leaf-validator.md`, `address-recognizer.md`) gate-accepted.
+
+**Flagged, not resolved here:** unlike the other artifacts in this sweep, `approach.md`
+and `anthropic-api.md` did not merely gain a commit identity — their **content changed**
+in `f6a0ad3` (the TLS-client-only distinction) and, for `approach.md`, in the §7 wording
+correction. This spec cites `approach.md` §1/§3 and `anthropic-api.md` §1/§2/§6/§8, none
+of which is the section those edits targeted, so the citations are *probably* unaffected —
+but "probably" is not a currency check. Whether the cited sections drifted is a content
+question beyond this re-pin, raised as a cold-docs candidate rather than answered here.
+
+Re-pin at the gate; the JA-1 set re-pins whenever the operator ratifies.

@@ -450,7 +450,8 @@ Audit first, in this order:
 
 ## Method
 
-- **MB1–MB6** apply to every new line. MB6's `{open_discipline, privilege}`
+- **MB1–MB6** (defined in `docs/proxy/review-vocabulary.md` — cited, not restated
+  here) apply to every new line. MB6's `{open_discipline, privilege}`
   set is **preserved, not widened** — the DSL itself is pure data, and the
   one new primitive this sprint needs (`fstatfs` on the pinned quarantine
   fd, Final State #6) lands **inside `open_discipline`** alongside
