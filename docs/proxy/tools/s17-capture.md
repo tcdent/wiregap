@@ -10,31 +10,34 @@ anything.
 
 ---
 
-## Status: **stale as of Sprint 18 — do not run as-is**
+## Status: **run and PASSED against the Sprint-18 pipe, 2026-07-25**
 
-Sprint 18 (2026-07-25) replaced the upstream client with a verbatim TLS pipe, and that changed what
-reaches the box. `net-response` now carries the **entire** upstream response — status line, headers,
-body — where it previously carried the body alone.
+Ran 2026-07-25 09:37:31 PDT on elsenor. All four tells satisfied, bench restored, Slice 3 accepted by
+review. Artifacts from that run are not in the repo (they land outside it by design).
 
-| | before Sprint 18 | now |
+Sprint 18 had replaced the upstream client with a verbatim TLS pipe, changing what reaches the box —
+`net-response` now carries the **entire** upstream response, not the body alone:
+
+| | before Sprint 18 | now (confirmed live) |
 |---|---|---|
 | invalid credential | proxy-invented `net-error` | the upstream's own verbatim **401 response** |
 | response bytes | body only | status line + headers + body |
 | connections | client-managed | **one TCP connection per call** (`Connection: close`) |
 
-So the capture now exercises the **relay** path rather than the error path. That is a *better*
-capture than the one designed — Anthropic's own `request-id` response header becomes reachable, which
-is a stronger per-call-unique tell than anything in the original design — but it is a **different**
-one, and the tells must be re-derived before the next run.
+The tells were re-derived for that shape before the run rather than after it, and the live response
+confirmed the redesign was right:
 
-What still holds: the preconditions, the credential-echo gate (it greps raw bytes, so the response
-shape does not matter to it), the verify-before-kill ordering, the teardown, and the `ixgbe` rebind.
+- **The `request-id` header was present** (`req_011CdP6wybnrmm3yDQ5pibFb`), so the response side
+  carries genuine per-call uniqueness — a stronger tell than anything in the original design. The
+  narrowed FS#7 framing was pre-written for its absence and did not need to be used.
+- **The real response came back `Transfer-Encoding: chunked`, and the raw chunk framing survived into
+  the relayed bytes.** Any general-purpose HTTP client would have de-chunked it. That is the
+  verbatim-pipe property demonstrated by the real upstream picking an encoding nobody anticipated —
+  better evidence than the synthetic arms, because nobody chose it.
 
-**Revalidate the tells; do not delete and rewrite the script.** The ordering and teardown took
-several review iterations to get right, and the failure modes they close are not obvious from
-reading the happy path.
-
----
+**Before re-running, re-read the tells against whatever the pipe does *now*.** That is the standing
+lesson from this sprint, not a one-off: the capture was blocked for a whole sprint because a change to
+the upstream client silently invalidated response-side tells designed against the old one.
 
 ## Safety
 
@@ -90,9 +93,17 @@ Both feature-gated binary sets must be built first — they are off the default 
 production/TCB build never links the bench surface:
 
 ```
-cargo build --features serve          --bin serve      # the composition root
-cargo build --features bench-capture  --bin s17_box --bin s17_head
+cargo build --offline --features serve         --bin serve
+cargo build --offline --features bench-capture --bin s17_box
+cargo build --offline --features bench-capture --bin s17_head
 ```
+
+**Run these as three separate invocations. Do not combine them.** Cargo unifies features across a
+single invocation, so building all three at once compiles the shared libraries with
+`serve,bench-capture` together — and `bench-capture` enables `directpath/bench`. The resulting `serve`
+links the bench internals *into the production binary*, which is exactly what the feature gate exists
+to prevent. Measured, not theoretical: the combined build produced `serve = 3d0cbaab…` against the
+separate builds' `38e14a57…`, the binary the accepted capture actually ran.
 
 The provisioned filesystem roots must exist, with the quarantine writable by the drop uid (65534):
 
@@ -124,6 +135,7 @@ Written **outside the repo** — they are per-run evidence, not source. Default
 | `serve-proc-exe-sha.txt` | **the running-bytes tell** — pid, cmdline, and `sha256` of `/proc/<pid>/exe` |
 | `serve.log`, `head.log`, `box.log` | the three processes' output |
 | `response-body.bin` | the bytes the box received |
+| `box-exit.txt` | `s17_box`'s exit status — recorded, not gated (the tells fail closed without it) |
 | `credential-echo.txt` | PASS/FAIL of the credential-echo gate |
 | `quarantine-write.txt` | tell #4 — the confined write, with owner and mode |
 
@@ -163,6 +175,7 @@ hardening rather than behaviour changes. `shellcheck` is clean at `--severity=st
 | `sudo tr … < /proc/PID/cmdline` → `sudo cat … \| tr` | **a real bug**: the redirect is opened by the invoking user, so the `sudo` applied only to `tr`, which needs no privilege. Works today only because `/proc/PID/cmdline` is world-readable; fails under a `hidepid=` mount while looking correct |
 | `s17_box`'s exit status captured, recorded, and warned on | was computed and printed but unreferenced; still not a gate, deliberately — see the in-file note on why every downstream tell fails closed without it |
 | three `sudo cmd > "$OUT/…"` redirects annotated `# shellcheck disable=SC2024` | the invoking-user redirect is *intended*: `$OUT` is user-owned, and a later non-`sudo` grep of `head.log` depends on it. The one artifact that genuinely needs a root write — `response-body.bin` — is written by the privileged binary opening its own path |
+| the teardown reports the ACTUAL driver state, not the bind write's exit status | the write returns EBUSY when a card is already bound — the normal case when a binary restores its own card — so the old form printed "check manually" on clean runs, training the operator to skim past the one message that matters |
 | the pid-verification failure path now reaps the backgrounded job | it exited without reaping, leaving a root-owned `serve` blocked on `accept()` forever. A process leak, not a bench-safety gap — no card is unbound at that point |
 
 Every other executable line is byte-identical to the version that produced the Sprint 17 capture

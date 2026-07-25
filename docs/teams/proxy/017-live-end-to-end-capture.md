@@ -29,22 +29,20 @@ found block it from ever running as a genuine two-process capture:
    `two_facade` in-process role, and not a replica of any part of the
    composition root.
 3. **The capture itself**: the real `serve` binary, unmodified beyond
-   item 1's two fixes and two further diagnostic additions (below), run
-   against a deliberately invalid credential (the operator's no-billing
-   ruling, Final State #5), a real upstream connection, a scripted head
-   client, and an operator-provisioned quarantine.
-4. **Two additional `serve`/`upstream.rs` diagnostics, found at their
-   respective design/implementation gates**: (a) `on_verdict`'s
-   `Routed::NetPayloadAdmit(body)` arm prints `lifecycle::body_fingerprint`
-   of the admitted body; `s17_box` prints the identical function's output
-   for the body it sent — matching fingerprints, observed live, close the
-   request-side tell. (b) `upstream_call`'s error site prints the real
-   `ureq::Error`'s `Display` (e.g. `"http status: 401"`) before it is
-   mapped away to the box-facing `ErrorCode` — found implementing the
-   operator's no-billing ruling, since the box-facing code alone collapses
-   every HTTP-status failure into the same generic value. Both are
-   content-free with respect to anything secret, additive, and change no
-   behavior or authority logic.
+   item 1's two fixes and one further diagnostic addition (below — a
+   second was originally planned and is now superseded by Sprint 18's
+   verbatim relay), run against a deliberately invalid credential (the
+   operator's no-billing ruling, Final State #5), a real upstream
+   connection, a scripted head client, and an operator-provisioned
+   quarantine.
+4. **One `serve`/`lifecycle.rs` diagnostic** (a second was originally
+   planned here and is now superseded — see the note at Final State #6):
+   `on_verdict`'s `Routed::NetPayloadAdmit(body)` arm prints
+   `lifecycle::body_fingerprint` of the admitted body; `s17_box` prints the
+   identical function's output for the body it sent — matching
+   fingerprints, observed live, close the request-side tell. Content-free
+   with respect to anything secret, additive, and changes no behavior or
+   authority logic.
 
 It explicitly does **not** own:
 
@@ -198,14 +196,20 @@ adjacent gap Sprint 16 could not close by construction.
    through the real reactor/transport (`open(net_address) -> sid`,
    `send(sid, net_payload)`, the ruled two-call one-session sequence) with
    a fresh nonce embedded in the body, and receives the correlated
-   `net-error` — **the designed, expected outcome under the operator's
-   no-billing ruling (Final State #5), not a failure mode** — recording
-   its decoded code **legibly** in its own log, so the outcome is checkable
-   rather than looking indistinguishable from the harness being stuck.
-   On receiving it, `s17_box` emits one display frame toward the head
-   carrying a marker derived from that observation (the box→head chain Q3
-   established: the head only ever observes display frames, which are the
-   box's to emit). **Also drives one `file-write` + `file-chunk`, carrying
+   **`net-response` carrying the real endpoint's own rejection bytes,
+   verbatim** — **the designed, expected outcome under the operator's
+   no-billing ruling (Final State #5) combined with Sprint 18's verbatim
+   relay, not a failure mode** (corrected from this Final State's original
+   text, which predates Sprint 18 and expected a `net-error`; a `net-error`
+   here now means only a genuine transport failure, confirmed against
+   `proxy/src/bin/s17_box.rs:299-324`) — recording the response
+   **legibly** in its own log, so the outcome is checkable rather than
+   looking indistinguishable from the harness being stuck. On receiving
+   it, `s17_box` emits one display frame toward the head carrying a
+   marker derived from `lifecycle::body_fingerprint` of the received
+   response (the box→head chain Q3 established: the head only ever
+   observes display frames, which are the box's to emit). **Also drives
+   one `file-write` + `file-chunk`, carrying
    a second, distinct nonce, into the provisioned quarantine** (found
    during planning: Final State #9's quarantine-write-as-dropped-uid tell
    has no producer without this — only the box can emit a `file-chunk`,
@@ -229,11 +233,36 @@ adjacent gap Sprint 16 could not close by construction.
    *authority rung* and `serve` exits before any call is ever made, which
    would read as a Sprint-16 regression, not a credential mistake; (b) **a
    valid HTTP header value** — visible ASCII only, no whitespace or
-   control characters, since the value goes straight into
-   `.header("x-api-key", key)` and anything the `http` crate rejects
-   produces `ureq::Error::Http` (the request never leaves the machine),
-   making the reachability tell vacuous while the log still looks like a
-   network failure to anyone not reading closely; (c) **well-formed but
+   control characters. **Corrected against current source**: under the
+   removed `ureq`/`http`-crate path, a malformed value was rejected
+   locally (`ureq::Error::Http`, the request never leaving the machine).
+   Sprint 18's hand-rolled `write_request` (`proxy/src/upstream.rs:468`)
+   does no such validation — `key` is interpolated directly into the
+   header line with no local safety net at all. **This is a gap in
+   Sprint 18 FS#5's own proof, not only a robustness gap** (reviewer's
+   sharpening): FS#5 proves the wire request is exactly the admitted body
+   plus the credential header via full-buffer equality — proven only for
+   a *well-formed* credential. A CRLF in the credential does not merely
+   malform one header; it terminates the header block early, so
+   `content-length` and the real body become part of whatever follows,
+   and the body boundary moves. FS#5's proven property is therefore
+   *false* for a malformed credential, and FS#5's own test cannot catch
+   this because it uses a well-formed key — an unstated precondition on
+   an already-accepted proof, not merely a missing validation.
+   `write_request`'s own doc comment stops one step short of this: it
+   argues the credential is operator-authored and never box-influenced
+   ("no header line takes a box-supplied value"), which is a correct
+   *containment* argument and entirely silent on *format-breakage* — it
+   answers "can the box escape" and not "can this break byte-exactness".
+   **A genuine residual, named here and routed to the PM as a finding,
+   not fixed by this sprint**: Non-Goals bar changing `bring_up`/
+   authority logic, and `write_request` is further still than that.
+   **This sprint's mitigation, in scope as a gate item rather than a
+   deferral** (reviewer's addition): the capture procedure asserts the
+   credential value is well-formed — visible ASCII, no CR, no LF —
+   *before* the run, converting "pinned by discipline" into "checked at
+   the one place it matters for this run", with no Sprint-18 code
+   touched. See Slice 3's gate and the Acceptance list; (c) **well-formed but
    wrong**, which is what actually produces the real `401`. Concretely:
    a non-empty, visible-ASCII, control-character-free, self-describing
    string that does not resemble a real key —
@@ -247,39 +276,36 @@ adjacent gap Sprint 16 could not close by construction.
    ways: a decision that paid off here, and a standing warning — if the
    ladder ever gains credential-shape validation, it would break this
    capture's method and should be weighed against that cost.
-   **Open finding, routed to dev, not yet resolved**: the `401`-takes-the
-   -`Err`-path mechanism currently depends on `ureq`'s *default*
-   `http_status_as_error` setting — `upstream_call`'s agent builder never
-   sets it explicitly, so the capture's whole tell structure implicitly
-   rests on an unpinned third-party default that a future dependency
-   bump could silently flip, with no signal. This is inconsistent with
-   this sprint's own standing discipline of pinning things explicitly
-   (exact BDFs, exact feature sets, the remap recipe). Dev to explicitly
-   configure the expected behavior in the agent builder (or otherwise pin
-   it) rather than leaving it implicit, before this item is considered
-   closed.
-6. **A real diagnostic gap, found implementing the ruling, closed by one
-   small addition — not by trusting the box's error code alone**: the
-   box only ever receives `NetError(Unavailable)`, and *every* HTTP-status
-   failure collapses into that same generic code
-   (`upstream.rs::map_ureq_error`'s catch-all — verified against source:
-   `ureq::Error::StatusCode(u16)` carries the real status but has no
-   explicit match arm, so it falls into `_ => ErrorCode::Unavailable`
-   alongside TLS failures, unexpected i/o errors, and anything else not
-   already named). So the box alone cannot distinguish "reached the real
-   host, got a `401`" from a purely local failure — the operator's actual
-   goal (proving the real path was reached) would be unproven by the
-   box's observation alone. **Fix**: `upstream_call`'s error site prints
-   the real `ureq::Error`'s `Display` (for `StatusCode`, exactly `"http
-   status: 401"`, verified to carry nothing sensitive — no headers, no
-   body, no credential) as a diagnostic, content-free with respect to
-   anything secret, before it is mapped away to the box-facing
-   `ErrorCode`. This is the same shape as Final State #3's fingerprint
-   addition — additive, observational, no change to what the box
-   receives or to `MB3`'s opaque-relay behavior — extending the "one
-   further diagnostic addition" this sprint's Scope Boundary already
-   permits to include this second one, found at the same gate for the
-   same reason.
+   **Formerly an open finding routed to dev — now resolved by
+   elimination, not by pinning.** This item originally found that the
+   `401`-takes-the-`Err`-path mechanism depended on `ureq`'s unpinned
+   *default* `http_status_as_error` setting, and asked dev to pin it
+   explicitly before this item closed. Sprint 18 removed the setting
+   along with `ureq` itself: there is no HTTP-status-based branch left
+   anywhere in the upstream call (`upstream_call`/`stream_response`
+   relay any TLS-connected response verbatim regardless of status,
+   confirmed at Final State #6/#4) — so there is no third-party default
+   left to silently flip. The concern this item raised is fully closed,
+   not merely addressed.
+6. **SUPERSEDED by Sprint 18 — the diagnostic this item originally added no
+   longer exists, and nothing needs to replace it.** This Final State
+   originally found that the box only ever received `NetError(Unavailable)`
+   (`upstream.rs::map_ureq_error`'s catch-all collapsed every HTTP-status
+   failure into that one generic code) and closed the gap with a
+   diagnostic print of `ureq::Error`'s `Display` on `serve`'s own stderr,
+   since that was the only place the real status was ever visible.
+   Sprint 18 removed `ureq` and `map_ureq_error` entirely and made the
+   upstream relay verbatim in both directions (Sprint 18 FS#4): a `401`
+   is not an error at all under the current design — any TLS-connected
+   call streams its response, status line and headers included, to the
+   box as an ordinary `net-response` (confirmed against source:
+   `proxy/src/upstream.rs`'s `stream_response`/`enqueue_net_response`
+   path; `net_error` is now reached only by a genuine transport failure —
+   confirmed against `proxy/src/bin/s17_box.rs:299-324`, already updated
+   to this reality). The box now observes the real `HTTP/1.1 401
+   Unauthorized` status line directly, which is strictly more than the
+   old diagnostic ever gave an observer outside `serve`'s own stderr — see
+   Final State #7 for the response-side tell this enables.
 7. **The round trip is bound end to end, honestly narrowed for the
    no-billing plan**: request-side, **`body_fingerprint(admitted) ==
    body_fingerprint(sent)`, observed live from both ends** — sharpened
@@ -297,39 +323,73 @@ adjacent gap Sprint 16 could not close by construction.
    **unaffected by the credential ruling**: the request body is admitted
    and forwarded exactly the same way whether the credential is valid or
    not, since authentication happens upstream, after forwarding.
-   Response-side, **the diagnostic `401` (Final State #6), correlated via
-   `in_reply_to` and the serial-bound-of-1 exclusivity, is what this
-   sprint's response-side tell now is** — stated with the honest,
-   narrower scope this actually has: a fixed `401` rejection is **not**
-   per-call-unique the way a real success response's `id` would have
-   been, so this proves *reachability and correct real-path behavior*
-   (a genuine TLS connection and HTTP round trip to the real, hardcoded
-   endpoint, correctly translated into a `NetError` delivered on the
-   box's own correlated session) — **not** a content-integrity or
-   anti-fabrication proof of a successful call. The self-declared bin-sha
-   still binds these observations to the reviewed bytes; nothing here
-   claims more than what is actually established.
-   **This tell lives in two separate logs, not one** (reviewer's
-   precision point): the box only ever sees the generic `NetError
-   (Unavailable)` in `box.log`; the `"http status: 401"` line is on
-   `serve`'s own stderr. Establishing the tell means correlating *both*
-   logs (serve's status-and-fingerprint lines against the box's
-   net-error and `in_reply_to`) — the capture procedure must capture and
-   correlate both, not treat `box.log` alone as the record the way the
-   quarantine tell already can. **A `401` does not by itself prove the
-   credential was attached to the request** (reviewer's precision
-   point): Anthropic returns the same `401` for a wrong key and an
-   absent one alike, so header-attachment stays a *code* property (the
-   `.header("x-api-key", key)` call is unconditional) — not something
-   this capture directly observes. "Correct real-path behavior" should
-   not be read as proving that leg specifically.
+   Response-side, **rebuilt entirely on Sprint 18's verbatim relay
+   (Final State #6 is superseded) and now rests on two observations made
+   directly at the box, correlated via `in_reply_to` and the
+   serial-bound-of-1 exclusivity** (reviewer's correction, twice
+   retracted and reissued during the relay's own design — recorded here
+   so it is not re-derived): both live in `box.log`, in one place, not
+   split across two logs as the superseded design required.
+   1. **The status line, read directly, not inferred.** `s17_box`'s
+      accumulated `response` bytes begin `HTTP/1.1 401 Unauthorized` —
+      the real endpoint's own line, relayed verbatim, never a `serve`-side
+      diagnostic standing in for it.
+   2. **Anthropic's own `request-id` response header — genuinely
+      per-call-unique**, correcting this Final State's earlier framing:
+      under the removed diagnostic design a fixed `401` was *not*
+      per-call-unique the way a real success response's `id` would have
+      been; under verbatim relay the header route is open too (Sprint 18
+      FS#4 relays the whole response, headers included), so `request-id`
+      restores exactly the unsynthesizable, per-call evidence that a
+      successful call's `id` would have given, without needing a
+      successful call. **Verified against a live response (Slice 3's
+      capture, 2026-07-25)**: `request-id: req_011CdP6wybnrmm3yDQ5pibFb`,
+      present and well-formed, corroborated twice independently — the
+      header and the JSON error body's own `request_id` field agree — so
+      the full claim below fired and the narrowed one was not needed.
+      **The narrowed claim, written in advance rather than left to be
+      decided at report time** (reviewer's finding), stands for any
+      future re-run where the header is absent: this Final State's claim
+      is then *reachability and correct real-path behavior only* — the
+      status line alone, with **no per-call uniqueness** — and the
+      capture report must state it in exactly that narrower form, not
+      merely note the header's absence as an aside.
+   **A `401`'s wording does not itself prove the credential was
+   attached** (reviewer's precision note on Slice 3's own evidence,
+   applying regardless of outcome): "invalid x-api-key" does not
+   distinguish a *wrong* key from an *absent* one. Credential attachment
+   is proven by Sprint 18 FS#5's byte-exact wire check (the header is
+   provably on the wire), not by the rejection message's content — the
+   conclusion holds, but this is the reason that actually carries it.
+   **The correlation tell is at its weakest when the box's first session
+   is 0** (reviewer's note from Slice 3's run): `in_reply_to = Some(0)`
+   against request session `0x0` is correct (the box is
+   `Originator::Low`, so its first session genuinely is `0`) but
+   indistinguishable at that value from an uninitialized default. Not a
+   defect in Slice 3's capture — a free strengthening for any re-run:
+   have `s17_box` open one throwaway session before the `net-address`
+   session, landing the real correlation on a nonzero id.
+   Together these prove *reachability, correct real-path behavior, and*
+   (via `request-id`) *that this specific call, not a stale or fabricated
+   observation, is what is on record* — still **not** a content-integrity
+   proof of a successful call, since none was attempted.
+   **A response arriving does not by itself prove the credential was
+   attached to the request** (reviewer's precision point, still holds
+   under the new design): Anthropic returns the same `401` for a wrong
+   key and an absent one alike, so header-attachment stays a *code*
+   property (`write_request`'s credential-header call is unconditional,
+   Sprint 18 FS#5) — not something this capture directly observes.
+   "Correct real-path behavior" should not be read as proving that leg
+   specifically.
 8. **A scripted head client observes the real display frame**, carrying a
-   marker now derived from **the box's own observation of the net-error**
-   (not a response `id`, which no longer exists under this plan) — reusing
-   Sprint 14's nonce'd-injection precedent (a real socket client, not a
-   human terminal) — proving the socket carries a frame whose marker
-   traces to the box's real net-error observation, not a human-verified
-   but non-repeatable proof.
+   marker derived from **`body_fingerprint` of the box's received
+   response** (corrected: earlier text derived this from a net-error
+   observation, predating Sprint 18's relay; there is no net-error on the
+   expected path any more — see Final State #4) — reusing Sprint 14's
+   nonce'd-injection precedent (a real socket client, not a human
+   terminal) — proving the socket carries a frame whose marker traces to
+   the box's real, received response, not a human-verified but
+   non-repeatable proof.
 9. **Both filesystem roots are operator-provisioned, not just the
    quarantine** (found independently during planning by both dev and
    reviewer: `assemble` validates *both* roots, and the compiled default
@@ -531,6 +591,27 @@ adjacent gap Sprint 16 could not close by construction.
     would look like a coherence failure that is actually a wrong recipe.
     Recording the exact invocation per binary makes coherence a one-pass
     verification rather than a round trip back to the dev.
+    **Slice 3's coherence rebuild proved this feature-unification risk
+    from source, not merely by rebuild-fingerprint** (reviewer): a
+    `cargo clean -p proxy` followed by separate rebuilds of all three
+    exact invocations reproduced every recorded bin-sha byte-identically
+    — a stronger proof than a no-recompile check, since a drifted source
+    tree could not recompile to identical bytes from a cleaned target.
+    **A second recipe dependency, found and corrected in the same
+    pass — the benchtools-linked binaries are TARGET-DIRECTORY-dependent,
+    `serve` is not** (reviewer's finding, the near-miss worth recording):
+    a first rebuild attempt into a separate target directory (to force a
+    from-source compile without touching the tree) reproduced `serve`
+    exactly but produced *different* bytes for `s17_box`/`s17_head` — two
+    of three not matching is the exact shape of a coherence failure, and
+    it was the recipe, not the tree (`benchtools`' build-script output
+    path is embedded; `serve`, which does not depend on it, is
+    unaffected). Confirmed, not inferred: a from-source rebuild in the
+    *default* target directory reproduced both exactly. **Reproduction
+    therefore requires the same target directory, alongside the same
+    absolute source path, rustc, profile, rustflags, and per-binary
+    feature set** — a reviewer following the recipe as written before
+    this correction would have reported a false mismatch.
 15. The sprint document carries role retrospectives; the sprint is
     committed with only its intentional files.
 
@@ -545,17 +626,18 @@ the stale-socket fix.
 
 **Slice 2 — `s17_box` and `s17_head`, the bench harness.**
 `s17_box` (Final State #4): real `Endpoint::Box` construction, one
-nonce'd net-request, response receipt, the resulting display-frame emission
+nonce'd net-request, response receipt (a `net-response` carrying the real
+endpoint's verbatim rejection, per Sprint 18 — a `net-error` now means
+only a genuine transport failure), the resulting display-frame emission
 toward the head, **and one `file-write`/`file-chunk` pair carrying a second
 nonce into the quarantine** (the only producer of the quarantine-write
 tell; found during planning as finding A, folded into Final State #9).
-Legible `net-error` recording if the upstream call fails — **now the
-designed, expected outcome under the operator's no-billing ruling (Final
-State #5), not a fallback**. **`serve.rs`'s `body_fingerprint` diagnostic
-addition** (Final State #3, ratified non-cryptographic — dependency-free,
-not `sha2`) and **the `401`-status diagnostic** (Final State #6, found at
-this same gate), both required for their respective tells to have an
-observer at all. **`s17_head`**, the scripted head client (Final State
+**`serve.rs`'s `body_fingerprint` diagnostic addition** (Final State #3,
+ratified non-cryptographic — dependency-free, not `sha2`) is required for
+the request-side tell to have an observer at all; the response-side tell
+needs no equivalent addition, since Sprint 18's relay already delivers the
+status line and headers the box reads directly (Final State #6,
+superseded). **`s17_head`**, the scripted head client (Final State
 #8): built in this slice rather than Slice 3, a scope extension beyond
 the slice's original naming that review endorsed as a genuine risk
 reduction (no hardware touched building it; both ends of the socket
@@ -575,17 +657,22 @@ unlink/bind-race sharpening); the operator invokes `serve` as
 in their own shell (Final State #5/#11; finding B: plain `sudo` strips it
 via `env_reset`), never as a `sudo VAR=...` command line. The two
 binaries run in the enforced start order (Final State #10); the round
-trip completes end to end (Final State #7, the fingerprint match and the
-diagnostic `401` as the two tells) with the no-billing upstream call
-(Final State #5/#6); the scripted head (run as root, per Final State
+trip completes end to end (Final State #7 — the request-side fingerprint
+match, and the response-side status-line-plus-`request-id` pair, as the
+two tells) with the no-billing upstream call (Final State #5); the
+scripted head (run as root, per Final State
 #10's residual) observes the real display frame (Final State #8); the
 quarantine write proceeds against the provisioned directory with pre-run
 state recorded (Final State #9); both bench cards are rebound to `ixgbe`
 afterward (Final State #12); the capture log is scrubbed for credential
 material before it is attached to this document (Final State #13). Gate:
 full capture-model discipline (Final State #14); every tell present
-(request-body-fingerprint-match, response-401-status-diagnostic,
-head-frame-marker, quarantine-write-as-dropped-uid); operator
+(request-body-fingerprint-match, response-status-line-and-request-id,
+head-frame-marker, quarantine-write-as-dropped-uid); **the credential
+value is asserted well-formed — visible ASCII, no CR, no LF — before
+anything is unbound** (reviewer's addition, folding Final State #5's
+proof-precondition finding into a checked precondition rather than a
+pinned-by-discipline assumption; no Sprint-18 code touched); operator
 paste-and-confirm executed before hardware is touched.
 
 ## Non-Goals
@@ -689,19 +776,20 @@ Audit first, in this order:
   request-side bind-the-chain tell — a live `body_fingerprint` match
   between the body `serve.rs`'s `on_verdict` admits and the body
   `s17_box` sent, not a printed nonce with no observer (found and closed
-  during Slice 2's design review) — the response-side tell, under the
-  operator's no-billing ruling, is the **diagnostic `401` status** printed
-  from the real `ureq::Error`, correlated via `in_reply_to` and the
-  serial-bound-of-1 exclusivity (honestly narrower than the originally
-  planned unsynthesizable-`id` tell would have been — see Final State #7
-  for the precise scope of what this does and does not prove), the
-  head-side marker tell (a display frame traceable to the box's own
-  net-error observation), and the quarantine-side write tell (a real file
-  landing as the dropped uid). No tell depends on the model's
+  during Slice 2's design review) — the response-side tell, under Sprint
+  18's verbatim relay, is **the box's own directly-observed status line
+  (`HTTP/1.1 401 Unauthorized`) plus Anthropic's `request-id` response
+  header**, correlated via `in_reply_to` and the serial-bound-of-1
+  exclusivity (Final State #7 — this supersedes the originally planned
+  `serve`-stderr diagnostic, and the header restores the per-call-unique
+  evidence a successful call's `id` would have given), the head-side
+  marker tell (a display frame traceable to the box's own response
+  fingerprint), and the quarantine-side write tell (a real file landing
+  as the dropped uid). No tell depends on the model's
   instruction-following, and none requires a successful call. Stated
   honestly: this rules out a coincidental or purely-local failure; it is
-  not an anti-fabrication proof, and the capture model does not require
-  one.
+  not an anti-fabrication proof of a *successful* call, and the capture
+  model does not require one.
 - **The provisioned quarantine's chown target is the subdirectory, never
   its parent.** `HEAD_SOCKET_PATH` lives in the parent
   (`/run/zerotrust-proxy`); `QUARANTINE_ROOT` is a subdirectory of it. The
@@ -751,16 +839,31 @@ Audit first, in this order:
   drop-target uid — only the `quarantine` subdirectory; chowning the
   parent introduces an unlink/bind race on the head socket.
 - REJECT attempting a successful upstream call, or leaning on response
-  content (an `id`, `usage`, or otherwise) as a tell — the operator's
-  ruling makes a `401` the designed outcome; the diagnostic status code,
-  correlated via `in_reply_to` and the serial-bound-of-1 exclusivity, is
-  the response-side tell, honestly scoped as reachability-and-correct-
-  behavior, not content-integrity.
-- REJECT relying on the box's `NetError` code alone to identify a `401`
-  specifically — `map_ureq_error`'s catch-all collapses every HTTP-status
-  failure into the same generic code; the diagnostic print of the real
-  `ureq::Error` (Final State #6) is what actually establishes it was a
-  `401`, not a TLS failure or an unrelated local error.
+  *body* content (an `id`, `usage`, or otherwise) as a tell — the
+  operator's ruling makes a `401` the designed outcome; the response-side
+  tell is the status line and Anthropic's `request-id` header (Final
+  State #7), correlated via `in_reply_to` and the serial-bound-of-1
+  exclusivity, honestly scoped as reachability-and-correct-behavior plus
+  per-call uniqueness, not body content-integrity.
+- REJECT a response-side tell that only checks "a response arrived"
+  without confirming the relayed bytes actually begin `HTTP/1.1 401` and
+  carry Anthropic's `request-id` header — a response arriving for an
+  unrelated reason (a stray local listener, a misrouted session) would
+  falsely satisfy a presence-only check; the specific status line and
+  header are what establish the real endpoint was reached and rejected
+  this specific call, not merely that some bytes came back.
+- REJECT a credential-echo check scoped to the response body alone —
+  under verbatim relay the credential could in principle surface
+  anywhere in the relayed bytes (status line, headers, or body); the
+  check must scan the *whole* buffer the box received, never a chosen
+  part of it (the same full-buffer-over-enumerated-parts discipline
+  Sprint 18 FS#5 established on the request side; reviewer's finding).
+- REJECT proceeding to Slice 3 without asserting the pinned credential
+  value is well-formed (visible ASCII, no CR, no LF) first — Sprint 18
+  FS#5's byte-exact-wire proof is proven only for a well-formed
+  credential (a CRLF would move the body boundary, not merely malform a
+  header), so this capture's own no-code-touched mitigation is a checked
+  precondition, not an assumption (reviewer's finding).
 - REJECT an upstream request body carrying anything beyond the nonce and a
   fixed minimal filler — no repo content, host identifiers, or path
   information published to the third party.
@@ -787,7 +890,7 @@ Audit first, in this order:
   values ever crossed a boundary where a party could craft a collision,
   this design would need revisiting before reuse.
 - REJECT a capture missing any of the four tells
-  (request-body-fingerprint-match, response-401-status-diagnostic,
+  (request-body-fingerprint-match, response-status-line-and-request-id,
   head-frame-marker, quarantine-write-as-dropped-uid).
 - REJECT any device-id-based enumeration, a missed exact-BDF gate, or a
   missed operator paste-and-confirm step on either binary.
@@ -808,3 +911,253 @@ facts of the current source, not open design forks; the peer-MAC placement
 existing `PROXY_BDF`/`HEAD_SOCKET_PATH` precedent in the same file, not
 escalated. Route to review for confirmation before execution, given the
 real-hardware and real-upstream-cost stakes.
+
+## Retrospectives
+
+### zero.proxy-review
+
+**What I verified.** Before hardware: the bench MACs read from sysfs rather than
+trusted; `/run`'s writability established by an actually-refused `mkdir` rather
+than by its mount flags; the recognizer's top-level whitelist confirmed to admit
+the planned request body; and the readable root found missing and unprovisioned,
+which would have failed the capture at its last step after the full bench
+sequence. At the gate: binary coherence, which was my half of the split verdict.
+Run-outcome was taken from the self-pinned capture and flagged as such
+throughout, never as independently witnessed.
+
+**The coherence methodology, which is the most transferable thing here.** A
+rebuild that reports *zero recompilation* proves only that cargo's fingerprint —
+mtime and size — is unchanged. It does **not** prove that the current source
+*content* compiles to the recorded bytes. So the verification was `cargo clean -p
+proxy` (12,762 files, 3.5 GiB removed) followed by each binary's exact recorded
+invocation, run separately. All three reproduced byte-identically. That is a
+content-to-binary proof, and it *subsumes* the mtime, cargo-fingerprint, and
+byte-comparison arguments rather than inheriting them: a source tree that had
+drifted cannot recompile to identical bytes from a cleaned target. For a capture
+whose source was never committed, this is the only thing that closes the
+dirty-tree question.
+
+**The near-miss inside that methodology, which matters more than the result.**
+My first attempt built into a *separate* target directory, to force a from-source
+compile without perturbing the tree. `serve` matched exactly; `s17_box` and
+`s17_head` did not. Two of three failing is precisely the shape of a coherence
+failure — and it was **my recipe**, not the tree. The two that diverged are the
+two that link `benchtools`, whose build script output is target-directory
+dependent; `serve` does not link it and was unaffected. What prevented a false
+report was not caution but *investigating the asymmetry* — the pattern of which
+binaries failed was itself the evidence, because a genuine tree drift would not
+have spared exactly the one binary with no build-script dependency. I had warned
+this team, before this capture, that a wrong recipe manufactures a mismatch that
+looks like a coherence failure. I then produced one. **The reproduction recipe
+must therefore specify the target directory** alongside the absolute source path,
+rustc, profile, rustflags, and per-binary feature set — and the invocations must
+be run separately, since feature unification links a bench-enabled `directpath`
+into the production binary and changes `serve`'s bytes.
+
+**What changed my read.** This sprint inverted its own premise twice, and both
+times I was on the wrong side first. I argued for *pinning* the behaviour that
+converted an upstream `401` into a proxy-authored error — which was itself the
+MB3 violation, forbidden in terms by `cloud/approach.md` §5, which had even
+pre-refused the shape of my argument. Then the full-raw-relay ruling superseded my
+own stated claim that the box could not see the status line. The pattern in both:
+I reasoned from a plausible model of the system instead of reading the artifact,
+and it happened while *extending* something I had got right rather than while
+testing someone else's claim.
+
+**Two corrections of myself worth writing down.** First, I specified that the
+`/proc/PID/exe` read must be performed as root, because reading another process's
+exe link requires `ptrace_may_access` — and then, in the same message,
+recommended recording `/proc/PID/cmdline` without carrying that reasoning across.
+`cmdline` happens to be world-readable, so the recommendation works on this host
+*incidentally*; under `hidepid=` it would have silently produced nothing, which
+is the exact failure shape it existed to prevent. Dev's `sudo`-ordering fix
+repaired a mechanism whose specification I under-wrote. Second, when the evidence
+artifact gained two corrections, I verified that both were *present* — true — and
+then narrated *who wrote them*, which I had not checked and which was recorded in
+the file. I verified the fact and inferred the story. Same shape as the reversals
+above; harmless in outcome, which is exactly when it slips through.
+
+**The best evidence in this capture was not designed.** The upstream chose
+`Transfer-Encoding: chunked`, and the raw chunk framing survived into the relayed
+bytes — the length line and the terminating `0\r\n\r\n`, confirmed by `od`. Any
+general-purpose HTTP client de-chunks that; the proxy did not, because it has no
+response parser at all. That demonstrates the dumb-verbatim-pipe property using an
+encoding nobody anticipated, which is stronger than the synthetic arms precisely
+because nobody chose it. A capture should leave room for the real system to
+surprise it, and should record what it did *not* design for — that is often the
+strongest thing in the artifact.
+
+**What the next sprint should inherit.** *Commit the source before a capture
+run.* This capture's dirty tree was already a known weakness; the cost
+materialised when a single post-capture prose fix — one I ruled should be made —
+permanently stranded `s17_head`'s captured binary, since its source was never
+committed and was overwritten. Slice 3's coherence is consequently **not uniform**:
+`serve` and `s17_box` remain re-derivable, `s17_head` is anchored on a preserved
+artifact plus a gate-time verification. Also carried: the correlation tell is at
+its weakest when the session id is `0`, where a correct correlation and an
+uninitialised default are indistinguishable — one throwaway session before the
+net-address session removes the ambiguity at zero cost; and credential
+*attachment* is established by FS#5's byte-exact wire check, never by the `401`'s
+wording, which does not distinguish a wrong key from an absent one.
+
+### zero.proxy-dev
+
+**This sprint was blocked by its own investigation, and that was the sprint working.** It opened as a
+live-capture sprint and stopped when the operator caught `http_status_as_error(true)` — a flag I had
+verified thoroughly and never questioned. That stop produced Sprint 18 (the verbatim pipe) and Sprint 19
+(the register fixes the dial), and only then could this one run. The capture that eventually passed is
+not the capture that was designed: it proves the *relay* path rather than the error path, because an
+invalid credential now arrives as the upstream's own 401 instead of a proxy-invented `net-error`. **A
+capture sprint that cannot be run yet is evidence about the system, not an obstacle to it.**
+
+**What the live run gave that no test server could.** The single strongest piece of evidence in the whole
+capture was not designed for: the real response came back `Transfer-Encoding: chunked`, and **the raw
+chunk framing survived into the relayed bytes** — the `82` length line and the terminating `0\r\n\r\n`,
+confirmed by `od`. Any general-purpose HTTP client would have de-chunked it. Sprint 18's synthetic gzip
+arm proves the same property, and this is better evidence, for one reason: **nobody chose it.** A test
+server can only produce what someone thought to script; the real upstream picked an encoding we never
+considered and the pipe relayed it untouched anyway. Worth keeping as a general principle for what a live
+capture is *for* — not to re-confirm what the unit tests already cover, but to be surprised.
+
+The `request-id` header was likewise a gift of the new shape (`req_011CdP6wybnrmm3yDQ5pibFb`), and it
+corroborates itself: the same id appears independently in the response header *and* in the JSON body's
+`request_id` field. Because the FS#7 narrowing was written **before** the run, its absence would have
+produced a stated, narrower claim rather than an argument about how much the capture proved. Pre-writing
+both branches cost twenty minutes and removed a whole category of after-the-fact reasoning.
+
+**What failed, and the pattern connecting most of it.** Five things went wrong that were mine:
+
+- **The credential well-formedness check accepted the input it existed to reject.** I wrote the obvious
+  `grep -qE '^[!-~]+$'`. `grep` is line-oriented, so a credential containing LF splits into two lines and
+  the pattern matches the first — it passed an LF-bearing value, the one character that would terminate
+  the header block early and move the body boundary. Rewritten as a byte-count comparison, which has no
+  line semantics.
+- **My first reap probe used `exec`**, which replaced the shell, so the wrapper had no child and the
+  child-sweep branch never ran. It passed having tested nothing.
+- **My first restore after the feature-unification experiment rebuilt only `serve`**, leaving `s17_box`
+  and `s17_head` sitting at their both-features bytes. Caught by comparing all three against the
+  preserved copies rather than assuming one command undid one command.
+- **I sent a message referencing an attachment I had not written yet.** Trivially avoidable; write the
+  artifact, then reference it.
+- **I edited `s17_head.rs` in place when it had never been committed** — see below.
+
+The first three are the same failure: *a check that ran, reported success, and verified nothing.* That is
+the identical shape as Sprint 18's vacuous FS#10 arm and Slice 1's `is_err()`-only refusals. The
+counter-discipline that actually worked, every time it was applied: **exercise a new check against the
+inputs it must REJECT before trusting it.** All three were caught that way, by me, before they reached
+anything that mattered — which is the improvement over earlier in this arc, where review caught them.
+
+**The one that could not be fixed after the fact.** `s17_head.rs` was never committed. After the capture
+was accepted, it needed a one-line-class prose fix, I edited it in place, and the source that produced
+the capture's `cd7d327d…` binary **ceased to exist** — no git history, not in the index, no copy on disk.
+The binary is preserved and review independently re-hashed it, so the evidence stands; but one of three
+binaries permanently lost its source-to-binary link.
+
+I chose not to reconstruct the file, and that call is worth recording because the temptation was real: the
+pre-fix text was still in my working context and I could have produced a plausible file in a minute. **A
+reconstructed source would look like evidence while being an assertion** — it might not even rebuild to
+`cd7d327d…`, and no one downstream could tell by inspection. The gap is the state of the record, so the
+gap is what the record says.
+
+**COMMIT SOURCE BEFORE THE RUN.** That is the lesson, and it generalises further than the one file: it is
+the same shape as the *bin-sha binds bytes, not git* limit flagged in the evidence chain, where the
+binaries self-declared `git: 0ebfaa0` against a dirty tree that could never rebuild them. **Both say the
+git record has to be made BEFORE the measurement, not after.** Any future capture should commit the
+source first, so that (a) the provenance header's git rev means something, and (b) a post-capture fix
+moves the tree forward instead of stranding the evidence behind an untracked file.
+
+**A second artifact-integrity lesson, from the two defects the run found.** Both were the same class: an
+artifact asserting something no longer true. `s17_head`'s output described the superseded `net-error`
+design while printing a `resp-fp:` marker, and the teardown printed "check manually" on a perfectly clean
+run because it branched on a bind write that returns `EBUSY` when the card is *already* bound. The second
+matters more than it looks — **a teardown that cries wolf every run trains an operator to skim past the
+one message that matters** when a card genuinely is left unbound. Same reasoning retired the script's
+stale `DO NOT RUN — STALE` banner once the capture had passed: that banner is read immediately before
+someone touches hardware, and a false one is worse than none.
+
+**What the next sprint should inherit.**
+
+- **Re-read the tells against what the pipe does NOW before any re-run.** This capture was blocked for an
+  entire sprint because an upstream-client change silently invalidated response-side tells designed
+  against the old one. That is a standing hazard, not a one-off: the tells couple to a component that
+  other sprints own.
+- **Build the three binaries with three SEPARATE `cargo` invocations.** Measured, not theoretical:
+  combining them unifies features and produces a different `serve` (`3d0cbaab…` vs the capture's
+  `38e14a57…`), because `bench-capture` enables `directpath/bench` and the unified build links the bench
+  internals *into the production binary* — precisely what the feature gate exists to prevent. Recorded in
+  `docs/proxy/tools/s17-capture.md`.
+- **`request-id` is now a real per-call-unique tell** available to any future capture, and stronger than
+  anything designed here. It did not exist as an option before Sprint 18 made headers reach the box.
+- **The runner lives at `docs/proxy/tools/s17-capture.sh`** with companion notes, no longer in an
+  ephemeral scratchpad. Artifacts land outside the repo by design.
+- **The paste-and-confirm gate held, and holding it was right.** The production NIC at `0000:61:00.0`
+  carries this host's default route and reports the *identical* `0x10fb` device id as both bench cards.
+  Neither I nor the lead self-cleared it; it went to the operator. Keep that shape — the cost is one
+  message and the failure mode is taking the host off the network, which also severs the path the failure
+  would be reported on.
+
+### zero.proxy-lead
+
+**What this sprint actually was, versus what it looked like at hand-off.** The
+PM's directive read as "run the capture and close it" — three sentences. What it
+required first was reconciling a sprint contract drafted before Sprint 18 against
+a codebase Sprint 18 had since rewritten underneath it: the response-side tell's
+entire mechanism (a `ureq`-error diagnostic) no longer existed in source, and the
+contract still described it as current. Resuming a held sprint is not a resume
+button; it is a currency check on the contract itself before anything is routed,
+and this one needed a real correction pass, not a footnote.
+
+**Where I drew my own line, and where it moved.** I read source, ran builds and
+tests, and edited the sprint contract directly throughout — verification and
+process-of-record are mine to do. I did not edit `proxy/src/`, the capture
+script, or the evidence artifact's substance; those routed to dev. The one
+edit I made to an artifact outside the contract — the bracketed correction on
+the archived evidence chain — I made because review named it explicitly as mine
+(a record-correction, not a code fix), and I would not have made it unprompted.
+Worth stating plainly: I nearly over-claimed credit for that same annotation
+before checking whether dev had already added one independently. Catching that
+before sending it mattered more than the annotation itself.
+
+**The hardware gate was the cleanest moment in the sprint, and it worked because
+nobody tried to be clever about it.** Dev held rather than self-cleared the
+paste-and-confirm step; I held rather than clearing it myself, for the same
+reason — an error there takes the host off its own network, which is exactly
+the class of decision this team's discipline reserves for the actual operator.
+Escalating a decision I could have technically approved was not caution for
+its own sake: the whole point of routing it up was that neither of us carried
+the standing to absorb that specific risk, and naming that plainly was cheaper
+than any alternative.
+
+**The s17_head bin-sha consequence is the sprint's sharpest lesson, and it is
+about sequencing, not about any single mistake.** A ruling I made (fix the stale
+prose, don't re-run hardware for a comment) had a cost neither dev nor I priced
+in advance: the fix permanently orphaned one binary's source, because that file
+had never been committed. Nobody did anything wrong in isolation — the
+contract's own Method already named the dirty-tree risk as an open limit before
+the run — but the sprint closed that risk's actual bill only after the fact,
+and only because review pushed on exactly this point rather than accepting the
+first "it's fine, preserved separately" answer. That is the shape to watch for
+going forward: an accepted risk that is still abstract at gate time can become
+concrete the moment someone makes an unrelated, individually-correct edit
+afterward.
+
+**On the team's own discipline holding under real stakes.** Every gate in this
+sprint that mattered — the paste-and-confirm, the coherence-versus-verdict
+question, the missing-source disclosure — was resolved by someone naming a
+limit precisely rather than rounding it off to "close enough." Dev choosing not
+to reconstruct a lost source file when reconstruction was trivially available,
+review distinguishing a verified fact from an inferred story about that fact,
+and both catching their own errors before I had to — none of that is
+guaranteed by the process I run; it is the actual behavior of the team, and it
+is worth recording as the reason this sprint's evidence is trustworthy rather
+than merely green.
+
+**What the next sprint should inherit, beyond what dev and review already
+named.** Commit source before any hardware run, without exception — not a
+style preference, a concrete lesson with a concrete cost attached. When a held
+sprint resumes after a dependency sprint has landed, budget for a contract
+reconciliation pass before routing any execution; assume the contract is stale
+until checked, not until proven so. And hold the line that a slice-boundary
+ACCEPT is a verdict about a state of the world at a time — a later, individually
+correct fix does not retroactively unmake it, but it can still owe the record
+an honest note about what changed underneath it.

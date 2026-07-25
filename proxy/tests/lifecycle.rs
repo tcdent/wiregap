@@ -521,3 +521,33 @@ fn milestone_all_four_authority_rungs_validate_for_real_and_the_ladder_serves() 
 
     let _ = std::fs::remove_dir_all(&readable);
 }
+
+/// The capture's bind-the-chain observer (Sprint 17): both the box and the proxy fingerprint the request
+/// body with THIS function, and a match proves the body crossed the seam unmangled. Content-free by
+/// construction — the output carries a hash and a length, never any of the bytes.
+#[test]
+fn body_fingerprint_distinguishes_bodies_and_leaks_none_of_them() {
+    use proxy::lifecycle::body_fingerprint;
+
+    let body = br#"{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"ping abc123"}]}"#;
+
+    // Deterministic: the two sides compute the same value for the same bytes (the whole point).
+    assert_eq!(body_fingerprint(body), body_fingerprint(body));
+
+    // Sensitive to the mangling classes this tell exists to catch.
+    assert_ne!(body_fingerprint(body), body_fingerprint(&body[..body.len() - 1]), "truncation");
+    let mut swapped = body.to_vec();
+    swapped.swap(10, 20);
+    assert_ne!(body_fingerprint(body), body_fingerprint(&swapped), "reordering");
+    let mut extra = body.to_vec();
+    extra.push(b' ');
+    assert_ne!(body_fingerprint(body), body_fingerprint(&extra), "an appended byte");
+
+    // CONTENT-FREE: the fingerprint contains no run of the body. The nonce is the thing that must not
+    // leak into a log, so it is checked explicitly.
+    let fp = body_fingerprint(body);
+    assert!(!fp.contains("abc123"), "the fingerprint must not carry the body's content");
+    assert!(!fp.contains("messages"), "the fingerprint must not carry the body's content");
+    // It does carry the exact length, deliberately — a length mismatch is legible on sight.
+    assert!(fp.ends_with(&format!("/{}", body.len())));
+}

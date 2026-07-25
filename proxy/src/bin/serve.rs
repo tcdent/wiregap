@@ -34,11 +34,6 @@
 //! **STILL HELD:** the live end-to-end round-trip — a real 82599 on the bench, a connected head, a real
 //! upstream call. Reaching `Served` means every authority *validated*, not that traffic has flowed.
 //!
-//! Beyond that, the live end-to-end round-trip additionally needs a real operator credential and a real
-//! head — neither present in a normal environment. (The quiescent-wake liveness this once listed as held
-//! on "Task 20" is **discharged**: Sprint 14 proved on real hardware that the unmodified reactor already
-//! services a quiescent arrival, and the proxy-side `idle_cap` was dropped as counterproductive.)
-//!
 //! SAFETY (reuses `s5_capture`'s exact posture): the ONLY device touched is the bench proxy card by
 //! EXACT BDF (`Bdf::parse` literal). NEVER device-id enumeration — the production NIC at 0000:61:00.0 is
 //! ALSO a 0x10fb and would match a scan. Two floors: the construct allowlist = [41:00.0] (this card
@@ -61,7 +56,8 @@ use std::os::unix::net::UnixListener;
 
 use directpath::Bdf;
 use proxy::head::{HeadConnection, run_adapter_composed};
-use proxy::lifecycle::{Assembly, BringUpConfig, Readiness, assemble, bring_up};
+use proxy::dispatch::Routed;
+use proxy::lifecycle::{Assembly, BringUpConfig, Readiness, assemble, body_fingerprint, bring_up};
 use proxy::register::anthropic::{CREDENTIAL_SOURCE, VETTED_TOOLS};
 use proxy::register::filesystem::{QUARANTINE_ROOT, READABLE_ROOT};
 use proxy::register::net::ROUTES;
@@ -73,11 +69,16 @@ const PROXY_BDF: &str = "0000:41:00.0"; // the proxy's bench card — the ONLY d
 // ── PLACEHOLDER config (pending the Sprint-8 config DSL; no config system is invented here) ─────────
 const DROP_UID: u32 = 65534; // nobody — the unprivileged drop target (config hook, same as s5_capture)
 const DROP_GID: u32 = 65534;
-// The box's L2 MAC the transport targets. No config DSL and no MAC-discovery for a standalone proxy yet,
-// so a marked const the operator MUST set to the real box MAC before a LIVE run. Zeroed so a mis-run
-// fails loudly at the transport rather than addressing a wrong peer. Never exercised this sprint (the
-// live round-trip is HELD).
-const PEER_BOX_MAC: [u8; 6] = [0u8; 6];
+// The box's L2 MAC the transport targets — the bench BOX card at 0000:63:00.0, read from sysfs while it
+// was still `ixgbe`-bound (Sprint 17). An **addressing/wiring** parameter, deliberately a bare `const`
+// like `PROXY_BDF` and `HEAD_SOCKET_PATH` rather than a Sprint-16 register entry: it gates nothing at the
+// authority ladder, and getting it wrong means frames are never recognized at all — not that an untrusted
+// input is wrongly admitted. There is no MAC discovery between two separate processes (the in-process
+// exchange `two_facade` uses is unavailable across a process boundary), so each side is configured with
+// the other's MAC; `s17_box` is configured with the proxy card's (`90:e2:ba:c7:69:a0`).
+//
+// It was `[0u8; 6]` — a deliberate fail-loud placeholder — for every sprint before a real peer existed.
+const PEER_BOX_MAC: [u8; 6] = [0x90, 0xe2, 0xba, 0xd0, 0x68, 0xac];
 // The head-connection rendezvous socket (config hook) — the operator's head connects here.
 const HEAD_SOCKET_PATH: &str = "/run/zerotrust-proxy/head.sock";
 // NOTE: there is deliberately NO endpoint constant here. It existed until Sprint 19 and was the second,
@@ -119,6 +120,24 @@ fn main() -> io::Result<()> {
     // Blocks until a head connects — a real proxy waits for its head. The composed adapter owns it. (The
     // accept precedes the ladder's authority check because the committed `bring_up` takes the adapter — and
     // thus the head — up front; a missing credential still closes the whole proxy, just after a head lands.)
+    // Clear a STALE socket file before binding (Sprint 17). A Unix socket path outlives the process that
+    // bound it, so a prior run — or a crash — leaves the file behind and `bind` then fails `EADDRINUSE`.
+    // Without this, the first failed attempt wedges every subsequent one. `NotFound` is the ordinary case
+    // (nothing to clear) and is not an error; any other failure is reported but not fatal here, because
+    // `bind` immediately below gives the authoritative outcome and reporting both would be noise.
+    //
+    // **Why this is not a race, and what keeps it that way.** Between the unlink and the bind the path is
+    // briefly absent, so anything able to CREATE a file at that path could interpose one and receive the
+    // head connection. Nothing unprivileged can: this runs as root, before the privilege drop, and the
+    // containing directory `/run/zerotrust-proxy` is root-owned. That is a **provisioning obligation, not
+    // an accident** — only the quarantine SUBDIRECTORY is chowned to the drop-target uid; chowning the
+    // parent would hand exactly this window to the dropped uid, so it must not be done.
+    match std::fs::remove_file(HEAD_SOCKET_PATH) {
+        Ok(()) => eprintln!("proxy: cleared a stale head socket at {HEAD_SOCKET_PATH}"),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("proxy: could not clear {HEAD_SOCKET_PATH}: {e} — bind will report the outcome"),
+    }
+
     eprintln!("proxy: awaiting head on {HEAD_SOCKET_PATH} …");
     let listener = UnixListener::bind(HEAD_SOCKET_PATH)?;
     let (stream, _addr) = listener.accept()?;
@@ -147,7 +166,21 @@ fn main() -> io::Result<()> {
         VETTED_TOOLS,
         client,
         head,
-        |_session, _routed| ControlFlow::Continue(()),
+        // THE BIND-THE-CHAIN OBSERVER (Sprint 17). `NetPayloadAdmit` carries the exact body the tier-1
+        // recognizer admitted and the upstream call forwards verbatim, so fingerprinting it HERE observes
+        // the real forwarded bytes rather than a re-derivation. Content-free: only a hash and a length are
+        // printed, never any of the box's bytes. Diagnostic only — no verdict is changed, the closure
+        // still returns `Continue`, and the loop behaves exactly as before.
+        |session, routed| {
+            if let Routed::NetPayloadAdmit(body) = routed {
+                eprintln!(
+                    "proxy: net-payload ADMITTED on session {:#x} — forwarded-body fingerprint {}",
+                    session.0,
+                    body_fingerprint(body),
+                );
+            }
+            ControlFlow::Continue(())
+        },
     );
 
     // `bring_up`: construct (privileged, exact-BDF) → real privilege drop (+ IB2 self-check) → the

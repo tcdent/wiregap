@@ -285,6 +285,31 @@ pub fn kernel_protections_hold(quarantine: std::os::fd::BorrowedFd<'_>) -> bool 
     protections_ok && crate::open_discipline::openat2_resolve_available(quarantine)
 }
 
+/// A **content-free fingerprint** of a request body — the observer for the capture's bind-the-chain tell
+/// (Sprint 17). The box prints the fingerprint of what it SENT; the proxy prints the fingerprint of what
+/// it ADMITTED and forwarded; a match proves the body crossed the seam unmangled — while logging none of
+/// its content. Both sides call THIS function, so the comparison cannot drift.
+///
+/// **Deliberately not a cryptographic hash, and the reason is the reviewability budget.** There is no
+/// `sha2`/`digest` crate in this crate's dependency tree, so a literal SHA-256 here would mean adding a
+/// crypto dependency to the TCB — spending the guarantee the whole project rests on (`principles.md`
+/// §15) to print a diagnostic. It is not needed: the property required is that an *accidental* mangling
+/// (a truncation, a re-encode, a reordered field) is detected, between two cooperating processes that are
+/// both ours. There is no adversary crafting a collision between "what the box sent" and "what the proxy
+/// forwarded". A 64-bit FNV-1a plus the exact length gives that with overwhelming probability, in eight
+/// reviewable lines and no dependency.
+///
+/// Emits `<hash>/<len>`: a length mismatch is legible on sight, and length + hash is stronger than either.
+#[must_use]
+pub fn body_fingerprint(body: &[u8]) -> alloc::string::String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+    for &b in body {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+    }
+    alloc::format!("{h:016x}/{}", body.len())
+}
+
 /// **The one composition-root assembly** (Sprint 16): compiled root paths → validated, pinned roots →
 /// a `Dispatcher` holding both. `serve.rs`'s `main` calls this, and so do this sprint's tests — there is
 /// no test replica of the wiring, so what the tests prove is what the binary runs.
