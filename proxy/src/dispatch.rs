@@ -867,7 +867,8 @@ impl Dispatcher {
 
     /// Enqueue one upstream cloud-response chunk for the box (Sprint 10 Slice 3) — `net-response`,
     /// stamped with `box_session` (the box's ORIGINATING net-request session) as `in_reply_to`. Fed by
-    /// the cloud ingress (a **fake** in tests this slice; the real upstream TLS client is a follow-on),
+    /// the cloud ingress (a **fake** in tests; the real one is `upstream::AnthropicClient`, a TLS client
+    /// to the upstream — the box-facing side of this queue carries plaintext and no TLS whatsoever),
     /// drained to the box on `pump_replies` ticks. Bounded: returns [`Enqueue::Full`] as **backpressure**
     /// at [`REPLY_QUEUE_CAP`] — the ingress must then stop reading upstream and retry (never drop, never
     /// grow). Creates the per-session push stream on the first accepted chunk.
@@ -1098,12 +1099,11 @@ impl Dispatcher {
 /// a path-less route (a bare domain) yields the root path `/`. The returned slices are `&'static`
 /// (the `Route` owns a `&'static str`), so they outlive the `&self` borrow and can back a `Request`.
 fn split_route(route: Route) -> (&'static str, &'static str) {
-    let s = route.as_str();
-    let rest = s.strip_prefix("https://").unwrap_or(s);
-    match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]), // path keeps its leading '/'
-        None => (rest, "/"),                 // bare domain → root path
-    }
+    // Delegates to the ONE decomposition on `Route` itself (Sprint 18 Slice 2). U4's envelope and the
+    // upstream dial both derive host/path from a matched route; two implementations that happened to
+    // agree would let U4 check one destination while the dial used another — the same
+    // agreement-by-authorship gap Sprint 19 removed between the register and the dial.
+    route.split()
 }
 
 #[cfg(test)]

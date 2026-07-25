@@ -1,5 +1,19 @@
 //! Sprint 18 Slice 1 — the verified TLS transport for the one upstream call site.
 //!
+//! **ONE TLS ROLE: client, outbound, to the upstream. Never a server, never inbound**
+//! (`cloud/approach.md`: "the proxy is a TLS **client** to the public upstream, and it is **not** a TLS
+//! server. It does not terminate TLS from the box"). The box terminates its own TLS and hands the proxy
+//! **plaintext** over the project wire (`net-address` + `net-payload`), which carries no TLS at all — so
+//! the proxy performs exactly one outbound handshake per call and **no inbound handshake ever**. That is
+//! why the only configuration in this module is a `ClientConfig`, why the only entry point is
+//! `TlsPipe::connect`, and why nothing here accepts a connection. `architecture.md` §11 L10 depends on
+//! it: box bytes reach the TLS stack only as plaintext to encrypt, and the stack's parser only ever sees
+//! the *cloud's* records — a claim that would not survive this module also being a server.
+//!
+//! (`rustls`'s SERVER API does appear below, in the `#[cfg(test)]` `testserver` module only, where it
+//! stands in for the upstream so the refusals can be proven offline. It is never linked into the shipped
+//! binary — a grep for `ServerConfig` in this crate should find that module and nothing else.)
+//!
 //! A **dumb, fixed pipe**: connect to a named host over TLS with the certificate genuinely verified,
 //! write bytes, read bytes until the peer closes. It is not an HTTP client and deliberately contains no
 //! HTTP knowledge — no redirect following, no proxy resolution, no content decoding, no response parsing.
@@ -37,7 +51,8 @@
 //!
 //! **The audit is necessary and NOT sufficient.** A disabled verifier connects perfectly, streams a
 //! response, and satisfies every functional test — a successful round trip is *zero* evidence that
-//! verification is on. What closes it is the negative-control run in `tests/upstream_tls.rs`: an
+//! verification is on. What closes it is the negative-control run in the `negative_control` module below:
+//! an
 //! untrusted certificate, a certificate for the wrong hostname, and an expired certificate must each be
 //! **refused**. The table above says the bypasses are absent; only the refusals show the verifier is
 //! actually running.
@@ -114,7 +129,7 @@ impl TlsPipe {
     /// entry point above is the only way in from outside this module, so no caller can supply a
     /// weakened configuration. The negative-control tests use it to trust a local CA — varying the trust
     /// anchors only, never the verifier.
-    fn connect_with_config(
+    pub(crate) fn connect_with_config(
         host: &str,
         port: u16,
         io_timeout: Duration,
@@ -220,20 +235,26 @@ impl Write for TlsPipe {
     }
 }
 
+
 #[cfg(test)]
-mod negative_control {
-    //! **The half a static audit cannot supply.** The module-level bypass table shows every
-    //! verification-defeating route is absent; that is necessary and not sufficient, because a disabled
-    //! verifier connects perfectly and streams a response — a successful round trip is *zero* evidence
-    //! that verification is on. These tests are the evidence: certificates that must be REFUSED, and one
-    //! that must be ACCEPTED so the refusals cannot be passing vacuously.
+pub(crate) mod testserver {
+    //! The local TLS server the whole sprint's offline evidence runs against — shared, because two
+    //! modules need the same one and a second copy would be a second thing to keep true.
     //!
-    //! Everything runs against a local TLS listener with locally generated certificates — no external
-    //! bad-certificate service, no network, no bench hardware, fully reproducible.
+    //! [`negative_control`](super::negative_control) uses it to present certificates that must be
+    //! REFUSED; Slice 2's upstream tests use it to capture the exact bytes the proxy puts on the wire and
+    //! to reply with scripted responses (a 302, a gzip-labelled body) that must be relayed untouched. No
+    //! external service, no network, no bench hardware.
     //!
     //! Only the TRUST ANCHORS differ from production (a local CA instead of `webpki-roots`); the
-    //! verifier, the named crypto provider, hostname matching, and the TLS-1.3-only version set are all
-    //! the shipped ones, via the shared [`client_config_with_roots`].
+    //! verifier, the named crypto provider, hostname matching, and the TLS-1.3-only version set are the
+    //! shipped ones, via the shared [`client_config_with_roots`](super::client_config_with_roots).
+    //!
+    //! **The `rustls` SERVER API used here is this test double, not the proxy.** It impersonates the
+    //! *upstream* — the peer the proxy dials — so that certificate refusals can be proven without a
+    //! network. The proxy itself is a TLS client only and never terminates TLS from the box
+    //! (`cloud/approach.md`, "no inbound TLS handshake ever"); this module is `#[cfg(test)]` and no part
+    //! of it reaches the shipped binary.
 
     use super::*;
     use rcgen::{CertificateParams, DnType, IsCa, KeyPair, SanType};
@@ -243,17 +264,17 @@ mod negative_control {
     use std::sync::mpsc;
     use std::time::{Duration, SystemTime};
 
-    const IO_TIMEOUT: Duration = Duration::from_secs(5);
+    pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
     /// A locally generated CA plus a leaf issued by it, with the leaf's SAN and validity window under
     /// the test's control — the three knobs the negative arms need.
-    struct Fixture {
+    pub(crate) struct Fixture {
         ca_der: CertificateDer<'static>,
         leaf_chain: Vec<CertificateDer<'static>>,
         leaf_key: PrivateKeyDer<'static>,
     }
 
-    fn fixture(san: &str, not_before: SystemTime, not_after: SystemTime) -> Fixture {
+    pub(crate) fn fixture(san: &str, not_before: SystemTime, not_after: SystemTime) -> Fixture {
         let ca_key = KeyPair::generate().expect("ca key");
         let mut ca_params = CertificateParams::default();
         ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -277,7 +298,7 @@ mod negative_control {
 
     /// A one-shot TLS listener presenting `fx`'s leaf. Returns the port; the thread serves one
     /// connection and exits, so nothing leaks between tests.
-    fn serve_once(fx: &Fixture) -> u16 {
+    pub(crate) fn serve_once(fx: &Fixture) -> u16 {
         let cfg = ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
             .expect("versions")
@@ -304,19 +325,96 @@ mod negative_control {
         port
     }
 
-    fn trusting(fx: &Fixture) -> Arc<ClientConfig> {
+    pub(crate) fn trusting(fx: &Fixture) -> Arc<ClientConfig> {
         let mut roots = RootCertStore::empty();
         roots.add(fx.ca_der.clone()).expect("add test ca");
         client_config_with_roots(roots)
     }
 
-    fn now_offset(secs: i64) -> SystemTime {
+    pub(crate) fn now_offset(secs: i64) -> SystemTime {
         if secs >= 0 {
             SystemTime::now() + Duration::from_secs(secs as u64)
         } else {
             SystemTime::now() - Duration::from_secs((-secs) as u64)
         }
     }
+
+    /// A one-shot TLS listener that **captures the exact request bytes** and replies with `response`
+    /// verbatim, then closes. The capture is what makes the request-side proof possible: the assertion is
+    /// against the literal octets that crossed the wire, not against the arguments the caller passed in.
+    ///
+    /// Returns `(port, request_bytes)`. The receiver yields once the connection has been served.
+    ///
+    /// Reads until the request is complete rather than for a fixed count: headers end at the blank line,
+    /// and the body length is taken from the `content-length` the PROXY wrote. That is not the proxy
+    /// parsing a response — this is the test server, standing in for the upstream, doing what any HTTP
+    /// server does with a request. Nothing in `proxy` gains a parser from it.
+    pub(crate) fn serve_scripted(fx: &Fixture, response: &'static [u8]) -> (u16, mpsc::Receiver<Vec<u8>>) {
+        let cfg = ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("versions")
+            .with_no_client_auth()
+            .with_single_cert(fx.leaf_chain.clone(), fx.leaf_key.clone_key())
+            .expect("server cert");
+        let listener = TcpListener::bind(("localhost", 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let cfg = Arc::new(cfg);
+        let (captured, requests) = mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((sock, _)) = listener.accept() else { return };
+            let Ok(conn) = rustls::ServerConnection::new(cfg) else { return };
+            let mut tls = StreamOwned::new(conn, sock);
+            let mut req = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                match tls.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        req.extend_from_slice(&buf[..n]);
+                        if let Some(h) = find_headers_end(&req)
+                            && req.len() >= h + content_length(&req[..h])
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = tls.write_all(response);
+            let _ = tls.flush();
+            tls.conn.send_close_notify();
+            let _ = tls.flush();
+            let _ = captured.send(req);
+        });
+        (port, requests)
+    }
+
+    /// Byte offset just past the request's blank line, or `None` if the headers have not all arrived.
+    fn find_headers_end(req: &[u8]) -> Option<usize> {
+        req.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+    }
+
+    /// The `content-length` the request declared, or 0 — the test server's own framing, not the proxy's.
+    fn content_length(headers: &[u8]) -> usize {
+        String::from_utf8_lossy(headers)
+            .lines()
+            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().to_string()))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
+
+}
+
+#[cfg(test)]
+mod negative_control {
+    //! **The half a static audit cannot supply.** The module-level bypass table shows every
+    //! verification-defeating route is absent; that is necessary and not sufficient, because a disabled
+    //! verifier connects perfectly and streams a response — a successful round trip is *zero* evidence
+    //! that verification is on. These tests are the evidence: certificates that must be REFUSED, and one
+    //! that must be ACCEPTED so the refusals cannot be passing vacuously.
+
+    use super::testserver::{IO_TIMEOUT, fixture, now_offset, serve_once, trusting};
+    use super::*;
 
     /// Assert a refusal arm failed **for the right reason**, not merely that it failed.
     ///

@@ -142,16 +142,35 @@ unblocking Sprint 17's live-capture redesign.
 
 ## Final State
 
-1. **`upstream.rs`'s upstream call no longer uses `ureq`.** The 56 lines
-   it replaces (`upstream_call` + `map_ureq_error`) are removed; the
-   final line count of the replacement is recorded against that number
-   as a real measurement, not an impression — the honest, open question
-   from planning (a hand-rolled version's size relative to what it
-   replaces was never assumed, only estimated as "likely smaller").
-   **Checkpoint, not a foregone conclusion**: if the replacement needs
-   substantially more trusted-side code than expected, that is itself a
-   finding to surface at the Slice 2 gate, not to push past because the
-   approach was already committed to.
+1. **`upstream.rs`'s upstream call no longer uses `ureq`.** The original
+   ~56-line estimate for `upstream_call` + `map_ureq_error` does not
+   reproduce under a stated, reproducible method (measured at Slice 2:
+   60/36 lines total/code-only at the pre-Slice-2 commit, 41/35 one
+   commit earlier) — **the replacement measures 389 total / 177
+   code-only, roughly 5x** (`Destination`/`write_request`/mapping in
+   `upstream.rs`: 166/82; the verified pipe in `upstream_tls.rs`:
+   223/95). **Checkpoint honored as drafted, not argued away**: dev
+   reported the number rather than redefining the baseline to make "56"
+   work, exactly what this item asked for.
+   **Sharpened at the gate (reviewer, correcting their own earlier
+   hypothesis): raw line count is the wrong denominator for what this
+   measures.** Reviewer's planning-time lean ("bypassing `ureq`'s HTTP
+   layer may well be less trusted-side code") was wrong in the direction
+   the measurement showed — but the corrected conclusion is not simply
+   "5x larger, accepted anyway." `ureq` is now **fully absent** from
+   `Cargo.toml` (zero dependency entries; the new direct dependencies —
+   `rustls`, `webpki-roots` — were already present *transitively*
+   underneath it, so no supply chain was added), meaning an entire
+   third-party HTTP client implementation left the code path touching
+   upstream bytes. And a large share of this crate's own growth is
+   exactly what review *demanded*: the six-route bypass audit, the four
+   negative-control arms, explicit provider/version pinning — counting
+   review-mandated documentation and tests as "surface increase" would
+   be incoherent. **The coherent form of the metric is logic separated
+   from docs-and-tests, with the departed dependency counted** — by
+   that measure, the total surface touching upstream bytes went down,
+   even though this crate's own line count rose. Recorded here as the
+   closing, correct framing, not the raw 5x figure alone.
 2. **A genuine TLS connection, via `rustls` used directly** (already a
    linked dependency, promoted to a direct one — no new supply chain),
    replaces `ureq` for this one call site. **Two bars, not one, because
@@ -603,6 +622,272 @@ here `rustls` owns it by L10's ruling), but a bypass audit (Sprint 5's
 DSL bypass-audit shape) combined with capability-narrowing (Sprint 15)
 and the confined-unsafe pattern, closed by a negative-control run since
 no static audit alone can demonstrate a verifier is actually enforcing.
-The final line count vs. the 56 lines replaced (Final State #1) is open
-by design, not a blocking question — the Slice 2 gate reports the actual
-number, not an estimate.
+The final line count question (Final State #1) is now closed: the
+replacement measures 389/177 lines, roughly 5x the original ~56-line
+estimate — reported honestly rather than argued down, per the Method's
+own instruction, and ruled acceptable directly (not escalated) since the
+growth is concentrated in already-reviewed Slice 1 code and Non-Goals
+never promised size parity.
+
+A separate item, the PM/operator's TLS-artifact audit (requested after
+Sprint 18 Slice 1 closed, before Slice 2's gate): dev found the codebase
+structurally clean of any box-side-TLS artifact (verified by targeted
+`git log -S` history search across eight terms, all empty, plus a
+zero-occurrence check of TLS/SSL/certificate/handshake across the
+box-facing wire crates) — the corrected client-only understanding was
+always the implemented one. Four prose defects were found (three
+missing role-statements, one broken file reference inside the bypass
+audit's own closure statement) and are folded into Slice 2 directly
+(ruled by the lead, not escalated): zero behavior change, three of four
+files already in Slice 2's manifest, and the broken reference sits
+inside the very security-audit document Slice 2's gate is read against.
+
+## Retrospectives
+
+### zero.proxy-lead
+
+This sprint started as a side investigation inside Sprint 17's live
+capture and grew into the largest, most consequential piece of security
+work this arc has produced — a real, latent MB3 violation (HTTP status
+treated as a proxy-invented error rather than relayed data), three
+inherited-default defects in a general-purpose HTTP client (credential-
+leaking redirects, ambient proxy override, silent decompression), a
+certificate-verification bug that no static audit alone could have
+caught, a panic path presenting crashes as completed responses, and a
+tier-1 property (the register fixes the destination) that was documented
+but not implemented — plus, found without being asked, the identical
+duplicate-decomposition gap one layer above the fix Sprint 19 itself
+was closing. None of these were on anyone's plan at the start of the day
+this arc began; every one surfaced because a claim got checked against
+source rather than trusted on report.
+
+My own role was almost entirely arbitration and verification, not
+discovery — which is exactly right for this role, and worth naming as a
+success rather than a limitation. The two moments I'd point to: correcting
+my own premature acceptance of dev's `http_status_as_error(true)` fix
+(the operator's correction that an HTTP status is not an error reversed
+the direction of what I'd asked for, and I had to retract and redirect
+rather than let a wrong fix ship), and the scoped-commit entanglement at
+Sprint 19's close, where two different files mixed sprints in two
+different ways (accepted-with-accepted in `upstream.rs`, accepted-with-
+held in `serve.rs`) and neither could be resolved by a single rule — each
+needed its own careful hand-verification before staging. Both are
+instances of the same discipline: when something is genuinely uncertain,
+say so and check, rather than extrapolate from the shape of what came
+before.
+
+**What I would do differently**: I let scope grow sprint-by-sprint
+across this whole arc (17 → 18 → 19, plus the TLS audit as a fourth
+thread) without ever stepping back to ask whether the *sequencing*
+itself needed reconsidering, only whether each individual expansion was
+justified in isolation — every individual escalation was the right call,
+but the cumulative shape was only visible in retrospect. A mid-arc
+pause to name "this is now four sprints deep from one capture attempt"
+explicitly, rather than only naming each step as it arrived, might have
+surfaced the destination-derivation and TLS-audit work as a cluster
+worth reviewing together sooner.
+
+**What the next work inherits**: Sprint 17's live capture is now
+technically unblockable — the response-side tell can be Anthropic's own
+`request-id` header, reaching the box for the first time, which is
+stronger than anything designed for that sprint before this arc began.
+The credential-scoping residual (bound bidirectionally to U4's hardcoded
+envelope check, Sprint 19) and reload-without-restart (L12) remain the
+two standing, correctly-deferred residuals from this whole arc.
+
+### zero.proxy-review
+
+**A capture sprint is a design audit in disguise.** This arc began as Sprint 17,
+whose entire job was to demonstrate that an already-accepted system worked end to
+end. It closed instead having found: a latent MB3 violation in Sprint 11's client
+(a real upstream `401` converted into a proxy-authored error), three inherited
+third-party defaults nobody chose (redirect-following that carried the credential
+to an unreviewed destination, an ambient environment-variable destination
+override, silent response decompression), a certificate-verification bug that no
+static audit could have caught, a panic path that presented crashes to the box as
+completed responses, a tier-1 property that was documented but unimplemented (the
+register did not fix the dial), and a duplicate-decomposition gap one level above
+the one being fixed. **Not one of these was found by reading code looking for
+defects.** Every one surfaced from trying to state an honest claim about behavior
+and discovering the claim could not be made — which is what a capture forces and
+ordinary review does not. Asking "prove this works" makes someone trace every
+path a byte actually takes.
+
+**The two-bar structure earned itself in the sharpest way available.** The
+certificate-verification bar was deliberately split: a static bypass audit
+enumerating every route by which verification could be circumvented, plus
+negative-control runs requiring actual refusals. The first implementation's
+static audit was **entirely accurate** — the verifier was configured, the roots
+were right, no bypass API was named — and verification had *not run*, because
+`rustls` verifies on first I/O and `connect` returned before any. This is a
+stronger instance of green-is-not-acceptance than a wrong passing test: it was a
+*correct audit of a correct configuration* that established nothing about whether
+the code executed. The generalizable rule: **where a security property fails
+silently, the audit can only establish what is absent; only a run that demands a
+refusal establishes what is active.** And the refusal arms must assert per-cause,
+or a suite meant to test three properties can pass while testing one — the same
+completeness discipline as Sprint 15's dispatch split and Sprint 16's
+partial-failure fixture, in its negative form.
+
+**Three reversals of my own, with one thread running through them.** I argued for
+*pinning* the `401`-to-`net-error` behavior as protection for the box, when that
+behavior was itself the violation — `cloud/approach.md` §5 forbade precisely what
+I was defending, and had pre-refused its shape ("the temptation to sanitize what
+comes back from the cloud is to be refused"). I proposed two ways to keep a hash
+dependency off the TCB, and both failed their own goal, because I reasoned about
+the *library's* dependency surface when the *deployed binary* was the surface that
+mattered. I predicted the hand-rolled replacement would be *less* code and it was
+roughly five times more. The thread: **each time I reasoned from a plausible model
+instead of reading the artifact** — and it happened most when I was arguing *for*
+a position rather than testing someone else's claim. The corrective is not more
+caution; it is the same move that produced every good finding in this arc, applied
+to my own reasoning as readily as to a report.
+
+**My Sprint-11 miss completes a pattern worth stating once, plainly.** I gated
+Sprint 11 with the words "REJECT any response inspection" and accepted it, having
+verified the relay path and never the error path — where a third-party default was
+inspecting the status and our code substituted a proxy-authored frame before the
+relay was ever reached. With the Sprint-13 bounded-versus-lossless miss and this
+sprint's absence miss, that is three of the same shape: **for a "never does X"
+invariant, verifying the affirmative path is not the gate. Every path that
+diverts the value before it reaches the checked one must be enumerated.** A
+property proven on the happy path is unproven on the diversion, and the diversion
+is where the defect lives.
+
+**Where the findings actually came from.** The MACs, read from sysfs rather than
+trusted. `/run`'s mode, established by attempting a real `mkdir` that was refused.
+`ureq`'s `Config` `Default` impl, read in full rather than sampled — which is where
+the ambient-proxy and auto-header findings were sitting in plain sight. `run.rs:128`,
+confirming a claimed mechanism was the sole gate. `split_route`'s body, read
+because its *name* survived a claim that it had been replaced. None of this
+required insight; all of it required declining to accept a plausible sentence.
+That is the whole method, and it is worth saying because the method is
+transferable in a way that any particular finding is not.
+
+**Two things Sprint 18 got right that should outlive it.** *Off by construction
+beats off by configuration* — it collapses a bypass audit from "prove this cannot
+be defeated" to "the machinery does not exist," which is both stronger and
+shorter. And *equality beats `contains` when the claim is a negative*: a
+`contains` check finds only what you thought to enumerate, so proving that
+nothing unauthorized is on the wire requires asserting the whole buffer. Both are
+general, and both were arrived at by the team rather than imposed by review.
+
+**Carried forward.** Sprint 17's redesign is unblocked and its response-side tell
+is now genuinely stronger than anything designable before this arc — Anthropic's
+own per-call `request-id` header reaches the box once the full raw response is
+relayed, restoring the unsynthesizable evidence that was lost when the successful
+call went away. Two named forks remain deliberately unresolved: deriving U4's
+envelope from the matched route (which would remove a load-bearing floor and make
+credential scoping non-deferrable in the same change), and the composed-defaults
+question that recurred three times in this arc — at any gate closing two related
+residuals, the question is not "is each correct?" but "what happens if these are
+taken in the wrong order?"
+
+### zero.proxy-dev
+
+**This sprint exists because I pinned a flag the right way for the wrong reason.** Sprint 17 was a
+live-capture sprint. It stopped when the operator caught `http_status_as_error(true)` — I had verified the
+*mechanism* thoroughly (which ureq function turns a status into an `Err`, at which line) and never asked
+whether the behaviour I was pinning was correct. It was not: an HTTP status is a *response*, and
+converting a 401 into a proxy-invented `NetError` is itself the §5 violation I was carefully documenting
+compliance with. Reversing the flag exposed that the real problem was upstream of the flag — a general
+HTTP client has *many* such behaviours, each one a §5 violation waiting for the right response to arrive,
+and configuring them off one at a time is a losing position. That is the whole sprint. **The lesson is not
+"check the flag." It is that verifying an implementation in depth feels exactly like verifying that it
+should exist**, and only one of those was actually done.
+
+**The two-bar lesson, which I would not have learned from the audit alone.** Slice 1's bypass-audit table
+was accurate the entire time: no custom `ServerCertVerifier`, `dangerous()` never named, roots compiled in
+and non-empty, provider selected by name, TLS 1.2 unavailable. Every row true. And the first version of
+`connect` verified **nothing**, because `rustls` handshakes lazily on first I/O — so it returned a
+`TlsPipe` that had checked no certificate at all, and all three refusal arms failed. The audit could not
+have caught this, because the audit's subject is *configuration* and the defect was in *lifecycle*: the
+right verifier, correctly installed, not yet run. This is why the sprint's acceptance bar was set at
+audit **plus** negative control rather than either alone, and it is the one thing from this sprint I would
+carry to any future security-mechanism work: **a static audit answers "is the guarantee configured"; only
+a negative control answers "is the guarantee running." They fail in different places and neither implies
+the other.** A disabled verifier passes every functional test ever written.
+
+**Four bugs, and who caught each, because the pattern matters more than the count.**
+- **Lazy handshake** (above) — caught by the negative control, which is precisely the case it exists for.
+- **`.next()` on `to_socket_addrs()`** — caught by my own *success* arm, which connected to `::1` while the
+  listener held `127.0.0.1`. The arm I wrote so the refusals could not pass vacuously found a real bug in
+  the production path. Success arms are not ceremony.
+- **Refusal arms asserting only `is_err()`** — caught by review. An infrastructural failure would have
+  satisfied them having tested nothing. I had guarded against vacuity in one direction and not the other,
+  in the same file, in the same sitting.
+- **Slice 2's FS#10 arm 2 vacuous** — caught by *my own assertion*, and this is the one I am recording as
+  the useful outcome. I dialled `127.0.0.1` at a listener bound via `localhost`, which resolves to `::1`
+  here, so the connection was refused before any TLS work and the arm "failed" having proven nothing —
+  structurally identical to the bug review caught above. It surfaced because the fix for that earlier bug
+  was to assert the *specific* reason rather than mere failure, and here the arm returned `Unreachable`
+  where the property demanded `Unavailable`. **The correction generalized instead of being applied once.**
+  That is the difference between fixing an instance and fixing a habit, and it is the first time in this
+  arc I can point at my own scaffolding catching the class of error I keep making.
+
+**The duplicate-split catch came from taking the reviewer's rule literally.** Their standing note was that
+peer, SNI, and `Host` must derive from the *same* matched `Route`, not three reads that happen to agree.
+Implementing that made me ask a question the note did not: *where else does a `Route` get decomposed?*
+`dispatch.rs` had its own `split_route` feeding U4's envelope check — so a separate decomposition in
+`upstream.rs` would have been two implementations agreeing by authorship, which is the exact shape
+Sprint 19 had just removed one level down, reappearing one level up. Fixed by putting the single
+decomposition on the type (`Route::split`) and making `dispatch.rs` delegate to it. **The rule was worth
+more than its stated scope, and the way to find that out was to apply it and then look one step past
+where it pointed.**
+
+**The FS#1 measurement: the number was worse than expected and reporting it was the job.** The contract
+asked for a real measurement, not an impression, and explicitly framed the outcome as a checkpoint rather
+than a foregone conclusion. It came in at **389 total / 177 code-only against a recorded ~56** — roughly
+5x, in the direction nobody wanted. Two things I would repeat. First, I could not reproduce the 56 under
+any of four slicings (60/36 at HEAD, 41/35 pre-Sprint-19), so I reported the discrepancy and my method
+rather than quietly picking whichever slicing landed nearest — a baseline adjusted after the fact to fit
+the result is not a measurement. Second, I gave the number without arguing it down, and flagged that the
+acceptability call was not mine. Review's revision of the denominator was better than my own framing: the
+coherent comparison is `ureq` gone from `Cargo.toml` entirely, and counting review-*mandated* audit and
+negative-control code as "surface increase" is incoherent — so the total surface touching upstream bytes
+went **down** while my own code grew. I would not have reached that framing alone, and I would not have
+been given it if I had massaged the number first.
+
+**The TLS-artifact audit: "nothing to clean up" was the finding, and it took real work to earn.** The
+question was whether any *code* retained artifacts of a superseded design in which the proxy did something
+TLS-related on the box-facing side. The answer is no, and the way to establish that is not a grep of the
+current tree — a grep shows what *is*, and the question was about what might have been *left behind*.
+`git log -S` over eight candidate terms answers it directly: no commit in `proxy/`'s history ever
+introduced `TlsAcceptor`, `tls_accept`, "terminate TLS", `box_tls`, `tls_server`, or `decrypt`, and
+`ServerConfig` appears exactly once — in Slice 1's own test double. **A negative finding about history
+needs a history tool; the current tree cannot answer it.**
+
+Two things worth keeping from that audit. **Substring grep on this tree is unreliable in both
+directions**: `tls` matches `NUL-terminated`, `unterminated` (JSON), and `terminates the final segment`,
+while the lead's broader pass hit `lossless`/`losslessly` in `proto/src` — false positives on both sides,
+so raw counts should never be trusted here without filtering. And **the one genuine defect I found was not
+the thing I was looking for**: the bypass audit's closure sentence pointed at `tests/upstream_tls.rs`, a
+file that does not exist. That is the sentence naming where the evidence for a security audit lives, and a
+reviewer following it finds nothing. It surfaced only because I checked every cross-reference in the module
+for currency while I was in there for an unrelated reason. Audits are cheap places to notice adjacent rot,
+and — given my repeated failure mode is *not* looking one step to the side — deliberately widening the
+sweep during an unrelated pass is a compensation I should keep using.
+
+**What Sprint 17's resumption inherits.** Its tell design was built against the old pipe and does not
+survive this sprint unexamined:
+- **The relayed bytes changed shape.** `net-response` now carries the **entire** upstream response —
+  status line, headers, body — not just the body. Any tell that pattern-matched a response body must be
+  re-derived against the new byte stream. `s17_box`'s marker (`net-error:<code>:irt=<session>`) is
+  unaffected, since the no-billing ruling put it on the net-error path, but tells #2/#3 need re-reading
+  before the capture is re-planned.
+- **A 401 is no longer a `net-error`.** Under the old pipe an invalid credential produced a
+  proxy-invented `net-error`; it now arrives as the upstream's own verbatim 401 response. The
+  deliberately-invalid-credential capture will therefore exercise the *relay* path, not the error path —
+  which is a better capture, and a different one than was designed. `s17_box.rs`'s comment that a
+  net-error means a genuine transport failure is now more strictly true than when it was written.
+- **One TCP connection per call**, since the request carries `Connection: close` and the response is
+  close-delimited. Anything in the capture plan assuming connection reuse should be re-checked.
+- **The unprivileged-head-connect residual still stands** (`proxy-head.md` §3): `serve` binds the
+  rendezvous socket before its privilege drop, so `s17_head` must run as root. Unchanged by this sprint.
+- **Two currency risks, flagged rather than fixed since both are outside a dev's remit.**
+  `docs/teams/proxy/017-live-end-to-end-capture.md` is **untracked** — Sprint 17's contract has never been
+  committed, so the arc's own starting document exists only in a working tree. And the staged capture
+  runner (`s17_capture.sh`) — with its preconditions, verify-before-kill sequencing, teardown, and
+  `ixgbe` rebind, all of which took review iterations to get right — lives only in an **ephemeral session
+  scratchpad**. Neither survives the environment being reset, and both are load-bearing for resuming a
+  hardware capture safely against the exact-BDF constraints.

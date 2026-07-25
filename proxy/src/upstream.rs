@@ -14,13 +14,13 @@
 //! Concurrent upstream calls are an explicit Sprint-12+ follow-on.
 //!
 //! **The evidence boundary (Sprint-8-shaped).** Slice 1 proves the loop-side logic with an INJECTED
-//! [`UpstreamSpawn`] (a controllable double); Slice 2 drops in the real `rustls`/`ureq` worker behind
+//! [`UpstreamSpawn`] (a controllable double); Sprint 18 Slice 2 landed the real `rustls` worker behind
 //! the same seam. The one thing these tests do not themselves exercise — that the real reactor runs a
 //! tick (and thus drains) when a response arrives during a real quiescent park — was **proven live on
 //! hardware in Sprint 14**: the reactor's own bounded wait re-checks unaided, so the wake needs no
 //! proxy-side mechanism. Here a test's `Idle` tick after a quiescent arrival stands in for that wake.
 
-use std::io::Read;
+use std::io::{self, Read, Write};
 use std::ops::ControlFlow;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::thread::JoinHandle;
@@ -32,6 +32,7 @@ use transport::SessionId;
 
 use crate::dispatch::{Dispatcher, Enqueue, Routed};
 use crate::nic::Reply;
+use crate::upstream_tls::TlsPipe;
 use crate::vocab::{CredentialSource, Route, ToolIdentity};
 
 /// The `anthropic-version` header the proxy sends on the upstream call — a proxy-owned constant (the box
@@ -78,7 +79,7 @@ pub struct UpstreamHandle {
 
 /// The upstream-call spawner seam — Slice 1's injection point. Given the request `session` and the
 /// recognizer-admitted `body`, spawn the (blocking) call on its own thread and return the loop-side
-/// [`UpstreamHandle`]. The real `rustls`/`ureq` worker (Slice 2) implements this; tests inject a
+/// [`UpstreamHandle`]. The real `rustls` worker ([`AnthropicClient`]) implements this; tests inject a
 /// controllable double. **`body` is the exact admitted bytes — POSTed verbatim, no re-encode**
 /// (bind-the-chain; realized on the real call in Slice 2).
 pub trait UpstreamSpawn {
@@ -287,7 +288,7 @@ where
 
 // ─── Sprint 11 Slice 2 — the real Anthropic upstream client (below the seam) ──────────────────────────
 //
-// `rustls` + `ureq` are used ONLY here (below the `NicRun`/reply seam), never in the box-reachable core
+// `rustls` is used ONLY here (below the `NicRun`/reply seam), never in the box-reachable core
 // (tier-3, off the L10 review budget). No proxy-owned `unsafe` (MB6). The box's request never carries or
 // influences the credential; the credential never reaches a box-facing frame or a log.
 
@@ -342,7 +343,8 @@ impl core::fmt::Debug for Credential {
 }
 
 /// The real upstream client (Sprint 11 Slice 2): POSTs the recognizer-admitted body **verbatim** to the
-/// Anthropic Messages API over `rustls` TLS via `ureq`, and streams the response **verbatim** back
+/// Anthropic Messages API over a direct `rustls` pipe — no HTTP client — and streams the response
+/// **verbatim** back
 /// through the [`UpstreamSpawn`] seam into the Sprint-10 push-queue. The destination is **not** a
 /// parameter of this type: it arrives per-call as the matched `Route` (Sprint 19), so the register is the
 /// only place a destination is authored.
@@ -365,11 +367,11 @@ impl AnthropicClient {
 impl UpstreamSpawn for AnthropicClient {
     fn spawn(&self, _session: SessionId, destination: Route, body: Vec<u8>) -> UpstreamHandle {
         let (tx, rx) = sync_channel(UPSTREAM_CHANNEL_CAP);
-        // The canonical route form IS the URL to dial — the operator's own register entry, verbatim.
-        let endpoint = destination.as_str().to_string();
+        // ONE decomposition of the matched route, here, feeding peer + SNI + Host alike.
+        let dest = Destination::of(destination);
         let key = self.credential.0.clone();
         let join = std::thread::spawn(move || {
-            match upstream_call(&endpoint, &key, &body) {
+            match upstream_call(dest, &key, &body) {
                 Ok(reader) => stream_response(reader, &tx),
                 Err(code) => {
                     let _ = tx.send(UpstreamFrame::Failed(code));
@@ -381,47 +383,126 @@ impl UpstreamSpawn for AnthropicClient {
     }
 }
 
-/// The blocking upstream call — **the network leg** (the live round-trip is the held item, pending
-/// a real credential). POSTs `body` **byte-verbatim** (`send(body)` — no
-/// re-encode between the tier-1 vet and the wire; bind-the-chain) with the credential + version headers,
-/// and returns a streaming reader over the response body, or a mapped [`ErrorCode`].
-fn upstream_call(endpoint: &str, key: &str, body: &[u8]) -> Result<impl Read, ErrorCode> {
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(UPSTREAM_TIMEOUT))
-        // **PINNED FALSE — an HTTP status is a RESPONSE, not an error** (operator ruling, 2026-07-24,
-        // against `cloud/approach.md` §5: "the proxy relays the response opaquely and never inspects,
-        // neutralizes, modifies, or sanitizes it. This holds for every cloud destination").
-        //
-        // `http_status_as_error` is the ONLY thing that turns a real HTTP response into an `Err` (ureq
-        // `run.rs:128`). Left at ureq's `true` default, a 401 or 500 never reaches the box at all: the
-        // proxy swallows the upstream's own response body and substitutes a proxy-INVENTED
-        // `net-error(Unavailable)` — the proxy inspecting and replacing a response, which is precisely
-        // what §5 forbids. With it `false`, any status returns `Ok(response)` and the body streams to the
-        // box verbatim through the existing relay path, unmodified: the box sees what the cloud actually
-        // said, and decides for itself.
-        //
-        // `Err` is then reserved for what it should always have meant — a genuine TRANSPORT failure with
-        // no response at all (timeout, host-not-found, connection-refused, TLS) — which `map_ureq_error`
-        // still maps to a box-facing `net-error`. Pinned explicitly rather than inherited, so a ureq
-        // default flip cannot silently reintroduce the §5 violation.
-        .http_status_as_error(false)
-        .build()
-        .new_agent();
-    match agent
-        .post(endpoint)
-        .header("x-api-key", key)
-        .header("anthropic-version", ANTHROPIC_VERSION)
-        .header("content-type", "application/json")
-        .send(body)
-    {
-        Ok(response) => Ok(response.into_body().into_reader()),
-        Err(e) => Err(map_ureq_error(&e)),
+/// The dial target: **one value, derived once**, that the TLS peer, the SNI, and the HTTP `Host` header
+/// are all read out of.
+///
+/// This exists to make the peer-binding a single property rather than three that happen to agree.
+/// [`Route::split`] is the crate's one decomposition and [`Destination::of`] is the only constructor
+/// reached from production, so a matched route cannot end up connecting to one host, presenting a second
+/// name for verification, and addressing a third in the request. Sprint 19 removed exactly this shape one
+/// level down — a dial that agreed with the register by authorship rather than by construction.
+#[derive(Clone, Copy)]
+struct Destination {
+    /// The TCP peer, the name certificate verification runs against, AND the `Host` header. One field.
+    host: &'static str,
+    /// The request-line target.
+    path: &'static str,
+}
+
+impl Destination {
+    /// Decompose the **matched** `Route` — the vetted destination the register authored and U3/U4 proved
+    /// the box's address equals. Nothing else constructs a production `Destination`.
+    fn of(route: Route) -> Self {
+        let (host, path) = route.split();
+        Destination { host, path }
     }
 }
 
-/// Stream a response body **verbatim** into the channel as [`UpstreamFrame::Chunk`]s (MB3 — never
-/// inspected, neutralized, or transformed). Bounded per-read memory ([`RESPONSE_CHUNK`]). A read error
-/// mid-stream → `Failed(Unavailable)`. Stops early if the loop hung up (the box session closed).
+/// The port every upstream call dials. Fixed, not derived: `Route`'s canonical form is `https://` +
+/// host + path and carries no port, so there is no box-influenced value here at all.
+const HTTPS_PORT: u16 = 443;
+
+/// The blocking upstream call — **the network leg**, now a direct TLS pipe with no HTTP client in it
+/// (Sprint 18). Connects to `dest`, writes the request, and hands back the live pipe so the caller
+/// streams the response **exactly as it arrives**.
+///
+/// What comes back is the WHOLE upstream response — status line, headers, body — unparsed (designer
+/// ruling, 2026-07-24). This function frames what the proxy *emits* and reads nothing of what it
+/// *receives*: there is no response parser here to be wrong, and therefore no status, no encoding, and no
+/// redirect for the proxy to have an opinion about. `cloud/approach.md` §5's "never inspects, neutralizes,
+/// modifies, or sanitizes" is satisfied structurally rather than by a configuration flag.
+fn upstream_call(dest: Destination, key: &str, body: &[u8]) -> Result<TlsPipe, ErrorCode> {
+    call_over(dest, key, body, || TlsPipe::connect(dest.host, HTTPS_PORT, UPSTREAM_TIMEOUT))
+}
+
+/// [`upstream_call`]'s body with the socket-opening step injected — **the only** thing that varies. The
+/// tests supply an opener aimed at the local test server (a name production cannot reach, on a port
+/// `Route` cannot express); everything from the request bytes onward is the shipped path, so what they
+/// prove is what production does. Slice 1's `connect_with_config` precedent: move the test below the
+/// seam rather than widen a production type to accommodate it.
+fn call_over(
+    dest: Destination,
+    key: &str,
+    body: &[u8],
+    open: impl FnOnce() -> io::Result<TlsPipe>,
+) -> Result<TlsPipe, ErrorCode> {
+    let mut pipe = open().map_err(|e| map_transport_error(&e))?;
+    write_request(&mut pipe, dest, key, body).map_err(|e| map_transport_error(&e))?;
+    Ok(pipe)
+}
+
+/// Write the request: the **fixed** header set, then the recognizer-admitted body byte-verbatim.
+///
+/// **The complete list of what goes on the wire, and why each line has to be there** — this is the
+/// request-side half of "a dumb, fixed, verbatim pipe", so the set is closed and auditable by reading it:
+///
+/// | line | why it cannot be dropped |
+/// |---|---|
+/// | `POST <path> HTTP/1.1` | the request line; `path` is the register's, via [`Destination`] |
+/// | `host` | HTTP/1.1 requires it — and it is the SAME field as the TLS peer and SNI |
+/// | `x-api-key` | the credential. The one thing the proxy adds that the box never sees |
+/// | `anthropic-version` | the API requires it; a fixed compiled-in constant |
+/// | `content-type` | the API requires it; fixed |
+/// | `content-length` | frames the body so the upstream knows where it ends |
+/// | `connection: close` | makes the response close-delimited, so the relay ends on a transport event |
+///
+/// Nothing else. No `user-agent`, no `accept`, no `accept-encoding`, no cookies, no proxy headers — an
+/// HTTP client adds those on your behalf, which is precisely why there is no longer an HTTP client here.
+/// The absence of `accept-encoding` is also why nothing arrives compressed to be tempted to decompress.
+///
+/// **The box contributes `body` and nothing else, and it cannot escape the body.** `content-length` is
+/// computed here from the actual byte count and the body is written after the blank line, so bytes the
+/// box authored are read by the upstream as body regardless of what they contain — a `\r\n` in the
+/// payload is payload. `key`, `host`, and `path` are all compiled-in or operator-authored, never
+/// box-influenced, so no header line takes a box-supplied value at all.
+fn write_request(w: &mut impl Write, dest: Destination, key: &str, body: &[u8]) -> io::Result<()> {
+    let mut req = Vec::with_capacity(HEADROOM + body.len());
+    req.extend_from_slice(
+        format!(
+            "POST {} HTTP/1.1\r\n\
+             host: {}\r\n\
+             x-api-key: {}\r\n\
+             anthropic-version: {}\r\n\
+             content-type: application/json\r\n\
+             content-length: {}\r\n\
+             connection: close\r\n\
+             \r\n",
+            dest.path,
+            dest.host,
+            key,
+            ANTHROPIC_VERSION,
+            body.len(),
+        )
+        .as_bytes(),
+    );
+    req.extend_from_slice(body);
+    // One write for the whole request: the credential never sits in a partially-flushed buffer across a
+    // failure, and the upstream sees headers and body together.
+    w.write_all(&req)?;
+    w.flush()
+}
+
+/// Slack for the fixed header block so the request buffer is sized once. Not a limit on anything.
+const HEADROOM: usize = 256;
+
+/// Stream a response **verbatim** into the channel as [`UpstreamFrame::Chunk`]s (MB3 — never inspected,
+/// neutralized, or transformed). Bounded per-read memory ([`RESPONSE_CHUNK`]). A read error mid-stream →
+/// `Failed(Unavailable)`. Stops early if the loop hung up (the box session closed).
+///
+/// Every byte the upstream sent is relayed, starting at the status line: the box receives the response
+/// the cloud actually gave, and decides for itself what a 401 or a 302 means. An HTTP status is a
+/// RESPONSE, not an error (operator ruling, 2026-07-24) — and with no parser here, there is now no code
+/// path that *could* turn one into a proxy-invented `net-error`.
 fn stream_response(mut reader: impl Read, tx: &SyncSender<UpstreamFrame>) {
     let mut buf = [0u8; RESPONSE_CHUNK];
     loop {
@@ -440,36 +521,30 @@ fn stream_response(mut reader: impl Read, tx: &SyncSender<UpstreamFrame>) {
     }
 }
 
-/// Map a `ureq` transport error to the proxy's own [`ErrorCode`] category (no upstream detail, no
-/// credential — the box learns only *that* it failed and roughly why). Timeout → `Timeout`;
-/// host-not-found / connection-refused → `Unreachable`; everything else (TLS, i/o, protocol) →
-/// `Unavailable`.
+/// Map a transport failure to the proxy's own [`ErrorCode`] category (no upstream detail, no credential —
+/// the box learns only *that* it failed and roughly why). Timeout → `Timeout`; unresolvable or
+/// unreachable peer → `Unreachable`; everything else, TLS verification failures included → `Unavailable`.
 ///
-/// **Scope, after the §5 ruling (Sprint 17)**: this is now reached ONLY for genuine transport failures
-/// where there is no response to relay. An HTTP status no longer arrives here at all —
-/// `http_status_as_error(false)` means `ureq::Error::StatusCode` is never produced, so a 401/500 flows to
-/// the box as the upstream's own verbatim response rather than being replaced by a proxy-invented code.
-/// The arms below are unchanged and remain correct for the cases that DO reach them.
-fn map_ureq_error(e: &ureq::Error) -> ErrorCode {
+/// **Reached only when there is no response to relay.** A refused connection, a name that does not
+/// resolve, a certificate that fails verification, a hung upstream: in each case nothing came back, so
+/// `net-error` is the only thing the box can be told (`proto/net.md` §4 — net-error is for what is NOT an
+/// upstream response). An HTTP status never arrives here; it is a response, and responses go down the
+/// relay untouched.
+///
+/// A read timeout on a socket carrying `SO_RCVTIMEO` surfaces as `WouldBlock`, not `TimedOut`, so both
+/// map to `Timeout` — the distinction is the platform's, not the proxy's.
+fn map_transport_error(e: &io::Error) -> ErrorCode {
     use std::io::ErrorKind;
-    match e {
-        ureq::Error::Timeout(_) => ErrorCode::Timeout,
-        ureq::Error::HostNotFound | ureq::Error::ConnectionFailed => ErrorCode::Unreachable,
-        // A refused / reset / aborted connection is "couldn't reach the upstream" → Unreachable.
-        ureq::Error::Io(io)
-            if matches!(
-                io.kind(),
-                ErrorKind::ConnectionRefused
-                    | ErrorKind::ConnectionReset
-                    | ErrorKind::ConnectionAborted
-                    | ErrorKind::NotConnected
-            ) =>
-        {
-            ErrorCode::Unreachable
-        }
-        // Everything else (TLS, other i/o, protocol) → a generic Unavailable. NOT reached for an HTTP
-        // status any more: `http_status_as_error(false)` means a status never becomes an `Error` at all,
-        // so a 401/500 is relayed as the upstream's own response instead of being replaced here.
+    match e.kind() {
+        ErrorKind::TimedOut | ErrorKind::WouldBlock => ErrorCode::Timeout,
+        ErrorKind::ConnectionRefused
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::NotConnected
+        | ErrorKind::HostUnreachable
+        | ErrorKind::NetworkUnreachable
+        | ErrorKind::AddrNotAvailable
+        | ErrorKind::NotFound => ErrorCode::Unreachable,
         _ => ErrorCode::Unavailable,
     }
 }
@@ -1053,8 +1128,7 @@ mod tests {
 
     // ─── Sprint 11 Slice 2 — the real Anthropic client ───────────────────────────────────────────
 
-    use std::io::{BufRead, BufReader, Cursor, Write};
-    use std::sync::mpsc::channel;
+    use std::io::Cursor;
     use std::time::Duration;
 
     /// MB3 (unit): `stream_response` relays the response body VERBATIM — the concatenated `Chunk`s equal
@@ -1076,106 +1150,318 @@ mod tests {
         assert_eq!(got, input, "the response is streamed byte-verbatim (MB3)");
     }
 
-    /// Error mapping (real ureq): a connection to a closed port maps to `net-error(Unreachable)` over the
-    /// seam — the real ureq transport-error path, no mock. (The live round-trip to Anthropic itself stays
-    /// pending a real credential.)
-    #[test]
-    fn upstream_connection_refused_maps_to_net_error_unreachable() {
-        // 127.0.0.1:1 — nothing listens; connect is refused immediately.
-        // Driven at `upstream_call` directly, not through `spawn`: since Sprint 19 the seam takes a
-        // `Route`, and a `Route` CANNOT name a local test target (no `http://`, no port — the canonical
-        // form forbids both, deliberately). The property under test is the transport-error mapping, which
-        // lives here; `spawn`'s only remaining job above this is deriving the URL from the route.
-        let err = upstream_call("http://127.0.0.1:1/v1/messages", "sk", ADMIT_BODY)
-            .err()
-            .expect("a refused connection must fail");
-        assert_eq!(err, proto::ErrorCode::Unreachable, "a refused connection → net-error(Unreachable)");
+    // ---------------------------------------------------------------------------------------------
+    // Sprint 18 Slice 2 — the pipe's own evidence.
+    //
+    // Every test below runs against the shared local TLS server (`upstream_tls::testserver`), through
+    // `call_over` — the shipped `upstream_call` body with only the socket target swapped. What varies is
+    // the thing that MUST vary for an offline test (a name production cannot reach, on a port `Route`
+    // cannot express); the request bytes, the relay, and the error mapping are all the production path.
+    // ---------------------------------------------------------------------------------------------
+
+    use crate::upstream_tls::testserver::{IO_TIMEOUT, Fixture, fixture, now_offset, serve_scripted, trusting};
+
+    /// A fixture whose leaf is valid, in date, and named `localhost` — the host every arm below dials.
+    fn local_fixture() -> Fixture {
+        fixture("localhost", now_offset(-3600), now_offset(3600))
     }
 
-    /// A minimal one-shot HTTP/1.1 server (handles `Expect: 100-continue`). Returns its URL and a channel
-    /// delivering the captured `(request_body, raw_headers)`.
-    fn mock_server(response_body: &'static [u8]) -> (String, std::sync::mpsc::Receiver<(Vec<u8>, String)>) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let url = format!("http://{addr}/v1/messages");
-        let (tx, rx) = channel();
-        std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut writer = stream.try_clone().unwrap();
-            let mut reader = BufReader::new(stream);
-            let mut headers = String::new();
-            let mut content_length = 0usize;
-            let mut expect_continue = false;
-            loop {
-                let mut line = String::new();
-                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
-                    break;
-                }
-                let low = line.to_ascii_lowercase();
-                if let Some(v) = low.strip_prefix("content-length:") {
-                    content_length = v.trim().parse().unwrap_or(0);
-                }
-                if low.starts_with("expect:") && low.contains("100-continue") {
-                    expect_continue = true;
-                }
-                headers.push_str(&line);
-            }
-            if expect_continue {
-                writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").unwrap();
-                writer.flush().unwrap();
-            }
-            let mut body = vec![0u8; content_length];
-            std::io::Read::read_exact(&mut reader, &mut body).unwrap();
-            let _ = tx.send((body, headers));
-            let resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", response_body.len());
-            writer.write_all(resp.as_bytes()).unwrap();
-            writer.write_all(response_body).unwrap();
-            writer.flush().unwrap();
-        });
-        (url, rx)
+    /// Run the real call against a local server on `port`, dialling it as `host`.
+    fn call_local(fx: &Fixture, host: &'static str, port: u16, key: &str) -> Result<TlsPipe, ErrorCode> {
+        let dest = Destination { host, path: "/v1/messages" };
+        call_over(dest, key, ADMIT_BODY, || {
+            TlsPipe::connect_with_config(host, port, IO_TIMEOUT, trusting(fx))
+        })
     }
 
-    /// BIND-THE-CHAIN + MB3 + NO-LEAK against a real ureq POST to a local server: the POSTed body is
-    /// byte-identical to the admitted body (no re-encode); the credential is sent upstream as `x-api-key`
-    /// (correct) but NEVER appears in the relayed response; the response streams back verbatim.
-    #[test]
-    fn real_post_is_verbatim_credential_sent_upstream_not_leaked_to_box() {
-        // Driven at `upstream_call` + `stream_response` directly — the same two functions `spawn`
-        // composes — because a `Route` cannot name a local mock server (see the refused-connection test).
-        let (url, captured) = mock_server(b"the-upstream-response-body");
+    /// Drain a pipe through the SAME `stream_response` production uses, returning the relayed bytes.
+    fn relayed(pipe: TlsPipe) -> Vec<u8> {
         let (tx, rx) = sync_channel(UPSTREAM_CHANNEL_CAP);
-        let worker = std::thread::spawn(move || {
-            match upstream_call(&url, "sk-secret-key", ADMIT_BODY) {
-                Ok(reader) => stream_response(reader, &tx),
-                Err(code) => {
-                    let _ = tx.send(UpstreamFrame::Failed(code));
-                }
-            }
-        });
-
-        let (req_body, headers) = captured.recv_timeout(Duration::from_secs(10)).unwrap();
-        // BIND-THE-CHAIN: the POST body IS the admitted bytes, verbatim (no re-encode between vet + send).
-        assert_eq!(req_body, ADMIT_BODY, "the POST body is byte-identical to the admitted body");
-        // The credential is sent UPSTREAM (correct) as x-api-key + the version header is present.
-        let low = headers.to_ascii_lowercase();
-        assert!(low.contains("x-api-key: sk-secret-key"), "credential sent upstream as x-api-key");
-        assert!(low.contains("anthropic-version:"), "the version header is sent");
-
-        // The worker streams the response back VERBATIM (MB3).
+        let worker = std::thread::spawn(move || stream_response(pipe, &tx));
         let mut got = Vec::new();
         while let Ok(frame) = rx.recv_timeout(Duration::from_secs(10)) {
             match frame {
                 UpstreamFrame::Chunk(c) => got.extend_from_slice(&c),
-                UpstreamFrame::Failed(code) => panic!("unexpected failure: {code:?}"),
+                UpstreamFrame::Failed(code) => panic!("unexpected transport failure: {code:?}"),
             }
         }
-        assert_eq!(got, b"the-upstream-response-body", "response relayed to the box verbatim");
-        // NO-LEAK: the credential never appears in the bytes relayed to the box.
-        assert!(
-            !got.windows(b"sk-secret-key".len()).any(|w| w == b"sk-secret-key"),
-            "the credential never leaks into the box-facing response",
+        worker.join().expect("relay worker");
+        got
+    }
+
+    /// **FINAL STATE #5 — the request side, byte-exact.** The wire request is the admitted body plus the
+    /// credential header and the fixed framing, and *nothing else*.
+    ///
+    /// Asserted as ONE full-buffer equality rather than a set of `contains` checks, because `contains`
+    /// can only find what you thought to look for: it passes just as happily with a `user-agent`, an
+    /// `accept-encoding`, or a cookie the HTTP client added on your behalf. Equality is the only form
+    /// that proves the *absence* of everything unlisted — which is the actual claim being made about a
+    /// dumb, fixed pipe.
+    #[test]
+    fn the_wire_request_is_exactly_the_admitted_body_plus_the_credential_header() {
+        let fx = local_fixture();
+        let (port, requests) = serve_scripted(&fx, b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}");
+        let pipe = call_local(&fx, "localhost", port, "sk-secret-key").expect("the local call connects");
+        let req = requests.recv_timeout(Duration::from_secs(10)).expect("the server captured a request");
+        drop(pipe);
+
+        let mut want: Vec<u8> = format!(
+            "POST /v1/messages HTTP/1.1\r\nhost: localhost\r\nx-api-key: sk-secret-key\r\n\
+             anthropic-version: 2023-06-01\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n",
+            ADMIT_BODY.len()
+        )
+        .into_bytes();
+        want.extend_from_slice(ADMIT_BODY);
+
+        assert_eq!(
+            String::from_utf8_lossy(&req),
+            String::from_utf8_lossy(&want),
+            "the wire request must be EXACTLY the fixed header set plus the admitted body — no extra \
+             header, no re-encode",
         );
-        worker.join().unwrap();
+        // BIND-THE-CHAIN, stated separately so a future edit to `want` cannot quietly lose it: the body
+        // on the wire is the admitted bytes themselves.
+        assert!(req.ends_with(ADMIT_BODY), "the body is the admitted bytes, byte-identical");
+    }
+
+    /// **FINAL STATE #4 — the response side, verbatim, including the status line.** The box receives the
+    /// upstream's own bytes from the first octet: a 401 is relayed as a 401, not replaced by a
+    /// proxy-invented `net-error` (`cloud/approach.md` §5; operator ruling 2026-07-24). This is the case
+    /// Sprint 17's capture will exercise live against a deliberately-invalid credential.
+    #[test]
+    fn the_whole_response_is_relayed_verbatim_status_line_and_headers_included() {
+        const RESPONSE: &[u8] = b"HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\n\
+                                  content-length: 62\r\n\r\n\
+                                  {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\"}}";
+        let fx = local_fixture();
+        let (port, _requests) = serve_scripted(&fx, RESPONSE);
+        let pipe = call_local(&fx, "localhost", port, "sk-invalid").expect("the local call connects");
+        assert_eq!(
+            String::from_utf8_lossy(&relayed(pipe)),
+            String::from_utf8_lossy(RESPONSE),
+            "the ENTIRE upstream response — status line, headers, body — reaches the box unmodified",
+        );
+    }
+
+    /// **FINAL STATE #8, defect 1 — a redirect is RELAYED, never followed.**
+    ///
+    /// The ureq defect had two halves and this proves both: the client followed 3xx automatically, and it
+    /// did not strip `x-api-key` when doing so — so a redirect chosen by whatever answered the connection
+    /// could walk the credential to a host the register never vetted.
+    ///
+    /// The `Location` here points at a SECOND live local server. The proof is not only that the 302 came
+    /// back, but that the second server received *nothing at all*: no follow-up request, and therefore no
+    /// credential delivered anywhere the route did not name.
+    #[test]
+    fn a_redirect_is_relayed_not_followed_and_the_credential_goes_nowhere_else() {
+        let fx = local_fixture();
+        let (elsewhere_port, elsewhere) = serve_scripted(&fx, b"HTTP/1.1 200 OK\r\n\r\nFOLLOWED");
+        let location = format!("https://localhost:{elsewhere_port}/stolen");
+        let redirect: &'static [u8] = Box::leak(
+            format!("HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\n\r\n").into_bytes()
+                .into_boxed_slice(),
+        );
+        let (port, _requests) = serve_scripted(&fx, redirect);
+
+        let pipe = call_local(&fx, "localhost", port, "sk-secret-key").expect("the local call connects");
+        let got = relayed(pipe);
+
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            String::from_utf8_lossy(redirect),
+            "the 302 is handed to the box verbatim — the proxy has no opinion about a status code",
+        );
+        assert!(
+            elsewhere.recv_timeout(Duration::from_secs(2)).is_err(),
+            "the redirect target was CONTACTED — the redirect was followed and the credential travelled \
+             to a host the register never vetted",
+        );
+    }
+
+    /// **FINAL STATE #8, defect 2 — an ambient proxy environment variable is ignored.**
+    ///
+    /// Proven in a CHILD PROCESS, because `std::env::set_var` is `unsafe` under edition 2024 and this
+    /// crate is `deny(unsafe_code)` outside its two audited modules (MB6) — so the environment is set the
+    /// only way a test here legitimately can: on a child. The child re-runs the ignored arm below, which
+    /// performs a real round trip to a local server. If any part of the upstream path consulted
+    /// `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`, the connection would go to the black-holed address instead
+    /// and the child would fail.
+    ///
+    /// The black hole is `127.0.0.1:1` — nothing listens, so a consulted proxy setting cannot accidentally
+    /// succeed.
+    #[test]
+    fn an_ambient_proxy_environment_variable_is_ignored() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = std::process::Command::new(exe)
+            .args(["--exact", "--ignored", "--nocapture", "upstream::tests::proxy_env_child_arm"])
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env("HTTP_PROXY", "http://127.0.0.1:1")
+            .env("ALL_PROXY", "socks5://127.0.0.1:1")
+            .env("https_proxy", "http://127.0.0.1:1")
+            .env("http_proxy", "http://127.0.0.1:1")
+            .output()
+            .expect("re-exec the test binary");
+        assert!(
+            out.status.success(),
+            "with proxy variables set, the upstream call did not reach its destination — something in \
+             the path consults the ambient environment:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+            "the child ran no test — the arm name or the harness flags drifted, so this proved nothing:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+        );
+    }
+
+    /// The child arm for the test above. `#[ignore]`d so it runs ONLY under the parent's re-exec, with the
+    /// proxy variables set; on its own it would prove nothing (a plain run has no proxy in the
+    /// environment, so it would pass vacuously).
+    #[test]
+    #[ignore = "driven by an_ambient_proxy_environment_variable_is_ignored, which sets the environment"]
+    fn proxy_env_child_arm() {
+        assert!(
+            std::env::var("HTTPS_PROXY").is_ok(),
+            "the child must inherit the proxy environment, or it tests nothing",
+        );
+        let fx = local_fixture();
+        let (port, requests) = serve_scripted(&fx, b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}");
+        let pipe = call_local(&fx, "localhost", port, "sk-secret-key")
+            .expect("the call must reach the destination, not the proxy named in the environment");
+        let req = requests.recv_timeout(Duration::from_secs(10)).expect("the DESTINATION got the request");
+        assert!(req.starts_with(b"POST /v1/messages HTTP/1.1\r\n"), "an origin-form request line");
+        assert!(
+            !String::from_utf8_lossy(&req).contains("http://"),
+            "an absolute-form request line means the request was addressed to a proxy",
+        );
+        assert_eq!(String::from_utf8_lossy(&relayed(pipe)).len(), 40);
+    }
+
+    /// **FINAL STATE #8, defect 3 — a compressed body is relayed COMPRESSED.**
+    ///
+    /// The response below is real gzip, labelled `content-encoding: gzip`. An HTTP client would hand the
+    /// caller the decompressed plaintext and quietly drop the header, which is a modified response: the
+    /// box would be told the upstream said something it did not literally say, and the bytes it received
+    /// would no longer be the bytes on the wire. Both the compressed octets and the header must survive.
+    #[test]
+    fn a_gzip_labelled_body_is_relayed_compressed_with_its_header_intact() {
+        /// Valid gzip of `{"id":"msg_gzip_probe"}`.
+        const GZIP_BODY: [u8; 43] = [
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xab, 0x56, 0xca, 0x4c, 0x51,
+            0xb2, 0x52, 0xca, 0x2d, 0x4e, 0x8f, 0x4f, 0xaf, 0xca, 0x2c, 0x88, 0x2f, 0x28, 0xca, 0x4f,
+            0x4a, 0x55, 0xaa, 0x05, 0x00, 0xce, 0x47, 0x4c, 0xc3, 0x17, 0x00, 0x00, 0x00,
+        ];
+        let mut response =
+            b"HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ncontent-length: 43\r\n\r\n".to_vec();
+        response.extend_from_slice(&GZIP_BODY);
+        let response: &'static [u8] = Box::leak(response.into_boxed_slice());
+
+        let fx = local_fixture();
+        let (port, _requests) = serve_scripted(&fx, response);
+        let got = relayed(call_local(&fx, "localhost", port, "sk-secret-key").expect("connects"));
+
+        assert_eq!(got, response, "the compressed body and its header are relayed untouched");
+        assert!(
+            !got.windows(b"msg_gzip_probe".len()).any(|w| w == b"msg_gzip_probe"),
+            "the plaintext appeared — the body was DECOMPRESSED somewhere in the path",
+        );
+    }
+
+    /// **FINAL STATE #10a — the destination IS the register's, for every route it holds.**
+    #[test]
+    fn a_destination_is_exactly_the_matched_routes_host_and_path() {
+        for route in ROUTES {
+            let dest = Destination::of(*route);
+            let rest = route.as_str().strip_prefix("https://").expect("a canonical route is https://");
+            let tail = rest.strip_prefix(dest.host).expect("the host is the route's leading segment");
+            assert!(
+                tail == dest.path || (tail.is_empty() && dest.path == "/"),
+                "{route:?}: host + path must recompose the route (a bare domain gains the root path)",
+            );
+            assert!(!dest.host.contains('/'), "the host carries no path");
+            assert!(dest.path.starts_with('/'), "the path is origin-form");
+        }
+    }
+
+    /// **FINAL STATE #10b — peer, SNI, and `Host` cannot be steered apart.**
+    ///
+    /// Both arms dial the SAME listener, whose certificate names `localhost` and nothing else. Only the
+    /// single [`Destination::host`] field differs:
+    ///
+    /// - `localhost` — the handshake succeeds (so the SNI and the verified peer name are `localhost`) AND
+    ///   the captured request says `host: localhost`. All three agree.
+    /// - `127.0.0.1` — reaches the *identical* listener, so nothing about reachability changed, and the
+    ///   handshake is REFUSED because the name is not in the certificate.
+    ///
+    /// The second arm is the load-bearing one: it shows the `Host` header cannot be set to one name while
+    /// the connection is verified against another, because there is only one field to set. Three separate
+    /// derivations that happened to agree would let the arms diverge; one value cannot.
+    #[test]
+    fn peer_sni_and_host_header_cannot_be_steered_apart() {
+        let fx = local_fixture();
+
+        let (port, requests) = serve_scripted(&fx, b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}");
+        let pipe = call_local(&fx, "localhost", port, "sk").expect("the SAN-matching name is accepted");
+        let req = requests.recv_timeout(Duration::from_secs(10)).expect("captured");
+        drop(pipe);
+        assert!(
+            String::from_utf8_lossy(&req).contains("\r\nhost: localhost\r\n"),
+            "the Host header carries the same name the certificate was verified against",
+        );
+
+        // Arm 2. A certificate that is valid, in date, and issued by a CA the client trusts — but which
+        // names a DIFFERENT host. It is served on a `localhost` listener, so the dialled name reaches the
+        // peer exactly as in arm 1; the ONLY thing that changed is whether the certificate carries the
+        // name being dialled.
+        //
+        // (This arm was first written dialling `127.0.0.1` at the arm-1 listener. It "passed" as a
+        // failure and proved nothing: that listener binds via `localhost`, which resolves to `::1` here,
+        // so the connection was REFUSED before any TLS work — the vacuous-pass shape Slice 1's review
+        // caught in the refusal arms. The `Unreachable` code, not `Unavailable`, is what exposed it.)
+        let elsewhere = fixture("not-the-destination.example", now_offset(-3600), now_offset(3600));
+        let (port2, requests2) = serve_scripted(&elsewhere, b"HTTP/1.1 200 OK\r\n\r\n");
+
+        let err = TlsPipe::connect_with_config("localhost", port2, IO_TIMEOUT, trusting(&elsewhere))
+            .err()
+            .expect("a certificate that does not name the dialled host must be refused");
+        let err = err.to_string();
+        assert!(
+            err.contains("tls handshake failed:"),
+            "the arm failed before the handshake, so it exercised nothing: {err}",
+        );
+        assert!(err.contains("not valid for name"), "refused, but not on the NAME: {err}");
+
+        // The join, stated as the consequence that matters: no request was written at all, so there is no
+        // way to put `host: localhost` on a wire whose peer was not verified as `localhost`. One field
+        // drives the verified name and the header alike; separate derivations could have diverged here.
+        let captured = requests2.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
+        assert!(
+            captured.is_empty(),
+            "request bytes reached a peer that failed verification: {:?}",
+            String::from_utf8_lossy(&captured),
+        );
+
+        // And the box-facing code for that failure is `Unavailable`, not `Unreachable`: the peer was
+        // reached, so this is not "could not get there" — it is "nothing trustworthy came back".
+        let refused = call_local(&elsewhere, "localhost", serve_scripted(&elsewhere, b"x").0, "sk")
+            .err()
+            .expect("refused");
+        assert_eq!(refused, ErrorCode::Unavailable, "a verification failure has no response to relay");
+    }
+
+    /// Transport-error mapping, on the real path: a refused connection becomes `net-error(Unreachable)`
+    /// over the seam. Driven at `call_over` because a `Route` cannot name a local target (no `http://`,
+    /// no port — the canonical form forbids both, deliberately).
+    #[test]
+    fn a_refused_connection_maps_to_net_error_unreachable() {
+        let dest = Destination { host: "localhost", path: "/v1/messages" };
+        // Port 1: nothing listens, so the connect is refused before any TLS work begins.
+        let err = call_over(dest, "sk", ADMIT_BODY, || TlsPipe::connect(dest.host, 1, IO_TIMEOUT))
+            .err()
+            .expect("a refused connection must fail");
+        assert_eq!(err, ErrorCode::Unreachable, "a refused connection → net-error(Unreachable)");
     }
 
     /// The credential's `Debug` is redacted — it can never reach a log or diagnostic.

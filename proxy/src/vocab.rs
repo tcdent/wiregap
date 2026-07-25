@@ -81,6 +81,26 @@ impl Route {
     pub const fn as_str(&self) -> &'static str {
         self.0
     }
+
+    /// Split the canonical form into `(host, path)` — **the one decomposition of a `Route` in the
+    /// crate**, deliberately living on the type rather than being re-derived per consumer.
+    ///
+    /// Two places need it and must not disagree: U4's envelope check (which proves the matched route IS
+    /// the vetted destination) and the upstream dial (which goes there). Separate implementations that
+    /// happen to agree would be exactly the gap Sprint 19 removed one level down — the register and the
+    /// dial agreeing by authorship rather than by construction — so there is one implementation and both
+    /// read it.
+    ///
+    /// A canonical `Route` is `https://` + host + optional `/`-joined path (guaranteed by
+    /// [`Route::new`]'s compile-time validation), so this is total: a bare domain yields `"/"`.
+    #[must_use]
+    pub fn split(&self) -> (&'static str, &'static str) {
+        let rest = self.0.strip_prefix("https://").unwrap_or(self.0);
+        match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]), // the path keeps its leading '/'
+            None => (rest, "/"),                 // bare domain → root path
+        }
+    }
 }
 
 /// A compiled-in **filesystem root** path — the quarantine root (write target) or the readable root

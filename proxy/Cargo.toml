@@ -24,10 +24,11 @@ directpath = { path = "../directpath" }
 # Optional, ONLY for the Slice-5 bench-capture bin: benchtools' Provenance (self-hashed bin-sha) +
 # nonce. Off by default — the production lib never links it.
 benchtools = { path = "../benchtools", optional = true }
-ureq = "3.3.0"
 # Sprint 18: the upstream call's TLS is done DIRECTLY, not through an HTTP client, so the relay can be a
-# verbatim pipe (no parsing ⇒ nothing to isolate or transform). Both were already linked transitively via
-# ureq; promoting them to direct dependencies adds no new supply chain — but ONLY with this exact spec.
+# verbatim pipe (no parsing ⇒ nothing to isolate or transform). Both of these were ALREADY in the tree
+# transitively, under the `ureq` this sprint removed, so naming them directly added no supply chain — it
+# only moved the version and feature choice into view, where it can be pinned. And it has to be pinned:
+# the exact spec below is load-bearing.
 #
 # `default-features = false` is load-bearing, not tidiness: rustls 0.23's DEFAULTS enable `aws_lc_rs`,
 # which would drag in aws-lc-rs + aws-lc-sys (a C/NASM build dependency) — a genuinely new crypto stack

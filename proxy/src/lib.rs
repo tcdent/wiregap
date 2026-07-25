@@ -39,6 +39,8 @@ pub mod upstream;
 
 /// Sprint 18 — the verified TLS transport for the upstream call: a dumb, fixed pipe with no HTTP
 /// knowledge, so the response can be relayed verbatim (`net.md` §3) rather than parsed and re-shaped.
+/// **Outbound, client-side only** — the proxy is a TLS client to the upstream and never a TLS server;
+/// the box terminates its own TLS and the project wire carries plaintext (`cloud/approach.md`).
 pub mod upstream_tls;
 
 #[cfg(unix)]
