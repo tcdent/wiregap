@@ -905,6 +905,19 @@ impl Dispatcher {
         }
     }
 
+    /// The `Route` U3 matched for `session`, if one was admitted — the **register's** destination for
+    /// this exchange (Sprint 19).
+    ///
+    /// Narrow on purpose: it exposes the already-stored route and nothing else. The route was always kept
+    /// here (U4 sources its envelope from it) and then discarded, so the dial fell back to a constant held
+    /// elsewhere; this is the one accessor that lets the destination reach the dial from the register
+    /// instead. `None` means no admitted `net-address` for this session, which the fail-closed
+    /// `NetPayloadNoRoute` rung already prevents from reaching a dial.
+    #[must_use]
+    pub fn route_for(&self, session: SessionId) -> Option<Route> {
+        self.routes.get(&session).copied()
+    }
+
     /// **Test/observability**: the number of active display sessions (the Slice-2 MB4 resource).
     #[must_use]
     pub fn terminal_display_count(&self) -> usize {

@@ -25,6 +25,26 @@ directpath = { path = "../directpath" }
 # nonce. Off by default — the production lib never links it.
 benchtools = { path = "../benchtools", optional = true }
 ureq = "3.3.0"
+# Sprint 18: the upstream call's TLS is done DIRECTLY, not through an HTTP client, so the relay can be a
+# verbatim pipe (no parsing ⇒ nothing to isolate or transform). Both were already linked transitively via
+# ureq; promoting them to direct dependencies adds no new supply chain — but ONLY with this exact spec.
+#
+# `default-features = false` is load-bearing, not tidiness: rustls 0.23's DEFAULTS enable `aws_lc_rs`,
+# which would drag in aws-lc-rs + aws-lc-sys (a C/NASM build dependency) — a genuinely new crypto stack
+# alongside the `ring` one already present. The provider is selected EXPLICITLY instead, which is also
+# what the authority audit requires: the code performing certificate verification must be a named choice,
+# never whatever happens to be linked.
+#
+# `tls12` is deliberately NOT enabled: rustls makes TLS 1.2 opt-in, so omitting it yields a TLS-1.3-ONLY
+# client. Verified against the real endpoint before pinning (a TLS 1.3 handshake to api.anthropic.com
+# succeeds), so this costs no compatibility.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+# The trust anchors, COMPILED IN rather than taken from the platform store. Deliberate: a system trust
+# store is ambient authority — an administrator-added CA silently widens who may impersonate the upstream,
+# with no signal at the call site — whereas compiled-in roots are pinned at build time and reviewed like
+# every other authority this project compiles in (the route register, the filesystem roots, the credential
+# descriptor).
+webpki-roots = "1.0"
 
 [features]
 # The Slice-5 receive-path e2e capture bin (src/bin/s5_capture.rs). Enables directpath's `bench`
@@ -50,6 +70,10 @@ libc = "0.2"
 # bypass, must each FAIL to compile against a pinned .stderr. Proto's own tests/trybuild.rs pattern.
 [dev-dependencies]
 trybuild = "1"
+# Sprint 18 Slice 1: generates the local test server's certificates (valid / untrusted / wrong-host /
+# expired) so certificate verification's negative arms are provable offline — no external bad-cert
+# service, no network dependency. A DEV dependency: never in the shipped binary.
+rcgen = "0.13"
 
 # The Slice-5 bench-capture bin — declared so its required-features gate it off the default build.
 [[bin]]
@@ -60,6 +84,18 @@ required-features = ["bench-capture"]
 # benchtools + exact-BDF; gated off the default build by its required-features.
 [[bin]]
 name = "s14_quiescent_wake"
+required-features = ["bench-capture"]
+
+# The Sprint-17 scripted BOX for the live end-to-end capture (src/bin/s17_box.rs) — a real, separate
+# process on 0000:63:00.0; gated off the default build by its required-features.
+[[bin]]
+name = "s17_box"
+required-features = ["bench-capture"]
+
+# The Sprint-17 scripted HEAD client (src/bin/s17_head.rs) — a real socket client; must run as root
+# because serve binds the rendezvous socket before its privilege drop. Gated off the default build.
+[[bin]]
+name = "s17_head"
 required-features = ["bench-capture"]
 
 # The Sprint-13 composition-root bin — declared so its required-features gate it off the default build.

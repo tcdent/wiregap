@@ -37,6 +37,10 @@ pub mod nic;
 
 pub mod upstream;
 
+/// Sprint 18 — the verified TLS transport for the upstream call: a dumb, fixed pipe with no HTTP
+/// knowledge, so the response can be relayed verbatim (`net.md` §3) rather than parsed and re-shaped.
+pub mod upstream_tls;
+
 #[cfg(unix)]
 pub mod head;
 

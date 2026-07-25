@@ -89,7 +89,7 @@ struct BoxResult {
 /// called; it returns an immediately-closed handle defensively.
 struct NoopSpawn;
 impl UpstreamSpawn for NoopSpawn {
-    fn spawn(&self, _session: SessionId, _body: Vec<u8>) -> UpstreamHandle {
+    fn spawn(&self, _session: SessionId, _destination: proxy::vocab::Route, _body: Vec<u8>) -> UpstreamHandle {
         let (_tx, rx) = std::sync::mpsc::sync_channel::<UpstreamFrame>(1); // _tx dropped → rx closed (EOF)
         UpstreamHandle { rx, join: None }
     }

@@ -58,8 +58,11 @@ pub enum UpstreamFrame {
     /// One **verbatim** chunk of the upstream response body → relayed to the box as `net-response`
     /// (MB3: never inspected, neutralized, or transformed — `cloud_relay::relay_response`).
     Chunk(Vec<u8>),
-    /// The upstream call **failed** (timeout / unreachable / TLS / HTTP status) → the box is told
-    /// `net-error(code)` (the proxy's own category; no upstream body, no credential — no leak).
+    /// The upstream call **failed at the TRANSPORT level** — timeout, unreachable, TLS — i.e. there is
+    /// no response to relay at all → the box is told `net-error(code)` (the proxy's own category; no
+    /// upstream body, no credential — no leak). **An HTTP status is NOT a failure**: a 401 or 500 is a
+    /// response, and it reaches the box verbatim as [`UpstreamFrame::Chunk`] like any other
+    /// (`cloud/approach.md` §5, operator ruling 2026-07-24).
     Failed(ErrorCode),
 }
 
@@ -79,7 +82,14 @@ pub struct UpstreamHandle {
 /// controllable double. **`body` is the exact admitted bytes — POSTed verbatim, no re-encode**
 /// (bind-the-chain; realized on the real call in Slice 2).
 pub trait UpstreamSpawn {
-    fn spawn(&self, session: SessionId, body: Vec<u8>) -> UpstreamHandle;
+    /// Spawn the upstream call for `session`, dialing **`destination`** — the `Route` U3 actually matched,
+    /// threaded from the register rather than held independently by the implementor (Sprint 19).
+    ///
+    /// Before this took a destination, an implementor dialed a constant of its own and the register's
+    /// authority over *where* the request went was illusory: the gate vetted one string while the dial
+    /// used another, identical only by coincidence of authorship. Passing it here is what makes "the
+    /// register fixes the destination" a property of the code rather than of two files agreeing.
+    fn spawn(&self, session: SessionId, destination: Route, body: Vec<u8>) -> UpstreamHandle;
 }
 
 /// One in-flight upstream call (serial bound = 1).
@@ -128,7 +138,17 @@ impl<S: UpstreamSpawn> UpstreamIngress<S> {
             dispatcher.enqueue_net_error(session, ErrorCode::Unavailable);
             return;
         }
-        let handle = self.spawn.spawn(session, body);
+        // The destination comes from the REGISTER — the `Route` U3 matched and the dispatcher already
+        // stores for this session — never from a constant the client happens to hold.
+        let Some(destination) = dispatcher.route_for(session) else {
+            // Unreachable by construction: `NetPayloadAdmit` is only produced when a route was stored
+            // (no stored route ⇒ `NetPayloadNoRoute`, which never reaches here). Fail CLOSED anyway
+            // rather than inventing a destination — an admitted request with nowhere vetted to send it
+            // is "not an upstream response" (`net.md` §4), so the box is told, not left waiting.
+            dispatcher.enqueue_net_error(session, ErrorCode::Unavailable);
+            return;
+        };
+        let handle = self.spawn.spawn(session, destination, body);
         self.inflight = Some(InFlight { session, rx: handle.rx, join: handle.join, pending: None });
     }
 
@@ -163,12 +183,26 @@ impl<S: UpstreamSpawn> UpstreamIngress<S> {
                 Ok(UpstreamFrame::Failed(code)) => PendingResponse::Failed(code),
                 Err(TryRecvError::Empty) => return, // nothing right now — the worker is still running
                 Err(TryRecvError::Disconnected) => {
-                    // End of response: close the reply stream (drains + evicts), reap the worker thread.
-                    dispatcher.close_reply(session);
-                    if let Some(done) = self.inflight.take()
-                        && let Some(join) = done.join
-                    {
-                        let _ = join.join(); // no leaked thread
+                    // The channel closed. That means the worker RETURNED — but "returned" covers both a
+                    // completed response and a PANIC, and the two must not look the same to the box.
+                    //
+                    // **Reap first, then decide** (Sprint 18, Finding B). This previously did
+                    // `close_reply` unconditionally and then discarded the join result with `let _ =`,
+                    // so a panicked worker presented to the box as a cleanly-completed response: the
+                    // reply stream closed normally and the box saw a truncated body it had no way to
+                    // distinguish from a short one. `net.md` §4 is explicit that "any outcome that is not
+                    // an upstream response — refusal, unreachable, dropped, timeout, malformed — is one
+                    // net-error", and a crashed worker is a dropped exchange, not a response.
+                    let panicked = match self.inflight.take().and_then(|done| done.join) {
+                        Some(join) => join.join().is_err(), // Err ⇒ the worker panicked
+                        None => false,                     // a threadless test double: nothing to reap
+                    };
+                    if panicked {
+                        // Tell the box the exchange was dropped, rather than closing as if it completed.
+                        // `enqueue_net_error` closes the reply itself once the frame is accepted.
+                        dispatcher.enqueue_net_error(session, ErrorCode::Unavailable);
+                    } else {
+                        dispatcher.close_reply(session);
                     }
                     return;
                 }
@@ -309,24 +343,30 @@ impl core::fmt::Debug for Credential {
 
 /// The real upstream client (Sprint 11 Slice 2): POSTs the recognizer-admitted body **verbatim** to the
 /// Anthropic Messages API over `rustls` TLS via `ureq`, and streams the response **verbatim** back
-/// through the [`UpstreamSpawn`] seam into the Sprint-10 push-queue. `endpoint` is a composition-root
-/// parameter (production `https://api.anthropic.com/v1/messages`; a test points it at a local server).
+/// through the [`UpstreamSpawn`] seam into the Sprint-10 push-queue. The destination is **not** a
+/// parameter of this type: it arrives per-call as the matched `Route` (Sprint 19), so the register is the
+/// only place a destination is authored.
+/// **Holds no destination.** The endpoint it dials arrives per-call from the matched `Route`
+/// (Sprint 19); there is deliberately no `endpoint` field, so there is nothing for a dial to diverge
+/// from the register *to*.
 pub struct AnthropicClient {
     credential: Credential,
-    endpoint: String,
 }
 
 impl AnthropicClient {
     #[must_use]
-    pub fn new(credential: Credential, endpoint: String) -> Self {
-        AnthropicClient { credential, endpoint }
+    /// Takes ONLY the credential. The endpoint is no longer an input here — it arrives per-call from the
+    /// matched `Route` — so a caller cannot supply a destination that differs from the register's.
+    pub fn new(credential: Credential) -> Self {
+        AnthropicClient { credential }
     }
 }
 
 impl UpstreamSpawn for AnthropicClient {
-    fn spawn(&self, _session: SessionId, body: Vec<u8>) -> UpstreamHandle {
+    fn spawn(&self, _session: SessionId, destination: Route, body: Vec<u8>) -> UpstreamHandle {
         let (tx, rx) = sync_channel(UPSTREAM_CHANNEL_CAP);
-        let endpoint = self.endpoint.clone();
+        // The canonical route form IS the URL to dial — the operator's own register entry, verbatim.
+        let endpoint = destination.as_str().to_string();
         let key = self.credential.0.clone();
         let join = std::thread::spawn(move || {
             match upstream_call(&endpoint, &key, &body) {
@@ -348,6 +388,23 @@ impl UpstreamSpawn for AnthropicClient {
 fn upstream_call(endpoint: &str, key: &str, body: &[u8]) -> Result<impl Read, ErrorCode> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(UPSTREAM_TIMEOUT))
+        // **PINNED FALSE — an HTTP status is a RESPONSE, not an error** (operator ruling, 2026-07-24,
+        // against `cloud/approach.md` §5: "the proxy relays the response opaquely and never inspects,
+        // neutralizes, modifies, or sanitizes it. This holds for every cloud destination").
+        //
+        // `http_status_as_error` is the ONLY thing that turns a real HTTP response into an `Err` (ureq
+        // `run.rs:128`). Left at ureq's `true` default, a 401 or 500 never reaches the box at all: the
+        // proxy swallows the upstream's own response body and substitutes a proxy-INVENTED
+        // `net-error(Unavailable)` — the proxy inspecting and replacing a response, which is precisely
+        // what §5 forbids. With it `false`, any status returns `Ok(response)` and the body streams to the
+        // box verbatim through the existing relay path, unmodified: the box sees what the cloud actually
+        // said, and decides for itself.
+        //
+        // `Err` is then reserved for what it should always have meant — a genuine TRANSPORT failure with
+        // no response at all (timeout, host-not-found, connection-refused, TLS) — which `map_ureq_error`
+        // still maps to a box-facing `net-error`. Pinned explicitly rather than inherited, so a ureq
+        // default flip cannot silently reintroduce the §5 violation.
+        .http_status_as_error(false)
         .build()
         .new_agent();
     match agent
@@ -385,8 +442,14 @@ fn stream_response(mut reader: impl Read, tx: &SyncSender<UpstreamFrame>) {
 
 /// Map a `ureq` transport error to the proxy's own [`ErrorCode`] category (no upstream detail, no
 /// credential — the box learns only *that* it failed and roughly why). Timeout → `Timeout`;
-/// host-not-found / connection-refused → `Unreachable`; everything else (HTTP status, TLS, i/o,
-/// protocol) → `Unavailable`.
+/// host-not-found / connection-refused → `Unreachable`; everything else (TLS, i/o, protocol) →
+/// `Unavailable`.
+///
+/// **Scope, after the §5 ruling (Sprint 17)**: this is now reached ONLY for genuine transport failures
+/// where there is no response to relay. An HTTP status no longer arrives here at all —
+/// `http_status_as_error(false)` means `ureq::Error::StatusCode` is never produced, so a 401/500 flows to
+/// the box as the upstream's own verbatim response rather than being replaced by a proxy-invented code.
+/// The arms below are unchanged and remain correct for the cases that DO reach them.
 fn map_ureq_error(e: &ureq::Error) -> ErrorCode {
     use std::io::ErrorKind;
     match e {
@@ -404,7 +467,9 @@ fn map_ureq_error(e: &ureq::Error) -> ErrorCode {
         {
             ErrorCode::Unreachable
         }
-        // Everything else (HTTP status, TLS, other i/o, protocol) → a generic Unavailable.
+        // Everything else (TLS, other i/o, protocol) → a generic Unavailable. NOT reached for an HTTP
+        // status any more: `http_status_as_error(false)` means a status never becomes an `Error` at all,
+        // so a 401/500 is relayed as the upstream's own response instead of being replaced here.
         _ => ErrorCode::Unavailable,
     }
 }
@@ -423,6 +488,15 @@ mod tests {
     use crate::dispatch::REPLY_QUEUE_CAP;
     use crate::register::anthropic::VETTED_TOOLS;
     use crate::register::net::ROUTES;
+
+    /// Establish the precondition `on_admit` now requires: an ADMITTED `net-address` for the session, so
+    /// the dispatcher holds the matched `Route` the dial is derived from (Sprint 19). This is exactly how
+    /// production reaches `on_admit` — the route is stored by `route()` when the address is admitted — so
+    /// driving it here keeps these tests on the real path rather than injecting state behind it.
+    fn admit_route(d: &mut Dispatcher, session: SessionId) {
+        let verdict = d.route(session, &net_address_frame(), ROUTES, VETTED_TOOLS);
+        assert!(matches!(verdict, Routed::NetRouteAdmit(_)), "the test's net-address must be admitted");
+    }
 
     // ─── Sprint 16 Slice 2 — the credential descriptor's resolution policy ───────────────────────
 
@@ -554,7 +628,7 @@ mod tests {
         count: Rc<Cell<usize>>,
     }
     impl UpstreamSpawn for ScriptedSpawner {
-        fn spawn(&self, _session: SessionId, _body: Vec<u8>) -> UpstreamHandle {
+        fn spawn(&self, _session: SessionId, _destination: Route, _body: Vec<u8>) -> UpstreamHandle {
             self.count.set(self.count.get() + 1);
             let (tx, rx) = sync_channel(UPSTREAM_CHANNEL_CAP);
             *self.cell.borrow_mut() = Some(tx);
@@ -567,7 +641,7 @@ mod tests {
         body: F,
     }
     impl<F: Fn(SyncSender<UpstreamFrame>) + Send + Clone + 'static> UpstreamSpawn for ThreadSpawner<F> {
-        fn spawn(&self, _session: SessionId, _body: Vec<u8>) -> UpstreamHandle {
+        fn spawn(&self, _session: SessionId, _destination: Route, _body: Vec<u8>) -> UpstreamHandle {
             let (tx, rx) = sync_channel(UPSTREAM_CHANNEL_CAP);
             let body = self.body.clone();
             let join = std::thread::spawn(move || body(tx));
@@ -592,6 +666,7 @@ mod tests {
         let s = SessionId(1);
 
         // A recognizer-admitted request kicks the upstream call (worker's tx now in the cell).
+        admit_route(&mut d, s);
         ingress.on_admit(&mut d, s, ADMIT_BODY.to_vec());
         assert!(ingress.is_in_flight());
         assert_eq!(count.get(), 1);
@@ -628,10 +703,12 @@ mod tests {
             UpstreamIngress::new(ScriptedSpawner { cell, count: count.clone() });
         let mut d = Dispatcher::new();
 
+        admit_route(&mut d, SessionId(1));
         ingress.on_admit(&mut d, SessionId(1), ADMIT_BODY.to_vec());
         assert_eq!(count.get(), 1, "first admit spawned the worker");
 
         // Second admit on a different session, while the first is in flight → deny, no second spawn.
+        admit_route(&mut d, SessionId(2));
         ingress.on_admit(&mut d, SessionId(2), ADMIT_BODY.to_vec());
         assert_eq!(count.get(), 1, "NO second worker/channel spawned (serial bound = 1)");
 
@@ -658,6 +735,7 @@ mod tests {
         let mut ingress = UpstreamIngress::new(spawner);
         let mut d = Dispatcher::new();
         let s = SessionId(1);
+        admit_route(&mut d, s);
         ingress.on_admit(&mut d, s, ADMIT_BODY.to_vec());
 
         // Drive drains until EOF completes the call (the worker runs async; bounded spin).
@@ -687,6 +765,7 @@ mod tests {
         };
         let mut ingress = UpstreamIngress::new(spawner);
         let mut d = Dispatcher::new();
+        admit_route(&mut d, SessionId(1));
         ingress.on_admit(&mut d, SessionId(1), ADMIT_BODY.to_vec());
 
         // The worker is hung (blocked on the barrier). drain must return without blocking, many times.
@@ -724,6 +803,7 @@ mod tests {
         };
         let mut ingress = UpstreamIngress::new(spawner);
         let mut d = Dispatcher::new();
+        admit_route(&mut d, SessionId(1));
         ingress.on_admit(&mut d, SessionId(1), ADMIT_BODY.to_vec());
 
         // Without any drain, the worker fills the bounded channel and BLOCKS — it can never get past
@@ -759,6 +839,129 @@ mod tests {
         assert_eq!(reply.net_responses(1).len(), target, "every frame reached the box, none lost");
     }
 
+    /// **SPRINT 19, FINAL STATE #4a — the destination reaches the dial FROM THE REGISTER.**
+    ///
+    /// Proven below `route()`'s full pipeline on purpose: the originally-planned "register a second route
+    /// and watch the dial follow it" test is UNBUILDABLE, because U4's Stage 1 hardcodes one envelope and
+    /// denies any second domain before a payload can ever be admitted (that hardcoding is deliberate
+    /// defense-in-depth — `anthropic.rs`). So the plumbing is proven directly: give the session an
+    /// admitted `Route`, call `on_admit`, and assert the spawner received *that* route as its destination
+    /// rather than a value the client held independently.
+    ///
+    /// This is the wiring half. The structural half — that there is no longer anywhere for a dial to
+    /// diverge *to* — is carried by the code's shape, not a test: `AnthropicClient` has no `endpoint`
+    /// field and `ANTHROPIC_ENDPOINT` no longer exists, which the compiler enforces.
+    #[test]
+    fn on_admit_dials_the_route_the_register_matched() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        /// Records the destination it was handed, and spawns nothing.
+        struct RecordingSpawner {
+            seen: Rc<RefCell<Option<Route>>>,
+        }
+        impl UpstreamSpawn for RecordingSpawner {
+            fn spawn(&self, _session: SessionId, destination: Route, _body: Vec<u8>) -> UpstreamHandle {
+                *self.seen.borrow_mut() = Some(destination);
+                let (_tx, rx) = sync_channel::<UpstreamFrame>(1); // _tx dropped → immediate EOF
+                UpstreamHandle { rx, join: None }
+            }
+        }
+
+        let seen = Rc::new(RefCell::new(None));
+        let mut ingress = UpstreamIngress::new(RecordingSpawner { seen: seen.clone() });
+        let mut d = Dispatcher::new();
+        let s = SessionId(1);
+        admit_route(&mut d, s);
+
+        // What the register actually matched for this session — the value the dial must use.
+        let matched = d.route_for(s).expect("an admitted address stores its route");
+        ingress.on_admit(&mut d, s, ADMIT_BODY.to_vec());
+
+        assert_eq!(
+            seen.borrow().map(|r| r.as_str()),
+            Some(matched.as_str()),
+            "the dial's destination must BE the register's matched route, not a value held elsewhere",
+        );
+        assert_eq!(
+            matched.as_str(),
+            "https://api.anthropic.com/v1/messages",
+            "sanity: the matched route is the register's entry, so the assertion above is not vacuous",
+        );
+    }
+
+    /// **FAIL CLOSED WITH NO ROUTE.** Unreachable in production (`NetPayloadNoRoute` blocks it), but the
+    /// guard must not invent a destination if it is ever reached: no dial, and the box is told rather
+    /// than left waiting (`net.md` §4 — anything that is not an upstream response is a net-error).
+    #[test]
+    fn on_admit_without_a_matched_route_fails_closed_and_never_dials() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct CountingSpawner {
+            calls: Rc<Cell<usize>>,
+        }
+        impl UpstreamSpawn for CountingSpawner {
+            fn spawn(&self, _session: SessionId, _destination: Route, _body: Vec<u8>) -> UpstreamHandle {
+                self.calls.set(self.calls.get() + 1);
+                let (_tx, rx) = sync_channel::<UpstreamFrame>(1);
+                UpstreamHandle { rx, join: None }
+            }
+        }
+
+        let calls = Rc::new(Cell::new(0));
+        let mut ingress = UpstreamIngress::new(CountingSpawner { calls: calls.clone() });
+        let mut d = Dispatcher::new(); // deliberately NO admitted address for this session
+        let s = SessionId(1);
+        ingress.on_admit(&mut d, s, ADMIT_BODY.to_vec());
+
+        assert_eq!(calls.get(), 0, "no route ⇒ NO dial is attempted");
+        let mut reply = ReplyRec::new();
+        d.pump_replies(&mut reply);
+        assert_eq!(
+            reply.net_error_code(s.0),
+            Some(proto::ErrorCode::Unavailable),
+            "the box is told the exchange failed, not left waiting on a dial that never happened",
+        );
+    }
+
+    /// **SPRINT 18, FINDING B — a PANICKED worker must not present as a completed response.** The
+    /// channel closing means the worker returned; it does NOT distinguish "streamed the whole response"
+    /// from "crashed partway". Before the fix the join result was discarded and the reply closed
+    /// unconditionally, so a panic reached the box as a cleanly-terminated (silently truncated) response
+    /// — indistinguishable from a genuinely short one. `net.md` §4: anything that is not an upstream
+    /// response is a net-error.
+    #[test]
+    fn a_panicked_worker_yields_a_net_error_not_a_clean_close() {
+        let spawner = ThreadSpawner {
+            body: |tx: SyncSender<UpstreamFrame>| {
+                // Deliver part of a response, then die. The box has bytes AND an unfinished exchange.
+                let _ = tx.send(UpstreamFrame::Chunk(b"partial-".to_vec()));
+                panic!("worker crashed mid-response");
+            },
+        };
+        let mut ingress = UpstreamIngress::new(spawner);
+        let mut d = Dispatcher::new();
+        let s = SessionId(1);
+        admit_route(&mut d, s);
+        ingress.on_admit(&mut d, s, ADMIT_BODY.to_vec());
+
+        let mut ticks = 0;
+        while ingress.is_in_flight() {
+            ticks += 1;
+            assert!(ticks < 100_000, "the panicked worker was never reaped");
+            ingress.drain(&mut d);
+        }
+        let mut reply = ReplyRec::new();
+        d.pump_replies(&mut reply);
+
+        assert_eq!(
+            reply.net_error_code(s.0),
+            Some(proto::ErrorCode::Unavailable),
+            "a crashed worker must be reported to the box as a net-error, never as a clean completion",
+        );
+    }
+
     /// **SPRINT 13 SLICE 1.5 — the data-loss regression** (the exact test class that was missing, which
     /// let the drop hide, checked=0): under a BACKPRESSURING box (its wire WouldBlocks), a response
     /// larger than the reply-queue cap must be delivered COMPLETE, IN ORDER, with NONE LOST. Before the
@@ -782,6 +985,7 @@ mod tests {
         let mut ingress = UpstreamIngress::new(spawner);
         let mut d = Dispatcher::new();
         let s = SessionId(1);
+        admit_route(&mut d, s);
         ingress.on_admit(&mut d, s, ADMIT_BODY.to_vec());
         let mut reply = ReplyRec::new();
 
@@ -878,16 +1082,14 @@ mod tests {
     #[test]
     fn upstream_connection_refused_maps_to_net_error_unreachable() {
         // 127.0.0.1:1 — nothing listens; connect is refused immediately.
-        let client = AnthropicClient::new(Credential::new("sk".into()), "http://127.0.0.1:1/v1/messages".into());
-        let handle = client.spawn(SessionId(1), ADMIT_BODY.to_vec());
-        let mut saw = None;
-        while let Ok(frame) = handle.rx.recv_timeout(Duration::from_secs(10)) {
-            if let UpstreamFrame::Failed(code) = frame {
-                saw = Some(code);
-            }
-        }
-        assert_eq!(saw, Some(proto::ErrorCode::Unreachable), "a refused connection → net-error(Unreachable)");
-        handle.join.unwrap().join().unwrap();
+        // Driven at `upstream_call` directly, not through `spawn`: since Sprint 19 the seam takes a
+        // `Route`, and a `Route` CANNOT name a local test target (no `http://`, no port — the canonical
+        // form forbids both, deliberately). The property under test is the transport-error mapping, which
+        // lives here; `spawn`'s only remaining job above this is deriving the URL from the route.
+        let err = upstream_call("http://127.0.0.1:1/v1/messages", "sk", ADMIT_BODY)
+            .err()
+            .expect("a refused connection must fail");
+        assert_eq!(err, proto::ErrorCode::Unreachable, "a refused connection → net-error(Unreachable)");
     }
 
     /// A minimal one-shot HTTP/1.1 server (handles `Expect: 100-continue`). Returns its URL and a channel
@@ -938,9 +1140,18 @@ mod tests {
     /// (correct) but NEVER appears in the relayed response; the response streams back verbatim.
     #[test]
     fn real_post_is_verbatim_credential_sent_upstream_not_leaked_to_box() {
+        // Driven at `upstream_call` + `stream_response` directly — the same two functions `spawn`
+        // composes — because a `Route` cannot name a local mock server (see the refused-connection test).
         let (url, captured) = mock_server(b"the-upstream-response-body");
-        let client = AnthropicClient::new(Credential::new("sk-secret-key".into()), url);
-        let handle = client.spawn(SessionId(1), ADMIT_BODY.to_vec());
+        let (tx, rx) = sync_channel(UPSTREAM_CHANNEL_CAP);
+        let worker = std::thread::spawn(move || {
+            match upstream_call(&url, "sk-secret-key", ADMIT_BODY) {
+                Ok(reader) => stream_response(reader, &tx),
+                Err(code) => {
+                    let _ = tx.send(UpstreamFrame::Failed(code));
+                }
+            }
+        });
 
         let (req_body, headers) = captured.recv_timeout(Duration::from_secs(10)).unwrap();
         // BIND-THE-CHAIN: the POST body IS the admitted bytes, verbatim (no re-encode between vet + send).
@@ -952,7 +1163,7 @@ mod tests {
 
         // The worker streams the response back VERBATIM (MB3).
         let mut got = Vec::new();
-        while let Ok(frame) = handle.rx.recv_timeout(Duration::from_secs(10)) {
+        while let Ok(frame) = rx.recv_timeout(Duration::from_secs(10)) {
             match frame {
                 UpstreamFrame::Chunk(c) => got.extend_from_slice(&c),
                 UpstreamFrame::Failed(code) => panic!("unexpected failure: {code:?}"),
@@ -964,7 +1175,7 @@ mod tests {
             !got.windows(b"sk-secret-key".len()).any(|w| w == b"sk-secret-key"),
             "the credential never leaks into the box-facing response",
         );
-        handle.join.unwrap().join().unwrap();
+        worker.join().unwrap();
     }
 
     /// The credential's `Debug` is redacted — it can never reach a log or diagnostic.

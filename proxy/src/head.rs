@@ -790,7 +790,7 @@ mod tests {
         count: Rc<Cell<usize>>,
     }
     impl UpstreamSpawn for ScriptedSpawner {
-        fn spawn(&self, _session: SessionId, _body: Vec<u8>) -> UpstreamHandle {
+        fn spawn(&self, _session: SessionId, _destination: Route, _body: Vec<u8>) -> UpstreamHandle {
             self.count.set(self.count.get() + 1);
             let (tx, rx) = sync_channel(UPSTREAM_CHANNEL_CAP);
             *self.cell.borrow_mut() = Some(tx);

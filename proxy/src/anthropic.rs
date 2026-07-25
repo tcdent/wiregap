@@ -93,6 +93,19 @@ pub enum Denial {
 /// forward the body verbatim** (never rewritten — the `cch` body hash stays valid).
 pub fn recognize(req: &Request, vetted: &[ToolIdentity]) -> Result<(), Denial> {
     // Stage 1 — envelope, exact-match (the U2/U3 exact-match discipline).
+    //
+    // **DEFENSE IN DEPTH — DO NOT DERIVE THIS FROM THE MATCHED ROUTE** (Sprint 19, Final State #6).
+    // This hardcoded pair looks like duplication of `register::net::ROUTES`, and the obvious tidy-up is
+    // "the matched Route already carries the domain and path, so read them from it instead". That change
+    // would remove a real safety layer while reading as a cleanup in review.
+    //
+    // What it currently does: the envelope handed here is derived FROM the matched route, so comparing it
+    // to this fixed pair proves the matched route IS `api.anthropic.com//v1/messages`. Every request that
+    // gets admitted has therefore had its destination independently confirmed here — which is what makes
+    // a misdial unreachable, and what makes per-route credential scoping unnecessary today (there is no
+    // admissible second destination for the Anthropic credential to follow). Derive this from the route
+    // and both of those stop being true in the same commit.
+    // A change here is a design fork for the proxy team, never a unilateral simplification.
     if req.verb != "POST" || req.domain != "api.anthropic.com" || req.path != "/v1/messages" {
         return Err(Denial::BadEnvelope);
     }

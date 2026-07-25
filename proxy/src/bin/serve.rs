@@ -80,11 +80,12 @@ const DROP_GID: u32 = 65534;
 const PEER_BOX_MAC: [u8; 6] = [0u8; 6];
 // The head-connection rendezvous socket (config hook) — the operator's head connects here.
 const HEAD_SOCKET_PATH: &str = "/run/zerotrust-proxy/head.sock";
-// The upstream endpoint (production Anthropic Messages API). The credential's SOURCE is no longer a
-// bare constant here — it is `register::anthropic::CREDENTIAL_SOURCE`, a const-validated descriptor in
-// the compiled register (Sprint 16), so *where* the secret comes from is reviewed with the rest of the
-// operator's authority data rather than buried in the binary.
-const ANTHROPIC_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
+// NOTE: there is deliberately NO endpoint constant here. It existed until Sprint 19 and was the second,
+// independent naming of the upstream destination — the gate vetted `register::net::ROUTES` while the dial
+// used this constant, identical only by coincidence of authorship. The destination is now derived from
+// the `Route` U3 actually matched, so the register is the single place a destination is authored, and
+// there is nothing left for a dial to diverge from. The credential's SOURCE is likewise not a bare
+// constant: it is `register::anthropic::CREDENTIAL_SOURCE` (Sprint 16).
 
 fn main() -> io::Result<()> {
     // Exact-BDF gate (never enumeration): parse the literal; the allowlist is THIS card only.
@@ -108,9 +109,10 @@ fn main() -> io::Result<()> {
     // unusable — but `run()` is never entered (the ladder closes the proxy at the authority rung first,
     // and an empty credential fails that rung), so its `spawn` is never called and the empty key is
     // never used.
+    // No endpoint is supplied here: the destination comes from the matched `Route` at dial time
+    // (Sprint 19), so the register is the only place a destination is authored.
     let client = AnthropicClient::new(
         Credential::from_source(&CREDENTIAL_SOURCE).unwrap_or_else(|| Credential::new(String::new())),
-        ANTHROPIC_ENDPOINT.to_string(),
     );
 
     // The real head connection: bind the rendezvous socket and accept ONE head (the operator's terminal).
