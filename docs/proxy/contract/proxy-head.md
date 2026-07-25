@@ -26,7 +26,9 @@ Network posture, settled: **the proxy is the head's only network peer** and it
 route to the head, and the head is never network-exposed to box-authored
 stack/scan/service attacks; the box's sole influence on the head is relayed payload
 content within the bounded protocol (`CITE(head: head/architecture.md`, threat-layer
-table`)`).
+table`)`). Here **"terminates" is connection topology, not TLS termination**: the proxy provides
+an interface to the adversarial side over the project's own wire protocol, never as a TLS server
+(`approach.md` §1).
 
 **Non-box network-exposure (added by the operator's flexible-transport direction, §3):** when the
 transport spans an untrusted network (head remote, not local), the proxy↔head link is exposed to
