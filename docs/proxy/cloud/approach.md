@@ -43,6 +43,18 @@ transport, the credential, and the forward-or-deny decision; the box owns the pa
 including any client-side request signing the payload carries. **The proxy is a gate, not an
 editor: it does not modify what the box sent.**
 
+**One TLS role, client-side only — the box terminates TLS, not the proxy.** "Its own
+authenticated TLS to the upstream" is the proxy's *only* TLS: the proxy is a TLS **client** to
+the public upstream, and it is **not** a TLS server. It does not terminate TLS from the box. The
+box terminates TLS on its own side and hands the proxy the **plaintext** request over the
+project's internal wire (`net-address` + `net-payload`, `proto/net.md`) — a wire that is not on an
+open network and carries **no TLS** (the box authored those bytes, so there is nothing on that hop
+to encrypt against; confidentiality is undefended regardless, `principles.md` §7). So the proxy
+performs exactly one outbound TLS handshake per call, to the upstream, and **no inbound TLS
+handshake ever.** This is the client-side reading already stated in `architecture.md` §11 L10: box
+bytes reach the TLS stack only as plaintext to encrypt, and the stack's parser only ever sees the
+*cloud's* records.
+
 This generalizes *Containment by Construction* §3.2 — "the boundary device does not route
 the box's packets; it originates its own fixed upstream call" — at the transport and
 encapsulation level, without extending it to rewriting the content. The decisive property —

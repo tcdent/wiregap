@@ -211,7 +211,9 @@ it processes by *recognizing*, not by *rewriting*.
 The proxy **reads** the box's request, **verifies** it against the **route's rule** — for the
 Anthropic route, *inert client-side shapes only* (§2–§3) — and **encapsulates** a conforming
 request, verbatim, inside its own authenticated TLS to Anthropic. It does **not** modify the
-payload. This is assertion 17 in force — *the proxy enforces that emitted requests adhere to
+payload. **Client-side only:** the proxy is a TLS *client* to Anthropic, never a TLS server — the
+box terminates its own TLS and hands the proxy the plaintext request over the project wire; the
+box↔proxy hop carries no TLS (`approach.md` §1). This is assertion 17 in force — *the proxy enforces that emitted requests adhere to
 the rules set for the route* — with the inert-shape requirement living as a **route rule**,
 not as spine text. The box owns the body; the proxy owns the transport, the credential, and
 the forward-or-deny decision. It is a gate, not an editor.
