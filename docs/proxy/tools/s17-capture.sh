@@ -66,25 +66,46 @@ REPO="$(cd "$HERE/../../.." && pwd)/proxy"
 # source, and writing them beside this script would deposit them into the docs tree. Override with
 # S17_CAPTURE_OUT if you want them somewhere specific.
 OUT="${S17_CAPTURE_OUT:-${TMPDIR:-/tmp}/s17-capture}/capture-$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$OUT"
+# Checked, and load-bearing twice over. Unchecked, a failed mkdir (unwritable $TMPDIR, or an
+# S17_CAPTURE_OUT pointing somewhere this user cannot write) would let every later `tee "$OUT/..."`
+# fail silently against a nonexistent directory — the run would narrate success on the terminal with
+# NOTHING landing in the artifact directory. It is also the precondition that makes the deliberate
+# `sudo cmd > "$OUT/..."` redirects below correct rather than merely lucky (see SC2024 note there):
+# those redirects are opened by the INVOKING user, so $OUT must be invoking-user-writable, which is
+# exactly what succeeding here establishes.
+mkdir -p "$OUT" || { echo "cannot create artifact directory $OUT — nothing touched."; exit 1; }
 say() { printf '\n=== %s ===\n' "$*"; }
 
 say "PRECONDITIONS (nothing is touched until all pass)"
 fail=0
+# Explicit if/fi throughout this block, not `test && echo || { fail=1; }`. In that idiom the else-arm
+# also runs when the test SUCCEEDS but the echo fails, which would set fail=1 spuriously. Here that
+# happens to err safe — a spurious abort before anything is touched — but these are the gates standing
+# between this script and the production NIC, and "wrong in the safe direction" is a poor thing for a
+# reader to have to derive. They are written unambiguously instead.
 for d in /run/zerotrust-proxy/quarantine /srv/zerotrust-proxy/readable; do
-  [ -d "$d" ] && echo "  ok   $d" || { echo "  MISSING $d"; fail=1; }
+  if [ -d "$d" ]; then echo "  ok   $d"; else echo "  MISSING $d"; fail=1; fi
 done
-sudo -u '#65534' test -w /run/zerotrust-proxy/quarantine \
-  && echo "  ok   quarantine writable by uid 65534" || { echo "  NOT writable by 65534"; fail=1; }
-[ -n "$BOGUS_KEY" ] && echo "  ok   deliberately-invalid credential set (non-empty, so the ladder reaches Served)" \
-  || { echo "  bogus credential is empty — the upstream call would never be attempted"; fail=1; }
+if sudo -u '#65534' test -w /run/zerotrust-proxy/quarantine; then
+  echo "  ok   quarantine writable by uid 65534"
+else
+  echo "  NOT writable by 65534"; fail=1
+fi
+if [ -n "$BOGUS_KEY" ]; then
+  echo "  ok   deliberately-invalid credential set (non-empty, so the ladder reaches Served)"
+else
+  echo "  bogus credential is empty — the upstream call would never be attempted"; fail=1
+fi
 for b in 0000:41:00.0 0000:63:00.0; do
   drv=$(basename "$(readlink /sys/bus/pci/devices/$b/driver 2>/dev/null)" 2>/dev/null)
   echo "  bench $b driver=${drv:-<unbound>}"
 done
 prod=$(basename "$(readlink /sys/bus/pci/devices/0000:61:00.0/driver 2>/dev/null)" 2>/dev/null)
-[ "$prod" = ixgbe ] && echo "  ok   production 61:00.0 still ixgbe (never in any allowlist)" \
-  || { echo "  PRODUCTION NIC NOT ixgbe — STOP"; fail=1; }
+if [ "$prod" = ixgbe ]; then
+  echo "  ok   production 61:00.0 still ixgbe (never in any allowlist)"
+else
+  echo "  PRODUCTION NIC NOT ixgbe — STOP"; fail=1
+fi
 [ "$fail" = 0 ] || { echo "PRECONDITIONS FAILED — nothing touched."; exit 1; }
 
 # RE-RUN HYGIENE (found on the second attempt, and it is the write path behaving CORRECTLY): the confined
@@ -97,14 +118,43 @@ if sudo test -e /run/zerotrust-proxy/quarantine/s17-capture.bin; then
 fi
 
 say "PRE-RUN STATE (capture evidence)"
+# Narration: a failure here costs context in the write-up, not a tell, so it is not gated.
 { ls -ld /run/zerotrust-proxy /run/zerotrust-proxy/quarantine /srv/zerotrust-proxy/readable
   findmnt -no TARGET,OPTIONS --target /run/zerotrust-proxy/quarantine; } | tee "$OUT/prerun-state.txt"
-sha256sum "$REPO/target/debug/serve" "$REPO/target/debug/s17_box" "$REPO/target/debug/s17_head" \
-  | tee "$OUT/binshas-before.txt"
+
+# THIS ONE IS A TELL, NOT NARRATION — so its failure is fatal. binshas-before.txt is what binds every
+# claim in the write-up to specific bytes; if `sha256sum` fails (a binary missing because a required
+# --features build was skipped, say), an UNCHECKED pipeline leaves a silently-empty file sitting in the
+# artifact directory. The bin-sha coherence tell then LOOKS present in the artifact listing while being
+# entirely vacuous — a false green, and the exact shape this project treats as worse than a red.
+# `pipefail` is set, so $? here genuinely reflects sha256sum rather than tee.
+#
+# Exiting is safe at this point specifically: no card has been unbound yet, so there is nothing to
+# tear down. Past the `serve` start below, a bare exit would strand the bench with unbound cards.
+if ! sha256sum "$REPO/target/debug/serve" "$REPO/target/debug/s17_box" "$REPO/target/debug/s17_head" \
+     | tee "$OUT/binshas-before.txt"; then
+  echo "FAILED to hash the binaries — the bin-sha tell would be vacuous. Nothing touched."
+  echo "Build them first:  cargo build --features serve --bin serve"
+  echo "                   cargo build --features bench-capture --bin s17_box --bin s17_head"
+  exit 1
+fi
 
 say "1/3  serve  (blocks on accept; deliberately-INVALID credential via env — no billed call)"
 export ANTHROPIC_API_KEY="$BOGUS_KEY"
+# shellcheck disable=SC2024  # deliberate: see the mkdir note above.
+# SC2024 warns that `sudo cmd > file` opens the redirect as the INVOKING user, not root. That is the
+# intended behaviour here, not an oversight. $OUT is created by this script as the invoking user (and
+# that mkdir is now checked), so the log lands user-owned in a user-owned directory — which is what the
+# later non-sudo `grep ... "$OUT/head.log"` depends on. Routing it through `sudo tee` instead would add
+# a pipe and a second sudo only to make the file root-owned, for no benefit. The one artifact that DOES
+# need root to write is response-body.bin, and it is written by the privileged binary itself opening its
+# own path — the pattern SC2024 actually recommends, already used where it is actually required.
 sudo -E "$REPO/target/debug/serve" >"$OUT/serve.log" 2>&1 &
+# The job THIS SCRIPT backgrounded — ours BY CONSTRUCTION, not by name-matching. Captured immediately,
+# because the next `&` below would overwrite `$!`. It is the handle used to reap serve on the
+# verification-failure path, where SERVE_PID is empty by definition and there is nothing else to trust.
+# Note this is the SUDO wrapper's pid, not serve's; see the reap for why that distinction matters.
+SUDO_JOB_PID=$!
 # `pgrep -f` would ALSO match the `sudo -E .../serve` wrapper (its cmdline ends in "serve"), and hashing
 # sudo's exe would be a silently WRONG hash. Match the exact process NAME instead (sudo's comm is "sudo"),
 # then PROVE the pid is ours by resolving its exe link before trusting anything it reports.
@@ -116,24 +166,74 @@ for _ in $(seq 1 30); do
   fi
   sleep 1
 done
-[ -n "$SERVE_PID" ] || { echo "serve did not start (or pid unverifiable) — see $OUT/serve.log"; cat "$OUT/serve.log"; exit 1; }
+if [ -z "$SERVE_PID" ]; then
+  echo "serve did not start (or pid unverifiable) — see $OUT/serve.log"
+  cat "$OUT/serve.log"
+  # REAP WHAT WE STARTED. This branch is reached precisely when the exe-verification above could not
+  # identify serve — which does NOT mean serve is not running. Without this, a root-owned serve is left
+  # blocked on accept() forever, since the head never connects after we exit.
+  #
+  # The target is $! — the job this script backgrounded — and deliberately NOT the `$cand` that pgrep
+  # matched. Killing the pgrep match would be wrong in exactly the case that put us on this branch: an
+  # unrelated process merely NAMED "serve", which is the possibility the exe-verification exists to rule
+  # out. Known-ours by construction beats known-ours by name.
+  #
+  # $! is the SUDO wrapper, not serve. sudo forwards SIGTERM to its child, so terminating it normally
+  # takes serve with it — but the children are enumerated FIRST and swept afterwards, because a sudo
+  # that dies without forwarding would reparent serve away and leave nothing to find.
+  if sudo kill -0 "$SUDO_JOB_PID" 2>/dev/null; then
+    mapfile -t kids < <(pgrep -P "$SUDO_JOB_PID" 2>/dev/null)
+    sudo kill -TERM "$SUDO_JOB_PID" 2>/dev/null
+    for _ in $(seq 1 5); do sudo kill -0 "$SUDO_JOB_PID" 2>/dev/null || break; sleep 1; done
+    sudo kill -KILL "$SUDO_JOB_PID" 2>/dev/null
+    for k in "${kids[@]}"; do [ -n "$k" ] && sudo kill -KILL "$k" 2>/dev/null; done
+    echo "  reaped the backgrounded serve job (sudo pid $SUDO_JOB_PID) — no stray root process left"
+  fi
+  # A bare exit is correct HERE and nowhere past this point: serve blocks on accept() before it
+  # constructs the NIC, so no card has been unbound yet and there is nothing to rebind.
+  exit 1
+fi
 # THE RUNNING-BYTES TELL: hash the kernel's own handle on the executing image, not a path. Read as root,
 # while serve is blocked on accept() (before bring_up) — a stable, no-race window.
 { echo "pid: $SERVE_PID"
-  echo -n "cmdline: "; sudo tr '\0' ' ' < "/proc/$SERVE_PID/cmdline"; echo
+  # `sudo cat ... | tr`, NOT `sudo tr ... < file`. The redirect form is opened by the invoking user —
+  # sudo does not affect redirections — so the `sudo` would apply only to `tr`, which needs no
+  # privilege whatsoever, while the privileged part (opening another user's /proc entry) ran
+  # unprivileged. It happens to work because /proc/<pid>/cmdline is world-readable by default, but it
+  # would fail under a `hidepid=` mount while LOOKING like it should have succeeded, and this block is
+  # the running-bytes tell — a silently-empty line here is a missing tell, not a cosmetic gap. The two
+  # lines below always got this right by passing the path TO the sudo'd command; this one did not.
+  echo -n "cmdline: "; sudo cat "/proc/$SERVE_PID/cmdline" | tr '\0' ' '; echo
   echo -n "exe -> "; sudo readlink "/proc/$SERVE_PID/exe"
   sudo sha256sum "/proc/$SERVE_PID/exe"
 } | tee "$OUT/serve-proc-exe-sha.txt"
 
 say "2/3  s17_head  (must be root — socket is root-owned; must connect BEFORE the box)"
+# shellcheck disable=SC2024  # invoking-user redirect into the user-owned $OUT is intended; see above.
 sudo "$REPO/target/debug/s17_head" >"$OUT/head.log" 2>&1 &
 for _ in $(seq 1 60); do grep -q "CONNECTED" "$OUT/head.log" 2>/dev/null && break; sleep 1; done
 grep -q "CONNECTED" "$OUT/head.log" || { echo "head never connected — see $OUT/head.log"; }
 
 say "3/3  s17_box  (drives the round trip — real TLS+HTTP to the real host, rejected 401, unbilled)"
 RESP_BODY="$OUT/response-body.bin"
+# shellcheck disable=SC2024  # invoking-user redirect into the user-owned $OUT is intended; see above.
 sudo "$REPO/target/debug/s17_box" "$RESP_BODY" >"$OUT/box.log" 2>&1
-echo "box exit: $?"
+BOX_EXIT=$?
+echo "box exit: $BOX_EXIT" | tee "$OUT/box-exit.txt"
+# NOT a gate, and deliberately so: the run must continue to the teardown regardless, or the bench is
+# left with unbound cards. It is recorded rather than branched on because **every downstream tell is
+# evidence-based and fails closed without it** — verified, not assumed:
+#
+#   * the credential-echo gate keys off `sudo test -s "$RESP_BODY"`; a box that died before writing
+#     leaves no body, so the gate reports NO BODY, never PASS;
+#   * tell #4 keys off a nonce grepped out of box.log; a box that died before emitting it leaves
+#     CHUNK_NONCE empty, so the write-check is skipped and reports NOT SATISFIED.
+#
+# Neither can produce a false PASS from a crashed box. That property is why this is a warning rather
+# than an exit — preserve it if you add a tell, or this line has to become a gate.
+if [ "$BOX_EXIT" != 0 ]; then
+  echo "  *** s17_box exited non-zero — the tells below are expected to fail closed; read box.log ***"
+fi
 
 say "CREDENTIAL-ECHO GATE — assert the upstream's reply carries no part of the credential"
 # Verbatim relay of an ERROR body is not symmetric with a success body: a 4xx CAN echo request material,
@@ -199,6 +299,8 @@ if sudo kill -0 "$SERVE_PID" 2>/dev/null; then
 fi
 sudo kill -0 "$SERVE_PID" 2>/dev/null && echo "  WARNING: serve STILL running (pid $SERVE_PID)" || echo "  serve stopped"
 # s17_head self-exits on the display frame, but reap it if it is still waiting out its frame window.
+# shellcheck disable=SC2015  # inert by construction: the `|| true` arm has no effect beyond
+# swallowing a non-match, so the A&&B||C caveat cannot change any outcome here.
 pkill -x s17_head 2>/dev/null && echo "  s17_head reaped (had not seen a display frame)" || true
 
 say "POST-RUN"

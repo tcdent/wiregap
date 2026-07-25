@@ -148,7 +148,22 @@ keyfile permission inconsistency, and the verify-before-kill race were each revi
 lived in an ephemeral session scratchpad until Sprint 18 closed, at which point the loss risk was
 flagged and the PM directed it into the repo.
 
-Moving it in required exactly two changes to executable lines, both forced by leaving the scratchpad:
-the repo path is now resolved from the script's own location rather than one hardcoded home
-directory, and artifacts now land outside the repo instead of beside the script. Every other
-executable line is byte-identical to the version that produced the Sprint 17 capture attempts.
+Two changes to executable lines were forced by leaving the scratchpad: the repo path is now resolved
+from the script's own location rather than one hardcoded home directory, and artifacts now land
+outside the repo instead of beside the script.
+
+A `shellcheck` 0.9.0 pass and a review read for exit-status masking then produced six more, all
+hardening rather than behaviour changes. `shellcheck` is clean at `--severity=style`:
+
+| change | why |
+|---|---|
+| `mkdir -p "$OUT"` now exits on failure | unchecked, every later `tee` failed silently and the run narrated success with an empty artifact directory |
+| the `sha256sum … \| tee binshas-before.txt` pipeline now exits on failure | it is a **tell**, not narration — a silently-empty file makes the bin-sha claim vacuous while looking present |
+| the precondition block uses explicit `if/fi` | `A && echo \|\| { fail=1; }` also takes the else-arm when the echo fails; these are the gates protecting the production NIC |
+| `sudo tr … < /proc/PID/cmdline` → `sudo cat … \| tr` | **a real bug**: the redirect is opened by the invoking user, so the `sudo` applied only to `tr`, which needs no privilege. Works today only because `/proc/PID/cmdline` is world-readable; fails under a `hidepid=` mount while looking correct |
+| `s17_box`'s exit status captured, recorded, and warned on | was computed and printed but unreferenced; still not a gate, deliberately — see the in-file note on why every downstream tell fails closed without it |
+| three `sudo cmd > "$OUT/…"` redirects annotated `# shellcheck disable=SC2024` | the invoking-user redirect is *intended*: `$OUT` is user-owned, and a later non-`sudo` grep of `head.log` depends on it. The one artifact that genuinely needs a root write — `response-body.bin` — is written by the privileged binary opening its own path |
+| the pid-verification failure path now reaps the backgrounded job | it exited without reaping, leaving a root-owned `serve` blocked on `accept()` forever. A process leak, not a bench-safety gap — no card is unbound at that point |
+
+Every other executable line is byte-identical to the version that produced the Sprint 17 capture
+attempts.
