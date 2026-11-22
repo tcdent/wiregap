@@ -39,11 +39,10 @@ exploration and do **not** define them.
 - **session** — one of our multiplexed connections: the transport's primary managed entity, and a fresh
   **instance** of the one transport protocol. (Earlier drafts called this a "stream"/"connection"/
   "instance"; "session" is canonical.)
-- **session ID** — the identifier of a session: **allocated by the endpoint that originates it** (the box
-  for requests, the proxy for responses), a 64-bit monotonic counter drawn from an **originator-partitioned**
-  space so the two allocators never collide, unique **within an epoch**, reset on reboot. It is the frame's
-  only key (demux only, zero security weight — the originator partition is collision-avoidance, not an
-  auth token).
+- **session ID** — the identifier of a session: **box-allocated** (the box is the sole allocator,
+  `proto/model.md §2`), a 64-bit monotonic counter, unique **within an epoch**, reset on reboot. It is the
+  frame's only key (demux only, zero security weight). A session is **bidirectional** — both the box's
+  request data and the proxy's reply ride this one id (§4, §6).
 - **application layer** — what rides *on top of* a session: one of a handful of implementations of the
   protocol (PTY, file, request). Selected by the session's **binding**; not the transport's concern.
 
@@ -206,11 +205,14 @@ There is **one** transport protocol code set. A **session** is one multiplexed c
 layer**: one of a handful of implementations (PTY, file, request) that gives the session's bytes their
 purpose, selected by the **binding** the session declares (a field it carries, *not* a transport
 branch). Multiplexing *is* instantiation: a new connection is a new session, not a new protocol.
-**Both endpoints run this one code set and both originate sessions** — the box opens **request** sessions
-(box→proxy), the proxy opens **response** sessions (proxy→box), as independent unidirectional messages
-(`proto/model.md §9`); the reactor on each side is symmetric, and origination is the *only* reply
-mechanism (a response is a new session, never data sent back on the request session — §6 tells data from
-ACK by role, so a session's data stays one-directional). Consequences:
+**A session is bidirectional, and the box is the sole allocator** (`proto/model.md §2`) — the box opens a
+session (off the `open-session` bootstrap, session 0 the seed), sends its request, and the proxy's **reply
+rides back on that same session** (`proto/model.md §9`'s independent unidirectional messages are the two
+directions of one session, not two sessions). The proxy never originates; it replies with
+`send(request_session_id, …)`. Data-from-ACK is told by **payload-presence**, not role (§6), so one
+session carries data both ways. *(Open — routed to the operator: whether the proxy ever sends an
+**unprompted** push with no request session to ride; if so, that reopens proxy-origination. On the current
+reply-and-relay model it does not, and box-sole-allocator holds.)* Consequences:
 
 - **Transport dispatch has zero protocol-type branching.** A frame arrives → the reactor looks up its
   session by session ID (a table) → hands it to that session — the same code, every time. "What
@@ -264,12 +266,14 @@ bytes that actually arrived, the same discipline the descriptor length was held 
 regression test (`grounding/data-path-and-events.md §1`). This is a link-framing detail below the
 transport, not a change to the transport frame. **There is no flag byte.**
 
-- **ACKs are bare return frames** on the same discriminator, opposite direction. Data-vs-ACK is told
-  by **role/direction**, not a flag: a session's data is one-directional, so at each endpoint an
-  arriving frame on that session is unambiguously data (if you're the receiver) or an ACK (if you're
-  the sender). No piggybacking — bare ACKs are simpler and free against the headroom.
-- **Strict stop-and-wait.** One frame in flight per session; the sender does not advance until the
-  ACK returns. This is not a throughput compromise — at µs RTT it is invisible, and it is what makes
+- **ACKs are bare (empty-payload) return frames** on the same session. Data-vs-ACK is told by
+  **payload-presence**, not a flag and not role: a bare ACK is an empty payload, while every data frame
+  carries a `u32`-verb-prefixed L2 message (`proto/model.md §3`) — so a data frame is ≥12 wire bytes and a
+  bare ACK is exactly 8, and they can never collide. This is what lets one session be **bidirectional**
+  with no flag byte: at each endpoint, empty ⇒ ACK (release my in-flight), non-empty ⇒ data (deliver up +
+  emit a bare ACK). No piggybacking — bare ACKs are simpler and free against the headroom.
+- **Strict stop-and-wait.** One frame in flight **per direction** — a bidirectional session has an
+  outbound half each way, each ≤1 in flight — and a sender does not advance until its ACK returns. This is not a throughput compromise — at µs RTT it is invisible, and it is what makes
   the reactor's interleaving trivial. Throughput, where needed, comes from **more sessions**, never
   a cleverer pipe.
 - **The ACK is irreducible; the bit is not.** The ACK exists purely to *delete work*: it lets
@@ -364,9 +368,9 @@ the wire. Lifecycle is what *falls out* of frames arriving or not arriving, plus
 minding its own resources. Keeping it this thin is what keeps the layer minimal; every consumer builds
 its own lifecycle on top with its own logic.
 
-**A new session is just a frame on a new session ID.** Either endpoint opens by emission — the first frame
-on a fresh ID: the box opens **request** sessions (box→proxy data), the proxy opens **response** sessions
-(proxy→box data), symmetric independent unidirectional messages (`proto/model.md §9`). The transport, seeing an ID it holds no session for, instantiates and delivers the frame
+**A new session is just a frame on a new session ID.** The **box opens by emission** — the first frame on a
+fresh box-allocated ID (off `open-session`, `proto/model.md §2`); the session is **bidirectional**, so the
+proxy's reply rides back on that same id rather than opening its own. The transport, seeing an ID it holds no session for, instantiates and delivers the frame
 upward; the consumer, seeing an ID it has not bound, attaches whatever it needs (a pane, a file sink).
 "Opened" is not announced; it is *noticed*, the same way on both sides. The binding (PTY / file /
 request) rides in that first frame's payload and is interpreted above; the transport routes bytes and
@@ -389,12 +393,11 @@ of cross-epoch state is the mechanism;** we add nothing to "handle restart," bec
 handle. (A reused ID is at most a cosmetic pane reuse; routing carries zero security weight. This
 supersedes `transport-stack.md §2.5`, which keyed proxy state to the box's lifetime — what we now call
 an epoch — and dropped it on restart; that keying is removed, and the transport holds no cross-epoch
-state at all.) Session IDs: **each endpoint allocates the sessions it originates** (the box its requests, the proxy its
-responses) from an **originator-partitioned** 64-bit space (the top bit encoding the originator is the
-clean form) — so an ID is unique **within an epoch across both originators** and the two allocators cannot
-collide by construction. Each side is a monotonic counter; the box's resets on its reboot (the epoch
-boundary), the proxy's persists across box epochs and its unacked sessions to a rebooted box fall out via
-give-up (§7).
+state at all.) Session IDs: **the box is the sole allocator** (`proto/model.md §2`); a 64-bit monotonic
+counter, unique **within an epoch**, reset on reboot. The proxy allocates nothing — its reply rides the
+box's session (§4, §6), so there is a single id space and no cross-originator collision to design against.
+*(Open, per §4: an unprompted, proxy-**initiated** push — should the operator rule one exists — is the sole
+case that would need proxy allocation; the current reply-and-relay model has none.)*
 
 **Dormant ≠ dead** — the give-up fires only on an *outstanding* unacked frame, never on idleness, so a
 quiet session with nothing in flight is never reclaimed; a dormant pane persists and "revives" simply by

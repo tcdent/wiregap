@@ -69,12 +69,12 @@ empty); the retransmit deadline composed into the same `MWAITX` wait; single-pro
 *Authority: `architecture.md §3, §5`; `grounding/data-path-and-events.md §4`.*
 
 **E5 — The session protocol.** The UART+ACK+ID transport: frame = `[session ID][payload]`; bare ACKs
-distinguished by direction; **strict stop-and-wait**; ~10 ms retransmit interval + ~1–5 s give-up
+distinguished by **payload-presence** (an empty payload ⇒ ACK, `architecture.md §6`); **strict stop-and-wait** (≤1 in flight per direction); ~10 ms retransmit interval + ~1–5 s give-up
 (silent internal reclaim, no event); **multiplexing-by-instantiation** (a session is an instance of the
 one protocol; the reactor interleaves them); session lifecycle — open-by-emission, **no close signal**,
-**no cross-epoch state**, dormant ≠ dead; session IDs **originator-allocated from a partitioned space**
-(box for requests, proxy for responses — disjoint by construction; both endpoints originate,
-`architecture.md §4`), 64-bit monotonic per side, unique within an epoch. No flag byte beyond what is needed, no adaptive RTO, no session/epoch tracking.
+**no cross-epoch state**, dormant ≠ dead; **bidirectional sessions** (the proxy's reply rides the box's
+session, not a new one; `architecture.md §4`); session IDs **box-allocated** (sole allocator,
+`proto/model.md §2`), 64-bit monotonic, unique within an epoch. No flag byte beyond what is needed, no adaptive RTO, no session/epoch tracking.
 *Authority: `architecture.md §4, §6, §7, §8`.*
 
 **E6 — Validation (mostly interleaved) + a final integration pass.** Bench validation is **not** a
